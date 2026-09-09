@@ -1,0 +1,16 @@
+# Build output
+/build/
+/cmake-build-*/
+
+# Locally-built dependencies (VSG, vsgQt, Vulkan headers, etc.)
+/.deps/
+
+# Editor / OS cruft
+.DS_Store
+.cache/
+compile_commands.json
+/.vs/
+/out/
+CMakeSettings.json
+*.user
+*.suo

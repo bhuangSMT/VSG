@@ -1,0 +1,90 @@
+// Parameter - the single store of application settings.
+//
+// Every control in the UI commits its value here first; the code that acts on a
+// setting then reads it back from this instance rather than from the widget.
+// That keeps the widgets as pure input and gives the rest of the application
+// one place to look for the current state.
+//
+// The instance is created when the application starts and lives until it exits.
+#pragma once
+
+#include <string>
+
+#include "Ray.h"
+#include "BooleanOp.h"
+#include "ToolType.h"
+#include "ViewMode.h"
+
+namespace app
+{
+
+class Parameter
+{
+public:
+    // The one instance. Constructed on first call, which main() makes during
+    // application start-up so that the store exists before any UI does.
+    static Parameter& instance();
+
+    Parameter(const Parameter&) = delete;
+    Parameter& operator=(const Parameter&) = delete;
+
+    // How the model is drawn.
+    ViewMode viewMode() const { return _viewMode; }
+    void setViewMode(ViewMode mode) { _viewMode = mode; }
+
+    // Grid spacing used when casting rays, per axis.
+    const Point3d& rayResolution() const { return _rayResolution; }
+    void setRayResolution(const Point3d& resolution) { _rayResolution = resolution; }
+
+    // Steps across the bounding box used to seed rayResolution for a new model.
+    int rayDivisions() const { return _rayDivisions; }
+    void setRayDivisions(int divisions) { _rayDivisions = divisions; }
+
+    // Whether the viewer redraws continuously or only on request.
+    bool continuousUpdate() const { return _continuousUpdate; }
+    void setContinuousUpdate(bool enabled) { _continuousUpdate = enabled; }
+
+    // Which cutter follows the mouse over the model.
+    ToolType toolType() const { return _toolType; }
+    void setToolType(ToolType type) { _toolType = type; }
+
+    // Cutter radius in model space. Seeded to 5% of the BRep bounding-box
+    // diagonal when a model is loaded; the UI commits edits here before the
+    // tool mesh is rebuilt.
+    double toolRadius() const { return _toolRadius; }
+    void setToolRadius(double radius) { _toolRadius = radius; }
+
+    // Whether the swept-volume mesh is drawn in the scene. Generation always
+    // runs while a tool is active; this only gates the VSG node.
+    bool sweptVolume() const { return _sweptVolume; }
+    void setSweptVolume(bool enabled) { _sweptVolume = enabled; }
+
+    // When true, each new sweep segment replaces the previous one so only the
+    // latest segment is kept and drawn.
+    bool showLastSweptVolumeOnly() const { return _showLastSweptVolumeOnly; }
+    void setShowLastSweptVolumeOnly(bool enabled) { _showLastSweptVolumeOnly = enabled; }
+
+    // How the swept volume is combined with the current RayModel.
+    BooleanOp booleanOp() const { return _booleanOp; }
+    void setBooleanOp(BooleanOp op) { _booleanOp = op; }
+
+    // The last file the user imported; also where the file dialog reopens.
+    const std::string& lastImportPath() const { return _lastImportPath; }
+    void setLastImportPath(std::string path) { _lastImportPath = std::move(path); }
+
+private:
+    Parameter() = default;
+
+    ViewMode _viewMode = ViewMode::Facet;
+    Point3d _rayResolution{0.000625, 0.000625, 0.000625};
+    int _rayDivisions = 1600;
+    bool _continuousUpdate = true;
+    ToolType _toolType = ToolType::None;
+    double _toolRadius = 0.05;
+    bool _sweptVolume = false;
+    bool _showLastSweptVolumeOnly = true;
+    BooleanOp _booleanOp = BooleanOp::None;
+    std::string _lastImportPath;
+};
+
+} // namespace app

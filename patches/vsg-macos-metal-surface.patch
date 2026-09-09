@@ -1,0 +1,120 @@
+diff --git a/include/vsg/platform/macos/MacOS_Window.h b/include/vsg/platform/macos/MacOS_Window.h
+index ddaeaaf..8d24445 100644
+--- a/include/vsg/platform/macos/MacOS_Window.h
++++ b/include/vsg/platform/macos/MacOS_Window.h
+@@ -13,6 +13,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
+ </editor-fold> */
+ 
+ #define VK_USE_PLATFORM_MACOS_MVK
++#define VK_USE_PLATFORM_METAL_EXT
+ 
+ #include <vsg/app/Window.h>
+ #include <vsg/ui/KeyEvent.h>
+@@ -55,7 +56,7 @@ namespace vsgMacOS
+         MacOS_Window(const MacOS_Window&) = delete;
+         MacOS_Window operator = (const MacOS_Window&) = delete;
+ 
+-        const char* instanceExtensionSurfaceName() const override { return "VK_MVK_macos_surface"; }
++        const char* instanceExtensionSurfaceName() const override { return "VK_EXT_metal_surface"; }
+ 
+         bool valid() const override { return _window || _view; }
+ 
+diff --git a/src/vsg/platform/macos/MacOS_Window.mm b/src/vsg/platform/macos/MacOS_Window.mm
+index 4df5927..70b4344 100644
+--- a/src/vsg/platform/macos/MacOS_Window.mm
++++ b/src/vsg/platform/macos/MacOS_Window.mm
+@@ -385,16 +385,20 @@ - (void)updateTrackingAreas
+     class MacOSSurface : public vsg::Surface
+     {
+     public:
+-        MacOSSurface(vsg::Instance* instance, NSView* window) :
++        MacOSSurface(vsg::Instance* instance, CAMetalLayer* metalLayer) :
+             vsg::Surface(VK_NULL_HANDLE, instance)
+         {
+-            VkMacOSSurfaceCreateInfoMVK surfaceCreateInfo{};
+-            surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
++            // Use the modern VK_EXT_metal_surface path and pass the CAMetalLayer
++            // directly. MoltenVK only reports present support when the surface has
++            // a valid CAMetalLayer, which the deprecated VK_MVK_macos_surface path
++            // fails to provide when embedded in a host-owned NSView (e.g. Qt).
++            VkMetalSurfaceCreateInfoEXT surfaceCreateInfo{};
++            surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+             surfaceCreateInfo.pNext = nullptr;
+             surfaceCreateInfo.flags = 0;
+-            surfaceCreateInfo.pView = window;
++            surfaceCreateInfo.pLayer = metalLayer;
+ 
+-            /*auto result = */ vkCreateMacOSSurfaceMVK(*instance, &surfaceCreateInfo, _instance->getAllocationCallbacks(), &_surface);
++            vkCreateMetalSurfaceEXT(*instance, &surfaceCreateInfo, _instance->getAllocationCallbacks(), &_surface);
+         }
+     };
+ 
+@@ -727,19 +731,37 @@ void createApplicationMenus(void)
+             _view = (vsg_MacOS_NSView*)externalView;
+             [_view setWantsLayer:YES];
+ 
+-            _metalLayer = (CAMetalLayer*)[_view layer];
+-            if (!_metalLayer || ![_metalLayer isKindOfClass:[CAMetalLayer class]])
++            auto devicePixelScale = _traits->hdpi ? [[_view window] backingScaleFactor] : 1.0f;
++
++            // The host (e.g. Qt) owns the view's backing layer, so we cannot
++            // replace it. Instead host our own CAMetalLayer as a sublayer that
++            // tracks the view's bounds; the Vulkan surface renders into this.
++            CAMetalLayer* existingLayer = (CAMetalLayer*)[_view layer];
++            if (existingLayer && [existingLayer isKindOfClass:[CAMetalLayer class]])
++            {
++                // View already provides a CAMetalLayer we can render into directly.
++                _metalLayer = existingLayer;
++                [_metalLayer setContentsScale:devicePixelScale];
++            }
++            else
+             {
+                 _metalLayer = [[CAMetalLayer alloc] init];
+                 if (!_metalLayer)
+                 {
+                     throw Exception{"Error: vsg::MacOS_Window::MacOS_Window(...) failed to create CAMetalLayer for embedded view.", VK_ERROR_INVALID_EXTERNAL_HANDLE};
+                 }
+-                [_view setLayer:_metalLayer];
+-            }
++                [_metalLayer setContentsScale:devicePixelScale];
+ 
+-            auto devicePixelScale = _traits->hdpi ? [[_view window] backingScaleFactor] : 1.0f;
+-            [_metalLayer setContentsScale:devicePixelScale];
++                CGRect bounds = CGRectMake(0, 0, traits->width, traits->height);
++                [_metalLayer setFrame:bounds];
++                [_metalLayer setAutoresizingMask:(kCALayerWidthSizable | kCALayerHeightSizable)];
++
++                CALayer* hostLayer = [_view layer];
++                if (hostLayer)
++                    [hostLayer addSublayer:_metalLayer];
++                else
++                    [_view setLayer:_metalLayer];
++            }
+ 
+             uint32_t finalwidth = traits->width * devicePixelScale;
+             uint32_t finalheight = traits->height * devicePixelScale;
+@@ -865,7 +887,7 @@ void createApplicationMenus(void)
+ {
+     if (!_instance) _initInstance();
+ 
+-    _surface = new vsgMacOS::MacOSSurface(_instance, _view);
++    _surface = new vsgMacOS::MacOSSurface(_instance, _metalLayer);
+ }
+ 
+ bool MacOS_Window::pollEvents(vsg::UIEvents& events)
+@@ -895,7 +917,14 @@ void createApplicationMenus(void)
+ 
+     NSWindow* hostWindow = _window ? _window : [_view window];
+     auto devicePixelScale = _traits->hdpi ? [hostWindow backingScaleFactor] : 1.0f;
+-    //[_metalLayer setContentsScale:devicePixelScale];
++
++    // When embedded (no owning NSWindow) our CAMetalLayer is a sublayer of the
++    // host view's layer; keep it matched to the view bounds and backing scale.
++    if (!_window && _metalLayer)
++    {
++        [_metalLayer setContentsScale:devicePixelScale];
++        [_metalLayer setFrame:[_view bounds]];
++    }
+ 
+     _extent2D.width = contentRect.size.width * devicePixelScale;
+     _extent2D.height = contentRect.size.height * devicePixelScale;
