@@ -47,7 +47,11 @@ struct Splat
 class GaussianSplatSet
 {
 public:
+    // Exact size (or clear when 0). Prefer ensureCapacity for rebuild/grow paths.
     void resize(std::size_t splatCount);
+    // Grow-only with hysteresis; no-op when needed <= capacity. Keeps pipelines.
+    void ensureCapacity(std::size_t needed);
+
     void set(std::size_t index, const Splat& splat);
     void clearSlot(std::size_t index);
     void markDirty();
@@ -57,6 +61,11 @@ public:
     bool empty() const { return !_root || _capacity == 0; }
 
 private:
+    void ensurePipelines();
+    void initSlotGeometry(std::size_t beginSplat, std::size_t endSplat);
+    void zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat);
+    void bindDrawArrays();
+
     std::size_t _capacity = 0;
     vsg::ref_ptr<vsg::vec4Array> _centerRadius;
     vsg::ref_ptr<vsg::vec2Array> _corners;
@@ -65,6 +74,8 @@ private:
     vsg::ref_ptr<vsg::uintArray> _indices;
     vsg::ref_ptr<vsg::VertexIndexDraw> _draw;
     vsg::ref_ptr<vsg::Group> _root;
+    vsg::ref_ptr<vsg::GraphicsPipeline> _depthPipeline;
+    vsg::ref_ptr<vsg::GraphicsPipeline> _colorPipeline;
 };
 
 // Builds the subgraph that draws splats.

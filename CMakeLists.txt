@@ -94,6 +94,30 @@ target_link_libraries(vsg_qt_cube
 install(TARGETS vsg_qt_cube RUNTIME DESTINATION bin)
 
 # ---------------------------------------------------------------------------
+# Headless hotspot profiler (cast / sweep / boolean / splat cache).
+# ---------------------------------------------------------------------------
+add_executable(profile_hotspots
+    src/profile_hotspots.cpp
+    src/BRep.cpp
+    src/BVH.cpp
+    src/BoundingBox.cpp
+    src/GaussianSplat.cpp
+    src/GaussianSplatCache.cpp
+    src/RayModel.cpp
+    src/RayBoolean.cpp
+    src/SweptVolume.cpp
+    src/ToolGeometry.cpp
+)
+target_link_libraries(profile_hotspots
+    PRIVATE
+        vsg::vsg
+        TBB::tbb
+)
+if(WIN32)
+    target_compile_definitions(profile_hotspots PRIVATE NOMINMAX)
+endif()
+
+# ---------------------------------------------------------------------------
 # Windows: copy VSG/vsgQt DLLs next to the exe and run windeployqt so the
 # Qt platform plugin (qwindows.dll) is available when launching from the
 # build tree.

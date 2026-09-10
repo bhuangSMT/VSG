@@ -299,7 +299,7 @@ try
     viewModeCombo->addItem("Facet", static_cast<int>(app::ViewMode::Facet));
     viewModeCombo->addItem("Wireframe", static_cast<int>(app::ViewMode::Wireframe));
     viewModeCombo->addItem("Ray", static_cast<int>(app::ViewMode::Ray));
-    viewModeCombo->addItem("Ray-GS", static_cast<int>(app::ViewMode::RayGS));
+    viewModeCombo->addItem("Simulation", static_cast<int>(app::ViewMode::RayGS));
     grid->addWidget(viewModeCombo, row++, 0);
 
     // Ray tessellation resolution: the spacing of the cast grid along each

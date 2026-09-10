@@ -1,5 +1,6 @@
 #include "GaussianSplat.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -238,46 +239,20 @@ vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
 
 } // namespace
 
-void GaussianSplatSet::resize(std::size_t splatCount)
+void GaussianSplatSet::ensurePipelines()
 {
-    if (splatCount == _capacity && _root) return;
+    if (!_depthPipeline) _depthPipeline = createPipeline(true);
+    if (!_colorPipeline) _colorPipeline = createPipeline(false);
+}
 
-    _capacity = splatCount;
-    if (splatCount == 0)
-    {
-        _centerRadius = nullptr;
-        _corners = nullptr;
-        _colors = nullptr;
-        _normals = nullptr;
-        _indices = nullptr;
-        _draw = nullptr;
-        _root = nullptr;
-        return;
-    }
-
-    const auto vertexCount = splatCount * 4;
-    const auto indexCount = splatCount * 6;
-
-    _centerRadius = vsg::vec4Array::create(vertexCount);
-    _corners = vsg::vec2Array::create(vertexCount);
-    _colors = vsg::vec4Array::create(vertexCount);
-    _normals = vsg::vec3Array::create(vertexCount);
-    _indices = vsg::uintArray::create(indexCount);
-
-    _centerRadius->properties.dataVariance = vsg::DYNAMIC_DATA;
-    _colors->properties.dataVariance = vsg::DYNAMIC_DATA;
-    _normals->properties.dataVariance = vsg::DYNAMIC_DATA;
-
-    for (std::size_t s = 0; s < splatCount; ++s)
+void GaussianSplatSet::initSlotGeometry(std::size_t beginSplat, std::size_t endSplat)
+{
+    if (!_corners || !_indices) return;
+    for (std::size_t s = beginSplat; s < endSplat; ++s)
     {
         const auto base = s * 4;
         for (std::size_t k = 0; k < 4; ++k)
-        {
-            (*_centerRadius)[base + k] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
             (*_corners)[base + k] = cornerOffsets[k];
-            (*_colors)[base + k] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
-            (*_normals)[base + k] = vsg::vec3(0.0f, 0.0f, 1.0f);
-        }
 
         const auto first = static_cast<std::uint32_t>(base);
         const auto indexBase = s * 6;
@@ -288,21 +263,142 @@ void GaussianSplatSet::resize(std::size_t splatCount)
         (*_indices)[indexBase + 4] = first + 2;
         (*_indices)[indexBase + 5] = first + 3;
     }
+}
 
-    _draw = vsg::VertexIndexDraw::create();
+void GaussianSplatSet::zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat)
+{
+    if (!_centerRadius || !_colors || !_normals) return;
+    const auto beginVert = beginSplat * 4;
+    const auto endVert = endSplat * 4;
+    for (std::size_t i = beginVert; i < endVert; ++i)
+    {
+        (*_centerRadius)[i] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        (*_colors)[i] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        (*_normals)[i] = vsg::vec3(0.0f, 0.0f, 1.0f);
+    }
+}
+
+void GaussianSplatSet::bindDrawArrays()
+{
+    if (!_draw)
+        _draw = vsg::VertexIndexDraw::create();
+
     _draw->assignArrays(vsg::DataList{_centerRadius, _corners, _colors, _normals});
     _draw->assignIndices(_indices);
     _draw->indexCount = static_cast<std::uint32_t>(_indices->size());
     _draw->instanceCount = 1;
 
-    _root = vsg::Group::create();
-    for (bool depthPrepass : {true, false})
+    if (!_root)
     {
-        auto stateGroup = vsg::StateGroup::create();
-        stateGroup->add(vsg::BindGraphicsPipeline::create(createPipeline(depthPrepass)));
-        stateGroup->addChild(_draw);
-        _root->addChild(stateGroup);
+        ensurePipelines();
+        _root = vsg::Group::create();
+
+        auto depthGroup = vsg::StateGroup::create();
+        depthGroup->add(vsg::BindGraphicsPipeline::create(_depthPipeline));
+        depthGroup->addChild(_draw);
+        _root->addChild(depthGroup);
+
+        auto colorGroup = vsg::StateGroup::create();
+        colorGroup->add(vsg::BindGraphicsPipeline::create(_colorPipeline));
+        colorGroup->addChild(_draw);
+        _root->addChild(colorGroup);
     }
+}
+
+void GaussianSplatSet::ensureCapacity(std::size_t needed)
+{
+    if (needed == 0) return;
+    if (needed <= _capacity && _root) return;
+
+    ensurePipelines();
+
+    const std::size_t oldCap = _capacity;
+    std::size_t newCap = needed;
+    if (oldCap > 0)
+        newCap = std::max(needed, oldCap + oldCap / 2);
+
+    const auto vertexCount = newCap * 4;
+    const auto indexCount = newCap * 6;
+
+    auto centerRadius = vsg::vec4Array::create(vertexCount);
+    auto corners = vsg::vec2Array::create(vertexCount);
+    auto colors = vsg::vec4Array::create(vertexCount);
+    auto normals = vsg::vec3Array::create(vertexCount);
+    auto indices = vsg::uintArray::create(indexCount);
+
+    centerRadius->properties.dataVariance = vsg::DYNAMIC_DATA;
+    colors->properties.dataVariance = vsg::DYNAMIC_DATA;
+    normals->properties.dataVariance = vsg::DYNAMIC_DATA;
+
+    // Preserve existing slots for updateRegion grow; init only the new tail.
+    if (oldCap > 0 && _centerRadius && _corners && _colors && _normals && _indices)
+    {
+        const auto oldVerts = oldCap * 4;
+        const auto oldIndices = oldCap * 6;
+        std::copy_n(_centerRadius->begin(), oldVerts, centerRadius->begin());
+        std::copy_n(_corners->begin(), oldVerts, corners->begin());
+        std::copy_n(_colors->begin(), oldVerts, colors->begin());
+        std::copy_n(_normals->begin(), oldVerts, normals->begin());
+        std::copy_n(_indices->begin(), oldIndices, indices->begin());
+    }
+
+    _centerRadius = centerRadius;
+    _corners = corners;
+    _colors = colors;
+    _normals = normals;
+    _indices = indices;
+    _capacity = newCap;
+
+    initSlotGeometry(oldCap, newCap);
+    zeroDynamicRange(oldCap, newCap);
+    bindDrawArrays();
+}
+
+void GaussianSplatSet::resize(std::size_t splatCount)
+{
+    if (splatCount == 0)
+    {
+        _capacity = 0;
+        _centerRadius = nullptr;
+        _corners = nullptr;
+        _colors = nullptr;
+        _normals = nullptr;
+        _indices = nullptr;
+        _draw = nullptr;
+        _root = nullptr;
+        // Keep cached pipelines for the next ensureCapacity.
+        return;
+    }
+
+    if (splatCount == _capacity && _root) return;
+
+    // Exact size for one-shot builds: allocate precisely when empty, otherwise grow.
+    if (_capacity == 0)
+    {
+        ensurePipelines();
+        _capacity = 0; // ensureCapacity treats oldCap==0 → newCap==needed
+        // Temporarily call grow logic with forced exact size:
+        const auto vertexCount = splatCount * 4;
+        const auto indexCount = splatCount * 6;
+
+        _centerRadius = vsg::vec4Array::create(vertexCount);
+        _corners = vsg::vec2Array::create(vertexCount);
+        _colors = vsg::vec4Array::create(vertexCount);
+        _normals = vsg::vec3Array::create(vertexCount);
+        _indices = vsg::uintArray::create(indexCount);
+
+        _centerRadius->properties.dataVariance = vsg::DYNAMIC_DATA;
+        _colors->properties.dataVariance = vsg::DYNAMIC_DATA;
+        _normals->properties.dataVariance = vsg::DYNAMIC_DATA;
+
+        _capacity = splatCount;
+        initSlotGeometry(0, splatCount);
+        zeroDynamicRange(0, splatCount);
+        bindDrawArrays();
+        return;
+    }
+
+    ensureCapacity(splatCount);
 }
 
 void GaussianSplatSet::set(std::size_t index, const Splat& splat)
