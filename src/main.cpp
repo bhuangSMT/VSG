@@ -194,6 +194,9 @@ try
     // box, so the sampling adapts to the model's own size.
     auto rayDivisions = arguments.value<int>(1600, "--ray-divisions");
 
+    // Log per-cut timings to stdout so interactive slowdown is measurable.
+    const bool profileCuts = arguments.read({"--profile", "-p"});
+
     if (arguments.errors()) return arguments.writeErrorMessages(std::cerr);
 
     if (rayDivisions < 1)
@@ -486,6 +489,12 @@ try
     // Bridges BRep geometry into the VSG scene. Populated before the viewer is
     // initialized so the camera is framed around real geometry.
     auto renderManager = std::make_shared<app::RenderManager>(viewer, vsg_scene, options);
+    renderManager->setProfilingEnabled(profileCuts);
+    if (profileCuts)
+    {
+        std::cout << "profiling enabled: one line per boolean cut\n";
+        std::cout.flush();
+    }
 
     const app::BRep startupBRep = createCubeBRep();
     seedToolSize(startupBRep);

@@ -55,6 +55,11 @@ public:
                        const ToolPose& tipB,
                        int circleSegments = 8);
 
+    // Append triangles from another soup. rebuildHierarchy rebuilds the BVH
+    // (needed when this volume is used for boolean). Display-only accumulation
+    // can skip it.
+    void appendTriangles(const TriangleMesh& extra, bool rebuildHierarchy = true);
+
 private:
     void rebuildBvh();
 

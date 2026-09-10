@@ -42,8 +42,16 @@ struct RaySlot
 {
     std::uint32_t intervalOffset = 0;
     std::uint32_t intervalCount = 0;
+    // Allocated block size in the pool (>= intervalCount). 0 means "same as
+    // intervalCount" for slots that have never been grown with slack.
+    std::uint32_t intervalCapacity = 0;
 
     bool empty() const { return intervalCount == 0; }
+
+    std::uint32_t capacity() const
+    {
+        return intervalCapacity > 0 ? intervalCapacity : intervalCount;
+    }
 };
 
 struct IntervalSpan
@@ -87,9 +95,18 @@ public:
 
     void append(RaySlot& slot, const Interval* begin, std::uint32_t count)
     {
+        // A slot that already owned a block leaves it behind unreferenced.
+        // Tracking that here keeps the compact test O(1) per cut.
+        wasted += slot.capacity();
+
+        // +2 slack so a later 1→2 (or 2→3) split can stay in-place.
+        const std::uint32_t capacity = count + 2;
         slot.intervalOffset = static_cast<std::uint32_t>(data.size());
         slot.intervalCount = count;
+        slot.intervalCapacity = capacity;
         data.insert(data.end(), begin, begin + count);
+        if (capacity > count)
+            data.insert(data.end(), capacity - count, Interval{});
     }
 
     void append(RaySlot& slot, const std::vector<Interval>& intervals)
@@ -99,16 +116,70 @@ public:
 
     bool tryReplaceInPlace(RaySlot& slot, const Interval* begin, std::uint32_t count)
     {
-        if (count > slot.intervalCount) return false;
+        if (count > slot.capacity()) return false;
         for (std::uint32_t i = 0; i < count; ++i)
             data[slot.intervalOffset + i] = begin[i];
         slot.intervalCount = count;
+        if (slot.intervalCapacity == 0) slot.intervalCapacity = count;
         return true;
     }
 
-    void clear() { data.clear(); }
+    // Pack live slot blocks; drops orphaned history from failed in-place grows.
+    // Retains +2 capacity slack so the next split can stay in-place.
+    void compact(std::vector<RaySlot>& cells)
+    {
+        std::size_t reserved = 0;
+        for (const RaySlot& slot : cells)
+        {
+            if (slot.intervalCount == 0) continue;
+            reserved += static_cast<std::size_t>(slot.intervalCount) + 2;
+        }
+        wasted = 0;
+        if (reserved == 0)
+        {
+            data.clear();
+            for (RaySlot& slot : cells)
+            {
+                slot.intervalOffset = 0;
+                slot.intervalCount = 0;
+                slot.intervalCapacity = 0;
+            }
+            return;
+        }
+
+        std::vector<Interval> packed;
+        packed.reserve(reserved);
+        for (RaySlot& slot : cells)
+        {
+            if (slot.intervalCount == 0)
+            {
+                slot.intervalOffset = 0;
+                slot.intervalCapacity = 0;
+                continue;
+            }
+            const auto newOffset = static_cast<std::uint32_t>(packed.size());
+            packed.insert(packed.end(),
+                          data.begin() + static_cast<std::ptrdiff_t>(slot.intervalOffset),
+                          data.begin() + static_cast<std::ptrdiff_t>(slot.intervalOffset +
+                                                                    slot.intervalCount));
+            packed.insert(packed.end(), 2, Interval{});
+            slot.intervalOffset = newOffset;
+            slot.intervalCapacity = slot.intervalCount + 2;
+        }
+        data.swap(packed);
+    }
+
+    void clear()
+    {
+        data.clear();
+        wasted = 0;
+    }
 
     std::vector<Interval> data;
+
+    // Entries in data no longer reachable from any slot, accumulated by
+    // append(). Reset by compact().
+    std::size_t wasted = 0;
 };
 
 // Dense sampling grid for one cast axis. Lateral indices (iu, iv) address slots.

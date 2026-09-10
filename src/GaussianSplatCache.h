@@ -90,6 +90,7 @@ private:
     const CellRef& cellRef(std::size_t axis, std::uint32_t su, std::uint32_t sv) const;
 
     void freeBlock(std::uint32_t first, std::uint32_t length);
+    void addFreeRange(std::uint32_t first, std::uint32_t length);
     bool allocBlock(std::uint32_t length, std::uint32_t* outFirst);
     void clearSlots(std::uint32_t first, std::uint32_t count);
 

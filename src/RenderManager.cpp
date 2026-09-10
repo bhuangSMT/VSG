@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <vector>
 
@@ -19,6 +21,53 @@
 
 namespace app
 {
+namespace
+{
+
+using ProfileClock = std::chrono::steady_clock;
+
+double millisSince(ProfileClock::time_point start)
+{
+    const std::chrono::duration<double, std::milli> elapsed = ProfileClock::now() - start;
+    return elapsed.count();
+}
+
+// Cells the boolean will visit for this dirty box, summed over present axes.
+// This is the work the sweep AABB actually buys, independent of what it cuts.
+std::size_t dirtyWindowCells(const RayModel& model, const BoundingBox& modelAabb)
+{
+    if (!modelAabb.valid()) return 0;
+
+    std::size_t cells = 0;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* grid = model.grid(axis);
+        if (!grid) continue;
+
+        std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
+        if (!gridWindowFromModelAabb(*grid, modelAabb, iu0, iu1, iv0, iv1)) continue;
+        cells += static_cast<std::size_t>(iu1 - iu0 + 1) *
+                 static_cast<std::size_t>(iv1 - iv0 + 1);
+    }
+    return cells;
+}
+
+// Live intervals vs entries actually held by the per-axis interval pools. The
+// ratio is what IntervalPool::compact keeps bounded. ("slots" is a Qt macro.)
+void poolOccupancy(const RayModel& model, std::size_t& live, std::size_t& reserved)
+{
+    live = 0;
+    reserved = 0;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* grid = model.grid(axis);
+        if (!grid) continue;
+        live += grid->intervalCount();
+        reserved += grid->pool.data.size();
+    }
+}
+
+} // namespace
 
 RenderManager::RenderManager(vsg::ref_ptr<vsgQt::Viewer> viewer,
                              vsg::ref_ptr<vsg::Group> scene,
@@ -554,6 +603,7 @@ void RenderManager::clear()
     _toolTransform = nullptr;
     _sweptNode = nullptr;
     _sweptVolume.reset();
+    _cutSweep.reset();
     _current.reset();
     clearRayModels();
     if (_viewer) _viewer->request();
@@ -771,6 +821,7 @@ void RenderManager::clearSweptVolume()
     }
 
     _sweptVolume.reset();
+    _cutSweep.reset();
     // Keep recording ready whenever a cutter is active.
     if (_toolType != ToolType::None) _sweptVolume = SweptVolume{};
 
@@ -803,8 +854,17 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
 
     const ToolPose tipA = *sweep.lastPose();
 
-    // Last-only mode: drop the previous segment's mesh/BVH and scene node
-    // before writing the new one, so only the latest sweep is kept.
+    // Boolean always uses this one segment. Stock (_booleanRayModel) already
+    // holds prior cuts; re-walking the whole path would only grow cost.
+    SweptVolume step;
+    step.appendSegment(_toolType, radius, worldToolLength(), tipA, pose);
+    if (step.empty())
+    {
+        sweep.setLastPose(pose);
+        return false;
+    }
+    _cutSweep = step;
+
     if (Parameter::instance().showLastSweptVolumeOnly())
     {
         if (_sweptNode)
@@ -814,10 +874,15 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
                            children.end());
             _sweptNode = nullptr;
         }
-        sweep.clearGeometry();
+        sweep = std::move(step);
+    }
+    else
+    {
+        // Keep the path for drawing only; skip BVH on the accumulator.
+        sweep.appendTriangles(_cutSweep->mesh(), false);
+        sweep.setLastPose(pose);
     }
 
-    sweep.appendSegment(_toolType, radius, worldToolLength(), tipA, pose);
     publishSweptVolume();
     return true;
 }
@@ -898,20 +963,27 @@ void RenderManager::applyBooleanToRayModel()
     const BooleanOp op = Parameter::instance().booleanOp();
     BoundingBox dirtyModelAabb;
     bool haveDirtyRegion = false;
+    double booleanMs = 0.0;
+    bool raysMutated = false;
+
+    // Tool motion calls this on every sweep step, so the branches below that
+    // only re-point _rayModel must not trigger a redraw of unchanged rays.
+    const RayModel* const displayedBefore = _rayModel;
 
     if (op == BooleanOp::None)
     {
         // Do not revert to the original cast; leave the last result in place.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
     }
-    else if (!_sweptVolume || _sweptVolume->empty())
+    else if (!_cutSweep || _cutSweep->empty())
     {
         // Keep any cuts already applied; only the cutter mesh went away.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
     }
     else
     {
-        // Cumulative: mutate a working copy in place. Fork from source once.
+        // Cumulative stock: mutate a working copy in place. Fork from source once.
+        // Each call subtracts/unions only the newest segment (_cutSweep).
         if (!_booleanRayModel)
             _booleanRayModel = _sourceRayModel->clone();
 
@@ -919,30 +991,89 @@ void RenderManager::applyBooleanToRayModel()
         const vsg::dmat4 modelToWorld = fitMatrix(bounds);
         const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
 
-        if (_sweptVolume->bvh().bounds().valid())
+        if (_cutSweep->bvh().bounds().valid())
         {
             dirtyModelAabb =
-                modelAabbFromWorld(_sweptVolume->bvh().bounds(), worldToModel);
+                modelAabbFromWorld(_cutSweep->bvh().bounds(), worldToModel);
             haveDirtyRegion = dirtyModelAabb.valid();
         }
 
-        _booleanRayModel->booleanInPlace(*_sweptVolume, op, modelToWorld);
+        const auto booleanStart = ProfileClock::now();
+        _booleanRayModel->booleanInPlace(*_cutSweep, op, modelToWorld);
+        booleanMs = millisSince(booleanStart);
         _rayModel = &*_booleanRayModel;
+        raysMutated = true;
+    }
+
+    if (!raysMutated && _rayModel == displayedBefore)
+    {
+        // No cut ran and the same model is still on screen: the tool (and its
+        // swept volume) moved, but the rays did not. A redraw is enough, and a
+        // full Ray-GS rebuild here would cost more than the frame itself.
+        if (_viewer) _viewer->request();
+        return;
     }
 
     if (_viewMode == ViewMode::RayGS && _rayModel && haveDirtyRegion && !_splatCache.empty())
     {
         const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+        const auto patchStart = ProfileClock::now();
         if (_splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
                                      splatRadii(*_rayModel, stride), splatStyle()))
         {
+            logCutProfile(booleanMs, "patch", millisSince(patchStart), dirtyModelAabb);
             if (_viewer) _viewer->request();
             return;
         }
+        // updateRegion bailed part way through; the rebuild below repacks it.
+        if (_profiling)
+            std::printf("  splat patch failed (free list exhausted) after %.2f ms\n",
+                        millisSince(patchStart));
     }
 
-    if (usesRayModel(_viewMode)) rebuild();
-    else if (_viewer) _viewer->request();
+    if (usesRayModel(_viewMode))
+    {
+        const auto rebuildStart = ProfileClock::now();
+        rebuild();
+        logCutProfile(booleanMs, "rebuild", millisSince(rebuildStart), dirtyModelAabb);
+    }
+    else
+    {
+        logCutProfile(booleanMs, "no-draw", 0.0, dirtyModelAabb);
+        if (_viewer) _viewer->request();
+    }
+}
+
+void RenderManager::logCutProfile(double booleanMs, const char* drawPath, double drawMs,
+                                  const BoundingBox& dirtyModelAabb)
+{
+    if (!_profiling) return;
+
+    ++_cutIndex;
+
+    std::size_t liveIntervals = 0;
+    std::size_t poolReserved = 0;
+    if (_rayModel) poolOccupancy(*_rayModel, liveIntervals, poolReserved);
+
+    const double poolRatio =
+        liveIntervals > 0 ? static_cast<double>(poolReserved) / static_cast<double>(liveIntervals)
+                          : 0.0;
+    const std::size_t splatLive = _splatCache.liveEndpoints();
+    const std::size_t splatCap = _splatCache.capacity();
+    const double splatFill =
+        splatCap > 0 ? static_cast<double>(splatLive) / static_cast<double>(splatCap) : 0.0;
+
+    const std::size_t windowCells =
+        _rayModel ? dirtyWindowCells(*_rayModel, dirtyModelAabb) : 0;
+    const std::size_t sweepTris = _cutSweep ? _cutSweep->mesh().triangles.size() : 0;
+
+    std::printf("cut %-4lld total %7.2f ms  boolean %7.2f ms  %-7s %6.2f ms"
+                "  window %9zu cells  sweep %6zu tris"
+                "  intervals %8zu  pool x%.2f  splat %8zu/%-8zu %3.0f%%\n",
+                _cutIndex, booleanMs + drawMs, booleanMs, drawPath, drawMs,
+                windowCells, sweepTris,
+                liveIntervals, poolRatio, splatLive, splatCap, splatFill * 100.0);
+    std::fflush(stdout);
 }
 
 bool RenderManager::pickToolPlacement(const vsg::Camera& camera, int32_t x, int32_t y,

@@ -604,4 +604,12 @@ void SweptVolume::appendSegment(ToolType type,
     rebuildBvh();
     _lastPose = tipB;
 }
+
+void SweptVolume::appendTriangles(const TriangleMesh& extra, bool rebuildHierarchy)
+{
+    _mesh.triangles.insert(_mesh.triangles.end(),
+                           extra.triangles.begin(), extra.triangles.end());
+    if (rebuildHierarchy) rebuildBvh();
+}
+
 } // namespace app

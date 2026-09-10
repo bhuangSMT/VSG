@@ -132,10 +132,9 @@ void GaussianSplatCache::clearSlots(std::uint32_t first, std::uint32_t count)
         _set.clearSlot(static_cast<std::size_t>(first + i));
 }
 
-void GaussianSplatCache::freeBlock(std::uint32_t first, std::uint32_t length)
+void GaussianSplatCache::addFreeRange(std::uint32_t first, std::uint32_t length)
 {
     if (length == 0) return;
-    clearSlots(first, length);
 
     FreeRange range{first, length};
     auto it = std::lower_bound(
@@ -160,11 +159,20 @@ void GaussianSplatCache::freeBlock(std::uint32_t first, std::uint32_t length)
             _freeList.erase(it);
         }
     }
+}
+
+void GaussianSplatCache::freeBlock(std::uint32_t first, std::uint32_t length)
+{
+    if (length == 0) return;
+    clearSlots(first, length);
+    addFreeRange(first, length);
 
     if (_live >= length) _live -= length;
     else _live = 0;
 }
 
+// Free-list only. Growing GPU capacity here would rebind the live VertexIndexDraw
+// with uncompiled BufferInfos, so exhaustion has to fall back to a full rebuild.
 bool GaussianSplatCache::allocBlock(std::uint32_t length, std::uint32_t* outFirst)
 {
     if (length == 0 || !outFirst) return false;
@@ -292,18 +300,29 @@ bool GaussianSplatCache::updateCell(const RayModel& rayModel,
         return fillCell(rayModel, axis, iu, iv, radius, style, ref, true);
     }
 
+    // +2 endpoint slack so a later 1→2 interval split often stays in-block.
+    std::uint32_t blockSize = needed + 2;
+    if (blockSize > static_cast<std::uint32_t>(maxEndpointsPerCell))
+        blockSize = static_cast<std::uint32_t>(maxEndpointsPerCell);
+    if (blockSize < needed) return false;
+
     if (ref.block != 0 && ref.first != CellRef::kInvalid)
         freeBlock(ref.first, ref.block);
 
     std::uint32_t first = 0;
-    if (!allocBlock(needed, &first))
+    if (!allocBlock(blockSize, &first))
     {
-        ref = {};
-        return false;
+        // Slack is opportunistic: an exact fit still beats a full rebuild.
+        blockSize = needed;
+        if (!allocBlock(blockSize, &first))
+        {
+            ref = {};
+            return false;
+        }
     }
 
     ref.first = first;
-    ref.block = static_cast<std::uint16_t>(needed);
+    ref.block = static_cast<std::uint16_t>(blockSize);
     ref.count = 0;
     if (!fillCell(rayModel, axis, iu, iv, radius, style, ref, true))
     {
@@ -378,8 +397,10 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     if (live == 0)
         throw std::runtime_error("The ray model contains no rays; try a coarser resolution.");
 
-    const std::size_t slack = live / 4;
-    const std::size_t minCapacity = live + slack;
+    // Full 2x headroom: the tail becomes free-list space, so later cuts can grow
+    // cells in place instead of forcing a rebuild (GPU capacity cannot grow
+    // mid-cut without recompiling the live draw node).
+    const std::size_t minCapacity = live * 2;
     _set.ensureCapacity(minCapacity);
     _capacity = _set.capacity();
     _live = live;

@@ -91,9 +91,9 @@ public:
     // For flat / bull nose, position is the tip. For ball nose / sphere, position
     // is the sphere centre — the tip is shifted down the axis by the tool radius.
     // No-op when the tool type is None. While a tool is active, motion always
-    // accumulates a CPU swept volume. Each mesh change re-applies the active
-    // boolean op and rebuilds Ray / Ray-GS. The swept-volume checkbox only
-    // controls whether that mesh is drawn in VSG.
+    // accumulates a CPU swept volume. Each new segment is booleaned once into
+    // the stock RayModel (prior cuts stay). The swept-volume checkbox only
+    // controls whether the cutter path is drawn in VSG.
     void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
 
     // Show or hide the swept-volume drawable. Does not start/stop recording.
@@ -125,6 +125,11 @@ public:
     // existing camera frames it regardless of the model's native units.
     void setFitToUnitBox(bool enable) { _fitToUnitBox = enable; }
     bool fitToUnitBox() const { return _fitToUnitBox; }
+
+    // Log per-cut timings (boolean, splat patch vs full rebuild) and the
+    // interval-pool / splat-buffer occupancy that drives them to stdout.
+    void setProfilingEnabled(bool enable) { _profiling = enable; }
+    bool profilingEnabled() const { return _profiling; }
 
     const vsg::ref_ptr<vsg::Group>& scene() const { return _scene; }
 
@@ -183,6 +188,11 @@ private:
     // Full Ray-GS rebuild through the Gaussian cache, then attach.
     void rebuildSplatCache();
 
+    // One --profile line for a completed cut. drawPath names how the display
+    // was refreshed: "patch" (splat AABB update), "rebuild" or "no-draw".
+    void logCutProfile(double booleanMs, const char* drawPath, double drawMs,
+                       const BoundingBox& dirtyModelAabb);
+
     // Compile a subgraph against the running viewer, then attach it.
     // replaceExisting swaps the model node only; the tool transform is kept.
     void attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting);
@@ -209,8 +219,10 @@ private:
 
     // The last (current) swept volume on the CPU: triangle soup + BVH. Always
     // recorded while a tool is active. The GPU node is only rebuilt when
-    // _showSweptVolume is true.
+    // _showSweptVolume is true. Boolean uses _cutSweep (the newest segment
+    // only) so the stock can keep prior cuts without re-walking the whole path.
     std::optional<SweptVolume> _sweptVolume;
+    std::optional<SweptVolume> _cutSweep;
     vsg::ref_ptr<vsg::Node> _sweptNode;
     bool _showSweptVolume = false;
 
@@ -241,6 +253,10 @@ private:
     bool _fitToUnitBox = true;
     ViewMode _viewMode = ViewMode::Facet;
     ToolType _toolType = ToolType::None;
+
+    // --profile: per-cut timing log, and the cut counter it is keyed by.
+    bool _profiling = false;
+    long long _cutIndex = 0;
 
     // Kept so a view mode change can rebuild the geometry from the source
     // topology rather than from whatever is currently in the scene.

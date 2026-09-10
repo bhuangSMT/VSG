@@ -17,6 +17,20 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
+# Release: -O3 -DNDEBUG plus LTO and host CPU codegen. Not for Debug.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg)
+    if(_ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    else()
+        message(STATUS "LTO not available: ${_ipo_msg}")
+    endif()
+    if(NOT MSVC)
+        add_compile_options(-O3 -march=native)
+    endif()
+endif()
+
 # Keep the executable at the build-tree root for both Ninja and Visual Studio.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 foreach(_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)

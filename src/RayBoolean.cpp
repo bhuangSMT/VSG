@@ -4,8 +4,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <thread>
+#include <iterator>
 #include <vector>
+
+#include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
+#include <tbb/parallel_for.h>
 
 #include <vsg/maths/transform.h>
 
@@ -207,17 +211,29 @@ std::vector<Interval> unionTicks(const std::vector<Interval>& solid,
     return merged;
 }
 
-void replaceSlotIntervals(RayGrid& grid, RaySlot& slot, const std::vector<Interval>& next)
+void maybeCompactPool(RayGrid& grid)
 {
-    if (next.empty())
-    {
-        slot.intervalCount = 0;
-        return;
-    }
-    if (!grid.pool.tryReplaceInPlace(slot, next.data(),
-                                     static_cast<std::uint32_t>(next.size())))
-        grid.pool.append(slot, next);
+    // O(1): append() maintains the orphan count, so a cut that touched a small
+    // window does not pay a scan over every slot in the grid.
+    IntervalPool& pool = grid.pool;
+    if (pool.wasted == 0) return;
+    if (pool.wasted * 2 > pool.data.size()) pool.compact(grid.cells);
 }
+
+// Cells whose intervals changed. Pool writes stay on one thread after the
+// parallel window walk; workers only read.
+struct PendingUpdate
+{
+    std::size_t flat = 0;
+    std::vector<Interval> intervals; // empty => clear the slot
+};
+
+struct CellScratch
+{
+    std::vector<Hit> hits;
+    std::vector<Interval> current;
+    std::vector<PendingUpdate> pending;
+};
 
 void processAxisGrid(RayGrid& grid,
                      const WorldSweep& sweep,
@@ -235,48 +251,84 @@ void processAxisGrid(RayGrid& grid,
                                  iu0, iu1, iv0, iv1))
         return;
 
-    std::vector<Hit> hits;
-    for (std::uint32_t iv = iv0; iv <= iv1; ++iv)
+    const std::uint32_t windowW = iu1 - iu0 + 1;
+    const std::size_t cellCount =
+        static_cast<std::size_t>(windowW) * static_cast<std::size_t>(iv1 - iv0 + 1);
+
+    tbb::enumerable_thread_specific<CellScratch> scratch;
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, cellCount),
+        [&](const tbb::blocked_range<std::size_t>& range) {
+            CellScratch& local = scratch.local();
+
+            for (std::size_t flat = range.begin(); flat != range.end(); ++flat)
+            {
+                const std::uint32_t iu =
+                    iu0 + static_cast<std::uint32_t>(flat % windowW);
+                const std::uint32_t iv =
+                    iv0 + static_cast<std::uint32_t>(flat / windowW);
+
+                const RaySlot& slot = grid.at(iu, iv);
+                const double u0 = grid.sampleU(iu);
+                const double v0 = grid.sampleV(iv);
+
+                collectHits(sweep, axis, u, v, u0, v0, local.hits);
+                if (local.hits.size() < 2) continue;
+
+                const std::vector<Interval> sweepSolid =
+                    removalTicksFromHits(local.hits, grid, mergeTol);
+                if (sweepSolid.empty()) continue;
+
+                local.current.clear();
+                if (!slot.empty())
+                {
+                    auto spans = grid.pool.span(slot);
+                    local.current.assign(spans.begin(), spans.end());
+                }
+
+                std::vector<Interval> result;
+                if (op == BooleanOp::Subtraction)
+                {
+                    if (local.current.empty()) continue;
+                    result = subtractTicks(local.current, sweepSolid);
+                }
+                else
+                {
+                    result = unionTicks(local.current, sweepSolid);
+                }
+
+                local.pending.push_back(PendingUpdate{flat, std::move(result)});
+            }
+        });
+
+    std::vector<PendingUpdate> pending;
+    for (CellScratch& local : scratch)
     {
-        for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
-        {
-            RaySlot& slot = grid.at(iu, iv);
-            const double u0 = grid.sampleU(iu);
-            const double v0 = grid.sampleV(iv);
-
-            collectHits(sweep, axis, u, v, u0, v0, hits);
-            if (hits.size() < 2)
-            {
-                if (op == BooleanOp::Subtraction) continue;
-                // Union with empty sweep solid: unchanged.
-                continue;
-            }
-
-            const std::vector<Interval> sweepSolid =
-                removalTicksFromHits(hits, grid, mergeTol);
-            if (sweepSolid.empty()) continue;
-
-            std::vector<Interval> current;
-            if (!slot.empty())
-            {
-                auto spans = grid.pool.span(slot);
-                current.assign(spans.begin(), spans.end());
-            }
-
-            std::vector<Interval> result;
-            if (op == BooleanOp::Subtraction)
-            {
-                if (current.empty()) continue;
-                result = subtractTicks(current, sweepSolid);
-            }
-            else
-            {
-                result = unionTicks(current, sweepSolid);
-            }
-
-            replaceSlotIntervals(grid, slot, result);
-        }
+        pending.insert(pending.end(), std::make_move_iterator(local.pending.begin()),
+                       std::make_move_iterator(local.pending.end()));
     }
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingUpdate& lhs, const PendingUpdate& rhs) {
+                  return lhs.flat < rhs.flat;
+              });
+
+    for (const PendingUpdate& entry : pending)
+    {
+        const std::uint32_t iu = iu0 + static_cast<std::uint32_t>(entry.flat % windowW);
+        const std::uint32_t iv = iv0 + static_cast<std::uint32_t>(entry.flat / windowW);
+        RaySlot& slot = grid.at(iu, iv);
+        if (entry.intervals.empty())
+        {
+            slot.intervalCount = 0;
+            continue;
+        }
+        if (!grid.pool.tryReplaceInPlace(slot, entry.intervals.data(),
+                                         static_cast<std::uint32_t>(entry.intervals.size())))
+            grid.pool.append(slot, entry.intervals);
+    }
+
+    maybeCompactPool(grid);
 }
 
 RayGrid copyGrid(const RayGrid& src)
@@ -293,6 +345,7 @@ RayGrid copyGrid(const RayGrid& src)
     dst.axis = src.axis;
     dst.cells = src.cells;
     dst.pool.data = src.pool.data;
+    dst.pool.wasted = src.pool.wasted;
     return dst;
 }
 
@@ -393,27 +446,13 @@ void applyBooleanInPlace(RayModel& model,
 
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
-    // One thread per present axis; each writes only its own grid (no mutex).
-    std::thread workers[2];
-    int workerCount = 0;
+    // Axes share nothing, but nested TBB (axis × cell) raced the interval
+    // pool. Walk axes in order; each axis still parallelizes its dirty window.
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        RayGrid* g = model.grid(axis);
-        if (!g) continue;
-
-        if (workerCount < 2)
-        {
-            workers[workerCount++] = std::thread(
-                [g, &worldSweep, op, mergeTol]() {
-                    processAxisGrid(*g, worldSweep, op, mergeTol);
-                });
-        }
-        else
-        {
+        if (RayGrid* g = model.grid(axis))
             processAxisGrid(*g, worldSweep, op, mergeTol);
-        }
     }
-    for (int i = 0; i < workerCount; ++i) workers[i].join();
 }
 
 RayModel RayModel::withBoolean(const SweptVolume& sweep,
