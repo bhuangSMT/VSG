@@ -54,6 +54,11 @@ public:
     double toolRadius() const { return _toolRadius; }
     void setToolRadius(double radius) { _toolRadius = radius; }
 
+    // Shank / flute length in model space (above the tip geometry). Default is
+    // 2.8 × toolRadius when a model is loaded.
+    double toolLength() const { return _toolLength; }
+    void setToolLength(double length) { _toolLength = length; }
+
     // Whether the swept-volume mesh is drawn in the scene. Generation always
     // runs while a tool is active; this only gates the VSG node.
     bool sweptVolume() const { return _sweptVolume; }
@@ -81,6 +86,7 @@ private:
     bool _continuousUpdate = true;
     ToolType _toolType = ToolType::None;
     double _toolRadius = 0.05;
+    double _toolLength = 0.05 * 2.8;
     bool _sweptVolume = false;
     bool _showLastSweptVolumeOnly = true;
     BooleanOp _booleanOp = BooleanOp::None;

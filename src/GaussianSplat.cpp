@@ -26,33 +26,29 @@ layout(location = 3) in vec3 inNormal;
 
 layout(location = 0) out vec2 corner;
 layout(location = 1) out vec4 color;
-layout(location = 2) out float closeUp;
-layout(location = 3) out vec3 normalEye;
+layout(location = 2) out vec3 normalEye;
 
 void main()
 {
+    float radius = inCenterRadius.w;
+    // Empty cache slots (padding) stay off-screen.
+    if (radius <= 0.0)
+    {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        corner = vec2(0.0);
+        color = vec4(0.0);
+        normalEye = vec3(0.0, 0.0, 1.0);
+        return;
+    }
+
     vec4 centerEye = pc.modelView * vec4(inCenterRadius.xyz, 1.0);
 
-    float radius = inCenterRadius.w;
-
-    // How much of the viewport the splat spans, as a fraction of half its
-    // height. This is what "zoomed in" amounts to without having to know the
-    // pixel size: projection[1][1] is the vertical scale, and dividing by eye
-    // depth gives the on-screen size.
+    // On-screen size as a fraction of half the viewport height. Cap it so
+    // zooming in shrinks world-space radius instead of ballooning into beads.
     float apparent = radius * abs(pc.projection[1][1]) / max(-centerEye.z, 1e-6);
-
-    // Once a splat covers a noticeable slice of the screen its own outline
-    // starts to resolve and the surface breaks up into beads. Growing it from
-    // that point on pushes it further into its neighbours, so the overlap
-    // washes the pattern back out into one skin.
-    //
-    // The bounds are set against what a splat actually spans: a default view of
-    // a model sits near 0.09, so the ramp starts just above that and is fully
-    // on by a few times closer. Because the measure is the splat's own size, a
-    // finer ray resolution rides further up the zoom range before flattening,
-    // which is right — smaller splats resolve later.
-    closeUp = smoothstep(0.10, 0.32, apparent);
-    radius *= 1.0 + 0.90 * closeUp;
+    const float maxApparent = 0.12;
+    if (apparent > maxApparent)
+        radius *= maxApparent / apparent;
 
     centerEye.xy += inCorner * radius;
 
@@ -60,8 +56,7 @@ void main()
     // The depth-only pass lays down the near surface half a splat further away
     // than it really is. Every splat sampling that same surface then still
     // passes the depth test in the colour pass and can blend, while the far
-    // side of the model is still rejected. Uses the grown radius so the offset
-    // keeps pace with the quad.
+    // side of the model is still rejected.
     centerEye.z -= radius * 0.5;
 #endif
 
@@ -88,8 +83,7 @@ void main()
 const char* const splatFragmentBody = R"(
 layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 color;
-layout(location = 2) in float closeUp;
-layout(location = 3) in vec3 normalEye;
+layout(location = 2) in vec3 normalEye;
 
 layout(location = 0) out vec4 outColor;
 
@@ -109,13 +103,8 @@ void main()
 #else
     // Windowed Gaussian: subtracting the falloff's value at the quad's edge and
     // rescaling takes it to exactly zero there, so the splat fades out rather
-    // than ending on a visible rim.
-    //
-    // Zoomed in the bell is broadened, which spreads each splat's weight more
-    // evenly over its quad. Together with the extra overlap from the vertex
-    // stage that is a wider averaging kernel, so a splat's own profile stops
-    // being something the eye can pick out.
-    float bell = mix(2.77, 1.35, closeUp);
+    // than ending on a visible rim. Half intensity at half radius (bell 2.77).
+    const float bell = 2.77;
     float edge = exp(-bell);
     float falloff = max(exp(-bell * radiusSquared) - edge, 0.0) / (1.0 - edge);
 
@@ -249,6 +238,102 @@ vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
 
 } // namespace
 
+void GaussianSplatSet::resize(std::size_t splatCount)
+{
+    if (splatCount == _capacity && _root) return;
+
+    _capacity = splatCount;
+    if (splatCount == 0)
+    {
+        _centerRadius = nullptr;
+        _corners = nullptr;
+        _colors = nullptr;
+        _normals = nullptr;
+        _indices = nullptr;
+        _draw = nullptr;
+        _root = nullptr;
+        return;
+    }
+
+    const auto vertexCount = splatCount * 4;
+    const auto indexCount = splatCount * 6;
+
+    _centerRadius = vsg::vec4Array::create(vertexCount);
+    _corners = vsg::vec2Array::create(vertexCount);
+    _colors = vsg::vec4Array::create(vertexCount);
+    _normals = vsg::vec3Array::create(vertexCount);
+    _indices = vsg::uintArray::create(indexCount);
+
+    _centerRadius->properties.dataVariance = vsg::DYNAMIC_DATA;
+    _colors->properties.dataVariance = vsg::DYNAMIC_DATA;
+    _normals->properties.dataVariance = vsg::DYNAMIC_DATA;
+
+    for (std::size_t s = 0; s < splatCount; ++s)
+    {
+        const auto base = s * 4;
+        for (std::size_t k = 0; k < 4; ++k)
+        {
+            (*_centerRadius)[base + k] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+            (*_corners)[base + k] = cornerOffsets[k];
+            (*_colors)[base + k] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+            (*_normals)[base + k] = vsg::vec3(0.0f, 0.0f, 1.0f);
+        }
+
+        const auto first = static_cast<std::uint32_t>(base);
+        const auto indexBase = s * 6;
+        (*_indices)[indexBase + 0] = first + 0;
+        (*_indices)[indexBase + 1] = first + 1;
+        (*_indices)[indexBase + 2] = first + 2;
+        (*_indices)[indexBase + 3] = first + 0;
+        (*_indices)[indexBase + 4] = first + 2;
+        (*_indices)[indexBase + 5] = first + 3;
+    }
+
+    _draw = vsg::VertexIndexDraw::create();
+    _draw->assignArrays(vsg::DataList{_centerRadius, _corners, _colors, _normals});
+    _draw->assignIndices(_indices);
+    _draw->indexCount = static_cast<std::uint32_t>(_indices->size());
+    _draw->instanceCount = 1;
+
+    _root = vsg::Group::create();
+    for (bool depthPrepass : {true, false})
+    {
+        auto stateGroup = vsg::StateGroup::create();
+        stateGroup->add(vsg::BindGraphicsPipeline::create(createPipeline(depthPrepass)));
+        stateGroup->addChild(_draw);
+        _root->addChild(stateGroup);
+    }
+}
+
+void GaussianSplatSet::set(std::size_t index, const Splat& splat)
+{
+    if (!_centerRadius || index >= _capacity) return;
+
+    const auto base = index * 4;
+    for (std::size_t k = 0; k < 4; ++k)
+    {
+        (*_centerRadius)[base + k] =
+            vsg::vec4(splat.position.x, splat.position.y, splat.position.z, splat.radius);
+        (*_colors)[base + k] = splat.color;
+        (*_normals)[base + k] = splat.normal;
+    }
+}
+
+void GaussianSplatSet::clearSlot(std::size_t index)
+{
+    Splat empty{};
+    empty.radius = 0.0f;
+    empty.normal = vsg::vec3(0.0f, 0.0f, 1.0f);
+    set(index, empty);
+}
+
+void GaussianSplatSet::markDirty()
+{
+    if (_centerRadius) _centerRadius->dirty();
+    if (_colors) _colors->dirty();
+    if (_normals) _normals->dirty();
+}
+
 vsg::ref_ptr<vsg::Node> createGaussianSplatNode(const std::vector<Splat>& splats)
 {
     if (splats.empty())
@@ -256,62 +341,16 @@ vsg::ref_ptr<vsg::Node> createGaussianSplatNode(const std::vector<Splat>& splats
         throw std::invalid_argument("Gaussian splatting requires at least one point.");
     }
 
-    const auto splatCount = splats.size();
-    const auto vertexCount = splatCount * 4;
-    const auto indexCount = splatCount * 6;
-
-    auto centerRadius = vsg::vec4Array::create(vertexCount);
-    auto corners = vsg::vec2Array::create(vertexCount);
-    auto colors = vsg::vec4Array::create(vertexCount);
-    auto normals = vsg::vec3Array::create(vertexCount);
-    auto indices = vsg::uintArray::create(indexCount);
-
-    for (std::size_t s = 0; s < splatCount; ++s)
+    for (const Splat& splat : splats)
     {
-        const Splat& splat = splats[s];
         if (!(splat.radius > 0.0f))
-        {
             throw std::invalid_argument("Gaussian splat radius must be positive.");
-        }
-
-        const auto base = s * 4;
-
-        for (std::size_t k = 0; k < 4; ++k)
-        {
-            (*centerRadius)[base + k] =
-                vsg::vec4(splat.position.x, splat.position.y, splat.position.z, splat.radius);
-            (*corners)[base + k] = cornerOffsets[k];
-            (*colors)[base + k] = splat.color;
-            (*normals)[base + k] = splat.normal;
-        }
-
-        const auto first = static_cast<std::uint32_t>(base);
-        const auto indexBase = s * 6;
-        (*indices)[indexBase + 0] = first + 0;
-        (*indices)[indexBase + 1] = first + 1;
-        (*indices)[indexBase + 2] = first + 2;
-        (*indices)[indexBase + 3] = first + 0;
-        (*indices)[indexBase + 4] = first + 2;
-        (*indices)[indexBase + 5] = first + 3;
     }
 
-    // The two passes share one set of buffers and one draw command.
-    auto drawCommand = vsg::VertexIndexDraw::create();
-    drawCommand->assignArrays(vsg::DataList{centerRadius, corners, colors, normals});
-    drawCommand->assignIndices(indices);
-    drawCommand->indexCount = static_cast<std::uint32_t>(indices->size());
-    drawCommand->instanceCount = 1;
-
-    auto root = vsg::Group::create();
-    for (bool depthPrepass : {true, false})
-    {
-        auto stateGroup = vsg::StateGroup::create();
-        stateGroup->add(vsg::BindGraphicsPipeline::create(createPipeline(depthPrepass)));
-        stateGroup->addChild(drawCommand);
-        root->addChild(stateGroup);
-    }
-
-    return root;
+    GaussianSplatSet set;
+    set.resize(splats.size());
+    for (std::size_t s = 0; s < splats.size(); ++s) set.set(s, splats[s]);
+    return set.node();
 }
 
 } // namespace app

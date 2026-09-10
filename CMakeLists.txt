@@ -61,6 +61,7 @@ set(VSG_QT_CUBE_SOURCES
     src/BVH.cpp
     src/BoundingBox.cpp
     src/GaussianSplat.cpp
+    src/GaussianSplatCache.cpp
     src/ModelPick.cpp
     src/Parameter.cpp
     src/RayModel.cpp

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -19,24 +20,9 @@ namespace app
 namespace
 {
 
-// The one ceiling on how fine a cast may be, and it exists only because the
-// spans have to fit in memory. The UI lets the resolution be typed in, so it
-// has to be enforced rather than assumed.
-//
-// It is emphatically not a ceiling on what can be drawn. The renderer thins a
-// fine model out by grid layers, so a resolution far past anything the GPU
-// could hold is still worth casting and is still displayed; the model keeps
-// every ray it cast. Setting this by what looks good on screen would throw away
-// the accuracy the fine cast exists for.
-//
-// Eight million casts in a direction is roughly 2.5 GB of spans on a part that
-// the rays cross a couple of times, which is what a 24 GB machine can give up
-// without paging. Around 2800 steps across the bounding box.
 constexpr double maxStepsPerAxis = 8192.0;
 constexpr double maxCastsPerDirection = 8.0e6;
 
-// What one casting direction costs: the steps along the two axes its grid runs
-// over, and how many casts that comes to.
 struct CastExtent
 {
     double uSteps = 0.0;
@@ -75,23 +61,12 @@ Point3d toPoint(const vsg::vec3& v)
                    static_cast<double>(v.z)};
 }
 
-// One crossing of the surface: where along the cast axis it happened, and the
-// normal of the face that was crossed.
 struct Hit
 {
     double along = 0.0;
     Normal3f normal{0.0f, 0.0f, 0.0f};
 };
 
-// Collect where the line parallel to `axis` through (u0, v0) crosses the
-// surface, as coordinates along `axis`. u and v are the two remaining axes.
-//
-// Because the ray is axis aligned, the test reduces to a point-in-triangle
-// check in the (u, v) plane; the crossing coordinate is then the barycentric
-// blend of the triangle's own `axis` coordinates.
-//
-// The BRep's BVH supplies the candidates, so only the triangles whose footprint
-// straddles (u0, v0) are looked at rather than the whole mesh.
 void collectHits(const BRep& brep,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
@@ -115,10 +90,6 @@ void collectHits(const BRep& brep,
         const double bu = b[u], bv = b[v];
         const double cu = c[u], cv = c[v];
 
-        // Cheap reject: the ray cannot cross a triangle whose footprint in the
-        // (u, v) plane does not contain the sample point. The BVH prunes whole
-        // groups of triangles on the same grounds, but the ones it hands back
-        // still have to be checked individually.
         const double loU = std::min({au, bu, cu});
         const double hiU = std::max({au, bu, cu});
         const double loV = std::min({av, bv, cv});
@@ -126,29 +97,17 @@ void collectHits(const BRep& brep,
         if (u0 < loU || u0 > hiU || v0 < loV || v0 > hiV) return;
 
         const double denom = (bv - cv) * (au - cu) + (cu - bu) * (av - cv);
-
-        // The denominator is twice the projected area. When it vanishes the
-        // triangle is edge-on to the ray, projecting to a line that cannot be
-        // crossed cleanly. Compare against the footprint so the test holds at
-        // any model scale.
         const double areaScale = (hiU - loU) * (hiV - loV);
         if (std::abs(denom) <= 1e-12 * std::max(areaScale, 1e-300)) return;
 
         const double w0 = ((bv - cv) * (u0 - cu) + (cu - bu) * (v0 - cv)) / denom;
         const double w1 = ((cv - av) * (u0 - cu) + (au - cu) * (v0 - cv)) / denom;
         const double w2 = 1.0 - w0 - w1;
-
-        // Hits exactly on an edge or vertex are kept; duplicates from the
-        // neighbouring triangles are merged by the caller.
         if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) return;
 
         Hit hit;
         hit.along = w0 * a[axis] + w1 * b[axis] + w2 * c[axis];
 
-        // Face normal from the edge cross product. Its sign follows the
-        // triangle's winding, which an STL is under no obligation to get
-        // consistently right, so the caller re-orients it against the
-        // direction of travel instead of trusting it.
         const double e1[3]{b[0] - a[0], b[1] - a[1], b[2] - a[2]};
         const double e2[3]{c[0] - a[0], c[1] - a[1], c[2] - a[2]};
         const double n[3]{e1[1] * e2[2] - e1[2] * e2[1],
@@ -168,7 +127,6 @@ void collectHits(const BRep& brep,
     const BVH& bvh = brep.bvh();
     if (bvh.empty())
     {
-        // A BRep built without a hierarchy still has to cast correctly.
         const std::size_t faces = brep.faceCount();
         for (std::size_t f = 0; f < faces; ++f) test(f);
         return;
@@ -177,10 +135,6 @@ void collectHits(const BRep& brep,
     bvh.query(u, v, u0, v0, test);
 }
 
-// Sort the crossings and drop repeats, which arise whenever a ray meets an edge
-// or a vertex shared by several triangles. Of a merged group the first crossing
-// is the one kept, so a shared edge takes the normal of one of its faces rather
-// than an average of them.
 void sortAndMerge(std::vector<Hit>& hits, double tolerance)
 {
     std::sort(hits.begin(), hits.end(),
@@ -193,43 +147,10 @@ void sortAndMerge(std::vector<Hit>& hits, double tolerance)
     hits.erase(last, hits.end());
 }
 
-Point3d makePoint(std::size_t axis, std::size_t u, std::size_t v,
-                  double along, double u0, double v0)
-{
-    Point3d p{0.0, 0.0, 0.0};
-    p[axis] = along;
-    p[u] = u0;
-    p[v] = v0;
-    return p;
-}
-
-// Point a face normal out of the solid. The ray travels up the axis, so at an
-// entry the outward normal opposes it and at an exit it agrees. `entering`
-// picks which. This makes the result independent of the triangle winding, which
-// an STL may well have inconsistent.
-Normal3f orientOutward(Normal3f normal, std::size_t axis, bool entering)
-{
-    const float along = normal[axis];
-    const bool flip = entering ? (along > 0.0f) : (along < 0.0f);
-    if (flip)
-    {
-        for (int i = 0; i < 3; ++i) normal[i] = -normal[i];
-    }
-    return normal;
-}
-
-} // namespace
-
-namespace
-{
-
 Point3d finestWithin(const BoundingBox& bounds, const Point3d& requested)
 {
     if (!bounds.valid() || withinCastBudget(bounds, requested)) return requested;
 
-    // Casts in a direction go as the product of its two step counts, so
-    // coarsening everything by k divides them by k squared. That gives a
-    // starting factor directly; the step limit is linear in k.
     double scale = 1.0;
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
@@ -242,9 +163,6 @@ Point3d finestWithin(const BoundingBox& bounds, const Point3d& requested)
         scale = std::max(scale, extent.vSteps / maxStepsPerAxis);
     }
 
-    // Each step count is rounded down before the casts are counted, so the
-    // factor above can land a shade under what is needed. Creep up until the
-    // real test agrees rather than trying to invert the rounding.
     Point3d resolution = requested;
     for (int attempt = 0; attempt < 128; ++attempt)
     {
@@ -255,6 +173,36 @@ Point3d finestWithin(const BoundingBox& bounds, const Point3d& requested)
     }
 
     return resolution;
+}
+
+RayGrid buildGridFromBounds(const BoundingBox& bounds,
+                            const Point3d& resolution,
+                            std::size_t axis)
+{
+    RayGrid grid;
+    grid.axis = axis;
+
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    const Point3d& lo = bounds.min();
+
+    const CastExtent extent = castExtent(bounds, resolution, axis);
+    const int uCount = (extent.uSteps > 0.0) ? static_cast<int>(extent.uSteps) : 0;
+    const int vCount = (extent.vSteps > 0.0) ? static_cast<int>(extent.vSteps) : 0;
+
+    grid.width = static_cast<std::uint32_t>(uCount + 1);
+    grid.height = static_cast<std::uint32_t>(vCount + 1);
+    grid.spacingU = static_cast<float>(resolution[u]);
+    grid.spacingV = static_cast<float>(resolution[v]);
+    grid.originU = static_cast<float>(lo[u]);
+    grid.originV = static_cast<float>(lo[v]);
+    grid.originT = static_cast<float>(lo[axis]);
+    grid.unit = static_cast<float>(resolution[axis]);
+    if (!(grid.unit > 0.0f)) grid.unit = 1.0f;
+
+    grid.cells.assign(static_cast<std::size_t>(grid.width) * static_cast<std::size_t>(grid.height),
+                      RaySlot{});
+    return grid;
 }
 
 } // namespace
@@ -284,124 +232,80 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
 
     if (!model._bounds.valid() || brep.faceCount() == 0) return model;
 
-    const Point3d& lo = model._bounds.min();
     const double tolerance = 1e-9 * std::max(model._bounds.diagonal(), 1.0);
+
+    if (!withinCastBudget(model._bounds, resolution))
+    {
+        const Point3d finest = finestWithin(model._bounds, resolution);
+        const CastExtent extent = castExtent(model._bounds, resolution, 0);
+        throw std::invalid_argument(
+            "The ray resolution is too fine to cast for this model: it would need " +
+            std::to_string(static_cast<long long>(extent.casts)) +
+            " casts in one direction, and the limit is " +
+            std::to_string(static_cast<long long>(maxCastsPerDirection)) +
+            ". The finest that will cast is " + std::to_string(finest[0]) + ", " +
+            std::to_string(finest[1]) + ", " + std::to_string(finest[2]) + ".");
+    }
 
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        // The two axes the sampling grid runs over, in cyclic order: casting
-        // along x steps over y then z, along y over z then x, along z over x
-        // then y.
         const std::size_t u = (axis + 1) % 3;
         const std::size_t v = (axis + 2) % 3;
 
-        const double du = resolution[u];
-        const double dv = resolution[v];
+        RayGrid grid = buildGridFromBounds(model._bounds, resolution, axis);
+        const int castCount = static_cast<int>(grid.width * grid.height);
 
-        const CastExtent extent = castExtent(model._bounds, resolution, axis);
-        const double uSteps = extent.uSteps;
-        const double vSteps = extent.vSteps;
-
-        // The only ceiling, and it is about memory rather than about what can
-        // be drawn. Nothing is substituted; the message says what would fit and
-        // leaves the choice with the caller.
-        if (!withinCastBudget(model._bounds, resolution))
-        {
-            const Point3d finest = finestWithin(model._bounds, resolution);
-
-            throw std::invalid_argument(
-                "The ray resolution is too fine to cast for this model: it would need " +
-                std::to_string(static_cast<long long>(extent.casts)) +
-                " casts in one direction, and the limit is " +
-                std::to_string(static_cast<long long>(maxCastsPerDirection)) +
-                ". The finest that will cast is " + std::to_string(finest[0]) + ", " +
-                std::to_string(finest[1]) + ", " + std::to_string(finest[2]) + ".");
-        }
-
-        const int uCount = (uSteps > 0.0) ? static_cast<int>(uSteps) : 0;
-        const int vCount = (vSteps > 0.0) ? static_cast<int>(vSteps) : 0;
-
-        // The two nested sweeps are flattened into one range so that the work
-        // still divides evenly when one of the axes has only a few steps. The
-        // guard above caps this at maxCastsPerDirection, so it cannot overflow.
-        const int uPoints = uCount + 1;
-        const int castCount = uPoints * (vCount + 1);
-
-        // Casts are independent and complete out of order, so each chain is
-        // tagged with the cast that produced it and grid order is restored
-        // below. Collecting them as they finish instead would leave the chain
-        // order varying from run to run.
-        std::vector<std::pair<int, RayChain>> found;
-        std::mutex foundMutex;
+        // Per-slot interval lists built in parallel, then packed into the pool.
+        std::vector<std::vector<Interval>> slotIntervals(
+            static_cast<std::size_t>(castCount));
 
         tbb::parallel_for(
             tbb::blocked_range<int>(0, castCount),
             [&](const tbb::blocked_range<int>& range) {
-                // Both buffers live for the whole range rather than per cast,
-                // so the casts in a range share one set of allocations.
                 std::vector<Hit> hits;
-                std::vector<std::pair<int, RayChain>> localFound;
-
                 for (int cast = range.begin(); cast != range.end(); ++cast)
                 {
-                    // The second axis is the slower one: for rays along x, y
-                    // runs from minY to maxY before z is stepped on.
-                    const int vi = cast / uPoints;
-                    const int ui = cast - vi * uPoints;
-
-                    const double v0 = lo[v] + dv * vi;
-                    const double u0 = lo[u] + du * ui;
+                    const std::uint32_t iu = static_cast<std::uint32_t>(cast % static_cast<int>(grid.width));
+                    const std::uint32_t iv = static_cast<std::uint32_t>(cast / static_cast<int>(grid.width));
+                    const double u0 = grid.sampleU(iu);
+                    const double v0 = grid.sampleV(iv);
 
                     collectHits(brep, axis, u, v, u0, v0, hits);
                     if (hits.size() < 2) continue;
 
                     sortAndMerge(hits, tolerance);
 
-                    RayChain chain;
-                    chain.u = ui;
-                    chain.v = vi;
-                    chain.rays.reserve(hits.size() / 2);
-
-                    // Pair the crossings: in at the first, out at the second,
-                    // back in at the third, and so on. A trailing unpaired
-                    // crossing is a grazing hit and cannot form a span.
+                    std::vector<Interval>& out = slotIntervals[static_cast<std::size_t>(cast)];
+                    out.reserve(hits.size() / 2);
                     for (std::size_t h = 0; h + 1 < hits.size(); h += 2)
                     {
-                        Ray ray;
-                        ray.startPoint = makePoint(axis, u, v, hits[h].along, u0, v0);
-                        ray.endPoint = makePoint(axis, u, v, hits[h + 1].along, u0, v0);
-                        ray.startNormal = orientOutward(hits[h].normal, axis, true);
-                        ray.endNormal = orientOutward(hits[h + 1].normal, axis, false);
-                        chain.rays.push_back(ray);
+                        Interval ivSpan;
+                        ivSpan.begin = grid.toTick(hits[h].along);
+                        ivSpan.end = grid.toTick(hits[h + 1].along);
+                        ivSpan.beginNormal = hits[h].normal;
+                        ivSpan.endNormal = hits[h + 1].normal;
+                        if (ivSpan.end > ivSpan.begin) out.push_back(ivSpan);
                     }
-
-                    if (!chain.rays.empty()) localFound.emplace_back(cast, std::move(chain));
                 }
-
-                if (localFound.empty()) return;
-
-                // Published once per range, not once per cast.
-                const std::lock_guard<std::mutex> guard(foundMutex);
-                found.insert(found.end(),
-                             std::make_move_iterator(localFound.begin()),
-                             std::make_move_iterator(localFound.end()));
             });
 
-        std::sort(found.begin(), found.end(),
-                  [](const std::pair<int, RayChain>& lhs, const std::pair<int, RayChain>& rhs) {
-                      return lhs.first < rhs.first;
-                  });
+        for (int cast = 0; cast < castCount; ++cast)
+        {
+            const std::vector<Interval>& spans = slotIntervals[static_cast<std::size_t>(cast)];
+            if (spans.empty()) continue;
+            const std::uint32_t iu = static_cast<std::uint32_t>(cast % static_cast<int>(grid.width));
+            const std::uint32_t iv = static_cast<std::uint32_t>(cast / static_cast<int>(grid.width));
+            grid.pool.append(grid.at(iu, iv), spans);
+        }
 
-        auto& chains = model._chains[axis];
-        chains.reserve(found.size());
-        for (auto& entry : found) chains.push_back(std::move(entry.second));
+        model._grids[axis] = std::move(grid);
     }
 
     return model;
 }
 
 RayModel::RayModel(RayModel&& other) noexcept :
-    _chains(std::move(other._chains)),
+    _grids(std::move(other._grids)),
     _bounds(other._bounds),
     _resolution(other._resolution)
 {
@@ -411,10 +315,22 @@ RayModel& RayModel::operator=(RayModel&& other) noexcept
 {
     if (this == &other) return *this;
     std::lock_guard<std::recursive_mutex> lock(_chainMutex);
-    _chains = std::move(other._chains);
+    _grids = std::move(other._grids);
     _bounds = other._bounds;
     _resolution = other._resolution;
     return *this;
+}
+
+const RayGrid* RayModel::grid(std::size_t axis) const
+{
+    if (axis >= 3 || !_grids[axis]) return nullptr;
+    return &*_grids[axis];
+}
+
+RayGrid* RayModel::grid(std::size_t axis)
+{
+    if (axis >= 3 || !_grids[axis]) return nullptr;
+    return &*_grids[axis];
 }
 
 std::unique_lock<std::recursive_mutex> RayModel::lockChains() const
@@ -422,48 +338,13 @@ std::unique_lock<std::recursive_mutex> RayModel::lockChains() const
     return std::unique_lock<std::recursive_mutex>(_chainMutex);
 }
 
-void RayModel::removeDegenerateRays()
-{
-    std::lock_guard<std::recursive_mutex> lock(_chainMutex);
-
-    for (std::size_t axis = 0; axis < 3; ++axis)
-    {
-        const double minLength = _resolution[axis];
-        auto& chains = _chains[axis];
-
-        for (auto& chain : chains)
-        {
-            auto& rays = chain.rays;
-            rays.erase(std::remove_if(rays.begin(), rays.end(),
-                                      [axis, minLength](const Ray& ray) {
-                                          const double length =
-                                              std::abs(ray.endPoint[axis] - ray.startPoint[axis]);
-                                          return length < minLength;
-                                      }),
-                       rays.end());
-        }
-
-        chains.erase(std::remove_if(chains.begin(), chains.end(),
-                                    [](const RayChain& chain) { return chain.rays.empty(); }),
-                     chains.end());
-    }
-}
-
-std::size_t RayModel::chainCount() const
-{
-    auto lock = lockChains();
-    std::size_t total = 0;
-    for (const auto& perAxis : _chains) total += perAxis.size();
-    return total;
-}
-
 std::size_t RayModel::rayCount() const
 {
     auto lock = lockChains();
     std::size_t total = 0;
-    for (const auto& perAxis : _chains)
+    for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        for (const auto& chain : perAxis) total += chain.rays.size();
+        if (const RayGrid* g = grid(axis)) total += g->intervalCount();
     }
     return total;
 }
@@ -475,20 +356,9 @@ int RayModel::strideForRayBudget(std::size_t maxRays) const
     const std::size_t total = rayCount();
     if (total <= maxRays) return 1;
 
-    // Keeping every stride'th line in both grid directions leaves roughly one
-    // ray in stride squared, which gives a starting point. It is a starting
-    // point rather than the answer because which lines actually meet the model
-    // depends on how it sits on the grid, so the real count decides.
-    //
-    // The search steps up one at a time instead of doubling: the drawn density
-    // then lands just under the budget whatever the cast resolution, so asking
-    // for a finer cast never comes back as a coarser picture.
     const double estimate = std::sqrt(static_cast<double>(total) / static_cast<double>(maxRays));
-
     int stride = (estimate > 1.0) ? static_cast<int>(estimate) : 1;
-
     while (stride < maxStride && rayCountAtStride(stride) > maxRays) ++stride;
-
     return stride;
 }
 
@@ -498,12 +368,9 @@ std::size_t RayModel::rayCountAtStride(int stride) const
 
     auto lock = lockChains();
     std::size_t total = 0;
-    for (const auto& perAxis : _chains)
+    for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        for (const auto& chain : perAxis)
-        {
-            if (chain.u % stride == 0 && chain.v % stride == 0) total += chain.rays.size();
-        }
+        if (const RayGrid* g = grid(axis)) total += g->intervalCountAtStride(stride);
     }
     return total;
 }

@@ -42,12 +42,12 @@ public:
     // Drop mesh, BVH, and the remembered tip pose.
     void clear();
 
-    // Append one linear segment at constant cost:
-    //  1) place the tool's meridional profile at tipA and tipB (rings around
-    //     the tool axis) and loft the matching rings together;
-    //  2) close each tip by revolving that profile 180° around the tool axis
-    //     (frame.z), with flipWinding selecting revolve sense and winding.
-    // circleSegments is the azimuthal tessellation of the loft rings.
+    // Append one linear segment at constant cost.
+    // Flat: stadium prism (Minkowski of the cylinder with tipA→tipB).
+    // Bull: flat tip stadium + quarter-torus fillet loft + shank stadium prism.
+    // Sphere: capsule about the centre path (cylinder + hemispheres).
+    // Ball nose: centre-path cylinder, tip + lower motion caps, then shank loft.
+    // circleSegments is the azimuthal tessellation for rings / stadium ends.
     void appendSegment(ToolType type,
                        float radius,
                        float height,

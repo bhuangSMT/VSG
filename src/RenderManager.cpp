@@ -30,10 +30,7 @@ RenderManager::RenderManager(vsg::ref_ptr<vsgQt::Viewer> viewer,
     if (!_scene) throw std::runtime_error("RenderManager requires a valid scene root.");
 }
 
-RenderManager::~RenderManager()
-{
-    joinRayCleanup();
-}
+RenderManager::~RenderManager() = default;
 
 vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array> positions,
                                                      vsg::ref_ptr<vsg::vec3Array> normals,
@@ -204,12 +201,8 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
     if (rayModel.rayCount() == 0)
         throw std::runtime_error("The ray model contains no rays; try a coarser resolution.");
 
-    // A fine cast holds far more rays than are worth drawing, so whole grid
-    // layers are dropped until what is left fits the budget.
     const int stride = rayModel.strideForRayBudget(maxRenderedRays);
     const std::size_t rays = rayModel.rayCountAtStride(stride);
-
-    // Two endpoints per ray, drawn as an independent line segment.
     const std::size_t pointCount = rays * 2;
 
     auto positions = vsg::vec3Array::create(pointCount);
@@ -217,26 +210,38 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
     auto colors = vsg::vec4Array::create(pointCount);
     auto indices = vsg::uintArray::create(pointCount);
 
-    // Prefix-sum write slots per kept chain so workers can fill disjoint ranges.
-    struct ChainWrite
+    struct SpanWrite
     {
         std::size_t axis = 0;
-        const RayChain* chain = nullptr;
+        std::uint32_t iu = 0;
+        std::uint32_t iv = 0;
+        const RayGrid* grid = nullptr;
+        const Interval* intervals = nullptr;
+        std::uint32_t intervalCount = 0;
         std::size_t pointOffset = 0;
     };
 
-    std::vector<ChainWrite> writes;
-    writes.reserve(rayModel.chainCount());
+    std::vector<SpanWrite> writes;
+    writes.reserve(rays);
     std::size_t next = 0;
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        for (const auto& chain : rayModel.chains(axis))
-        {
-            if (chain.u % stride != 0 || chain.v % stride != 0) continue;
-            if (chain.rays.empty()) continue;
+        const RayGrid* grid = rayModel.grid(axis);
+        if (!grid) continue;
 
-            writes.push_back(ChainWrite{axis, &chain, next});
-            next += chain.rays.size() * 2;
+        for (std::uint32_t iv = 0; iv < grid->height; ++iv)
+        {
+            if (static_cast<int>(iv) % stride != 0) continue;
+            for (std::uint32_t iu = 0; iu < grid->width; ++iu)
+            {
+                if (static_cast<int>(iu) % stride != 0) continue;
+                const RaySlot& slot = grid->at(iu, iv);
+                if (slot.empty()) continue;
+                auto spans = grid->pool.span(slot);
+                writes.push_back(SpanWrite{axis, iu, iv, grid, spans.data(),
+                                           slot.intervalCount, next});
+                next += static_cast<std::size_t>(slot.intervalCount) * 2;
+            }
         }
     }
 
@@ -245,23 +250,38 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
         [&](const tbb::blocked_range<std::size_t>& range) {
             for (std::size_t i = range.begin(); i != range.end(); ++i)
             {
-                const ChainWrite& write = writes[i];
-                const vsg::vec4& axisColor = _rayColors[write.axis];
+                const SpanWrite& write = writes[i];
+                const RayGrid& grid = *write.grid;
+                const std::size_t axis = write.axis;
+                const std::size_t u = (axis + 1) % 3;
+                const std::size_t v = (axis + 2) % 3;
+                const double u0 = grid.sampleU(write.iu);
+                const double v0 = grid.sampleV(write.iv);
+                const vsg::vec4& axisColor = _rayColors[axis];
                 std::size_t point = write.pointOffset;
 
-                for (const auto& ray : write.chain->rays)
+                for (std::uint32_t s = 0; s < write.intervalCount; ++s)
                 {
-                    const vsg::vec4& color = ray.fromBoolean ? _toolColor : axisColor;
+                    const Interval& iv = write.intervals[s];
+                    const vsg::vec4& color = iv.fromBoolean() ? _toolColor : axisColor;
 
-                    (*positions)[point] = vsg::vec3(static_cast<float>(ray.startPoint[0]),
-                                                    static_cast<float>(ray.startPoint[1]),
-                                                    static_cast<float>(ray.startPoint[2]));
+                    Point3d start{0.0, 0.0, 0.0};
+                    Point3d end{0.0, 0.0, 0.0};
+                    start[axis] = grid.fromTick(iv.begin);
+                    end[axis] = grid.fromTick(iv.end);
+                    start[u] = u0;
+                    end[u] = u0;
+                    start[v] = v0;
+                    end[v] = v0;
+
+                    (*positions)[point] = vsg::vec3(static_cast<float>(start[0]),
+                                                    static_cast<float>(start[1]),
+                                                    static_cast<float>(start[2]));
                     (*colors)[point] = color;
                     ++point;
-
-                    (*positions)[point] = vsg::vec3(static_cast<float>(ray.endPoint[0]),
-                                                    static_cast<float>(ray.endPoint[1]),
-                                                    static_cast<float>(ray.endPoint[2]));
+                    (*positions)[point] = vsg::vec3(static_cast<float>(end[0]),
+                                                    static_cast<float>(end[1]),
+                                                    static_cast<float>(end[2]));
                     (*colors)[point] = color;
                     ++point;
                 }
@@ -275,7 +295,6 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
                 (*indices)[i] = static_cast<std::uint32_t>(i);
         });
 
-    // Per-vertex colours so each axis keeps its own colour in one draw call.
     auto drawable = buildDrawable(positions, normals, colors,
                                   VK_VERTEX_INPUT_RATE_VERTEX, indices, true);
 
@@ -312,6 +331,32 @@ float RenderManager::splatRadius(const RayModel& rayModel, std::size_t axis) con
     return static_cast<float>(radius);
 }
 
+std::array<float, 3> RenderManager::splatRadii(const RayModel& rayModel, int stride) const
+{
+    const float s = static_cast<float>(stride < 1 ? 1 : stride);
+    return {splatRadius(rayModel, 0) * s, splatRadius(rayModel, 1) * s,
+            splatRadius(rayModel, 2) * s};
+}
+
+SplatStyle RenderManager::splatStyle() const
+{
+    SplatStyle style;
+    style.stockColor = _splatColor;
+    style.toolColor = _toolColor;
+    style.opacity = _splatOpacity;
+    return style;
+}
+
+void RenderManager::rebuildSplatCache()
+{
+    if (!_rayModel) return;
+
+    const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+    auto drawable =
+        _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle());
+    attach(applyFit(drawable, _rayModel->bounds()), true);
+}
+
 vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel) const
 {
     auto chainLock = rayModel.lockChains();
@@ -319,15 +364,11 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
     if (rayModel.rayCount() == 0)
         throw std::runtime_error("The ray model contains no rays; try a coarser resolution.");
 
-    // As in createRayNode: only every stride'th grid line in each direction is
-    // drawn, which is what keeps a fine cast inside what the GPU can hold.
     const int stride = rayModel.strideForRayBudget(maxRenderedRays);
 
     std::vector<Splat> splats;
     splats.reserve(rayModel.rayCountAtStride(stride) * 2);
 
-    // One albedo for every uncut splat. Spans rewritten by boolean use the
-    // tool colour so the cut reads against the metal grey.
     vsg::vec4 color = _splatColor;
     color.a = _splatOpacity;
 
@@ -336,38 +377,58 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
 
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        // Dropping layers spaces the endpoints stride times further apart, so
-        // the splats have to grow to match or the surface opens up into gaps.
+        const RayGrid* grid = rayModel.grid(axis);
+        if (!grid) continue;
+
         const float radius = splatRadius(rayModel, axis) * static_cast<float>(stride);
+        const std::size_t u = (axis + 1) % 3;
+        const std::size_t v = (axis + 2) % 3;
 
-        // The cast recorded the normal of the face met at each end of a span,
-        // already pointing out of the solid, so the splats can be shaded by the
-        // real surface rather than by the six axis directions.
-        for (const auto& chain : rayModel.chains(axis))
+        for (std::uint32_t iv = 0; iv < grid->height; ++iv)
         {
-            if (chain.u % stride != 0 || chain.v % stride != 0) continue;
-
-            for (const auto& ray : chain.rays)
+            if (static_cast<int>(iv) % stride != 0) continue;
+            for (std::uint32_t iu = 0; iu < grid->width; ++iu)
             {
-                auto splatNormal = [](const Normal3f& n) {
-                    const float len2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
-                    if (len2 < 1.0e-12f) return vsg::vec3(0.0f, 0.0f, 1.0f);
-                    const float inv = 1.0f / std::sqrt(len2);
-                    return vsg::vec3(n[0] * inv, n[1] * inv, n[2] * inv);
-                };
+                if (static_cast<int>(iu) % stride != 0) continue;
+                const RaySlot& slot = grid->at(iu, iv);
+                if (slot.empty()) continue;
 
-                const vsg::vec4& splatColor = ray.fromBoolean ? toolColor : color;
+                const double u0 = grid->sampleU(iu);
+                const double v0 = grid->sampleV(iv);
+                auto spans = grid->pool.span(slot);
 
-                splats.push_back({vsg::vec3(static_cast<float>(ray.startPoint[0]),
-                                            static_cast<float>(ray.startPoint[1]),
-                                            static_cast<float>(ray.startPoint[2])),
-                                  splatNormal(ray.startNormal),
-                                  splatColor, radius});
-                splats.push_back({vsg::vec3(static_cast<float>(ray.endPoint[0]),
-                                            static_cast<float>(ray.endPoint[1]),
-                                            static_cast<float>(ray.endPoint[2])),
-                                  splatNormal(ray.endNormal),
-                                  splatColor, radius});
+                for (const Interval& span : spans)
+                {
+                    Point3d start{0.0, 0.0, 0.0};
+                    Point3d end{0.0, 0.0, 0.0};
+                    start[axis] = grid->fromTick(span.begin);
+                    end[axis] = grid->fromTick(span.end);
+                    start[u] = u0;
+                    end[u] = u0;
+                    start[v] = v0;
+                    end[v] = v0;
+
+                    auto normalOrAxis = [axis](const Normal3f& n, bool enter) {
+                        const float len2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+                        if (len2 < 1.0e-12f)
+                        {
+                            vsg::vec3 fallback(0.0f, 0.0f, 0.0f);
+                            fallback[static_cast<uint32_t>(axis)] = enter ? -1.0f : 1.0f;
+                            return fallback;
+                        }
+                        return vsg::vec3(n[0], n[1], n[2]);
+                    };
+
+                    const vsg::vec4& splatColor = span.fromBoolean() ? toolColor : color;
+                    splats.push_back({vsg::vec3(static_cast<float>(start[0]),
+                                                static_cast<float>(start[1]),
+                                                static_cast<float>(start[2])),
+                                      normalOrAxis(span.beginNormal, true), splatColor, radius});
+                    splats.push_back({vsg::vec3(static_cast<float>(end[0]),
+                                                static_cast<float>(end[1]),
+                                                static_cast<float>(end[2])),
+                                      normalOrAxis(span.endNormal, false), splatColor, radius});
+                }
             }
         }
     }
@@ -396,8 +457,6 @@ void RenderManager::addBRep(const BRep& brep)
 
 void RenderManager::setRayModel(RayModel model)
 {
-    joinRayCleanup();
-
     const Point3d resolution = model.resolution();
     const std::size_t rays = model.rayCount();
 
@@ -453,31 +512,13 @@ void RenderManager::touchRayModel(const Point3d& resolution)
 
 void RenderManager::clearRayModels()
 {
-    joinRayCleanup();
-
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
     _rayModels.clear();
     _rayModelOrder.clear();
     _cachedRays = 0;
-}
-
-void RenderManager::joinRayCleanup()
-{
-    if (_rayCleanupThread.joinable()) _rayCleanupThread.join();
-}
-
-RayModel* RenderManager::mutableDisplayedRayModel()
-{
-    if (!_rayModel) return nullptr;
-    if (_booleanRayModel && _rayModel == &*_booleanRayModel) return &*_booleanRayModel;
-
-    for (auto& entry : _rayModels)
-    {
-        if (&entry.second == _rayModel) return &entry.second;
-    }
-    return nullptr;
+    _splatCache.clear();
 }
 
 void RenderManager::setViewMode(ViewMode mode)
@@ -489,21 +530,17 @@ void RenderManager::setViewMode(ViewMode mode)
 
 void RenderManager::rebuild()
 {
-    joinRayCleanup();
-
     // The ray modes need a model to draw; without one fall back to the surface
     // so the viewport never goes blank.
     if (usesRayModel(_viewMode) && _rayModel && _rayModel->rayCount() > 0)
     {
-        if (RayModel* model = mutableDisplayedRayModel())
+        if (_viewMode == ViewMode::RayGS)
         {
-            _rayCleanupThread = std::thread([model]() { model->removeDegenerateRays(); });
-            joinRayCleanup();
+            rebuildSplatCache();
+            return;
         }
 
-        attach(_viewMode == ViewMode::RayGS ? createSplatNode(*_rayModel)
-                                            : createRayNode(*_rayModel),
-               true);
+        attach(createRayNode(*_rayModel), true);
         return;
     }
 
@@ -564,6 +601,25 @@ float RenderManager::worldToolRadius() const
     return static_cast<float>(radius);
 }
 
+float RenderManager::worldToolLength() const
+{
+    double length = Parameter::instance().toolLength();
+    if (length <= 0.0) length = static_cast<double>(worldToolRadius()) * 2.8;
+
+    if (_fitToUnitBox && _current)
+    {
+        const BoundingBox bounds = BoundingBox::fromBRep(*_current);
+        if (bounds.valid())
+        {
+            const double maxExtent =
+                std::max({bounds.extent(0), bounds.extent(1), bounds.extent(2)});
+            if (maxExtent > 0.0) length /= maxExtent;
+        }
+    }
+
+    return static_cast<float>(length);
+}
+
 void RenderManager::rebuildTool(bool preservePose)
 {
     vsg::dmat4 previousMatrix;
@@ -584,7 +640,7 @@ void RenderManager::rebuildTool(bool preservePose)
     }
 
     const float radius = worldToolRadius();
-    const float height = radius * toolHeightFactor;
+    const float height = worldToolLength();
     const TriangleMesh mesh = createToolMesh(_toolType, radius, height);
     if (mesh.triangles.empty()) return;
 
@@ -665,16 +721,23 @@ void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& di
 
     const vsg::dvec3 y = vsg::cross(z, x);
 
+    // Mesh / sweep frames put the tip at the origin and the sphere centre at
+    // +radius along the tool axis. For ball nose and sphere, the mouse hit is
+    // that centre, so shift the tip down by radius along -z.
+    vsg::dvec3 tip = position;
+    if (_toolType == ToolType::BallNose || _toolType == ToolType::Sphere)
+        tip = position - z * static_cast<double>(worldToolRadius());
+
     _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
                                         y.x, y.y, y.z, 0.0,
                                         z.x, z.y, z.z, 0.0,
-                                        position.x, position.y, position.z, 1.0);
+                                        tip.x, tip.y, tip.z, 1.0);
 
     // Always record the CPU swept volume while a tool is active. Visibility
     // of the VSG node is gated separately by _showSweptVolume.
     bool sweepChanged = false;
     if (_toolType != ToolType::None)
-        sweepChanged = recordSweepStep(ToolPose{position, z});
+        sweepChanged = recordSweepStep(ToolPose{tip, z});
 
     if (sweepChanged)
         applyBooleanToRayModel();
@@ -754,7 +817,7 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
         sweep.clearGeometry();
     }
 
-    sweep.appendSegment(_toolType, radius, radius * toolHeightFactor, tipA, pose);
+    sweep.appendSegment(_toolType, radius, worldToolLength(), tipA, pose);
     publishSweptVolume();
     return true;
 }
@@ -824,16 +887,18 @@ void RenderManager::setBooleanOp(BooleanOp op)
 
 void RenderManager::applyBooleanToRayModel()
 {
-    joinRayCleanup();
-
     if (!_sourceRayModel)
     {
         _booleanRayModel.reset();
         _rayModel = nullptr;
+        _splatCache.clear();
         return;
     }
 
     const BooleanOp op = Parameter::instance().booleanOp();
+    BoundingBox dirtyModelAabb;
+    bool haveDirtyRegion = false;
+
     if (op == BooleanOp::None)
     {
         // Do not revert to the original cast; leave the last result in place.
@@ -849,9 +914,30 @@ void RenderManager::applyBooleanToRayModel()
         // Cumulative: each new sweep segment cuts the last boolean result.
         const RayModel& input = _booleanRayModel ? *_booleanRayModel : *_sourceRayModel;
         const BoundingBox bounds = input.bounds();
-        RayModel next = input.withBoolean(*_sweptVolume, op, fitMatrix(bounds));
+        const vsg::dmat4 modelToWorld = fitMatrix(bounds);
+        const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
+
+        if (_sweptVolume->bvh().bounds().valid())
+        {
+            dirtyModelAabb =
+                modelAabbFromWorld(_sweptVolume->bvh().bounds(), worldToModel);
+            haveDirtyRegion = dirtyModelAabb.valid();
+        }
+
+        RayModel next = input.withBoolean(*_sweptVolume, op, modelToWorld);
         _booleanRayModel = std::move(next);
         _rayModel = &*_booleanRayModel;
+    }
+
+    if (_viewMode == ViewMode::RayGS && _rayModel && haveDirtyRegion && !_splatCache.empty())
+    {
+        const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+        if (_splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
+                                     splatRadii(*_rayModel, stride), splatStyle()))
+        {
+            if (_viewer) _viewer->request();
+            return;
+        }
     }
 
     if (usesRayModel(_viewMode)) rebuild();

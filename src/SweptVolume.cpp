@@ -11,126 +11,15 @@ namespace
 
 constexpr double pi = 3.14159265358979323846;
 
-// Fixed-cost tip closure: 180° of profile revolution in this many steps.
+// Fixed-cost tip closure: hemisphere / fillet stacks.
 constexpr int capRevolveSteps = 8;
-
-struct ProfilePoint
-{
-    double r = 0.0; // radial distance from the tool axis (>= 0)
-    double z = 0.0; // height along the tool axis from the tip
-};
-
-// Orthonormal frame for one tip of a segment:
-//   z = tool axis — also the revolving axis for end caps
-//   x = side axis from segment motion (orients the meridional plane)
-//   y = z × x; meridian rests in the +y / +z half-plane
-struct SegmentFrame
-{
-    vsg::dvec3 x{1.0, 0.0, 0.0};
-    vsg::dvec3 y{0.0, 1.0, 0.0};
-    vsg::dvec3 z{0.0, 0.0, 1.0};
-};
+constexpr int filletStacks = 8;
 
 vsg::dvec3 normalizeOr(const vsg::dvec3& v, const vsg::dvec3& fallback)
 {
     const double len = vsg::length(v);
     if (len <= 1.0e-12) return fallback;
     return v / len;
-}
-
-SegmentFrame makeSegmentFrame(const ToolPose& pose, const vsg::dvec3& motion)
-{
-    SegmentFrame frame;
-    frame.z = normalizeOr(pose.direction, vsg::dvec3(0.0, 0.0, 1.0));
-
-    // Side axis from motion so the meridian faces consistently along the path.
-    // Caps revolve around frame.z (tool axis), not this vector.
-    frame.x = vsg::cross(motion, frame.z);
-    if (vsg::length(frame.x) <= 1.0e-12)
-    {
-        vsg::dvec3 up(0.0, 0.0, 1.0);
-        if (std::abs(vsg::dot(frame.z, up)) > 0.95) up = vsg::dvec3(1.0, 0.0, 0.0);
-        frame.x = vsg::cross(up, frame.z);
-    }
-    frame.x = normalizeOr(frame.x, vsg::dvec3(1.0, 0.0, 0.0));
-    frame.y = vsg::cross(frame.z, frame.x);
-    return frame;
-}
-
-vsg::dvec3 transformLocal(const ToolPose& pose,
-                          const SegmentFrame& frame,
-                          const vsg::dvec3& local)
-{
-    return pose.position + frame.x * local.x + frame.y * local.y + frame.z * local.z;
-}
-
-// Meridional cutter profile in the (r, z) half-plane. Point count is fixed per
-// tool type so each appendSegment costs the same regardless of path length.
-std::vector<ProfilePoint> toolProfile(ToolType type, double radius, double height)
-{
-    std::vector<ProfilePoint> profile;
-    if (radius <= 0.0) return profile;
-
-    switch (type)
-    {
-    case ToolType::FlatNose:
-        profile.push_back({0.0, 0.0});
-        profile.push_back({radius, 0.0});
-        profile.push_back({radius, height});
-        profile.push_back({0.0, height});
-        break;
-
-    case ToolType::BallNose:
-    {
-        // Hemispherical tip of `radius`, then a cylindrical shank.
-        constexpr int samples = 8;
-        profile.reserve(samples + 3);
-        for (int s = 0; s <= samples; ++s)
-        {
-            const double theta =
-                pi * (1.0 - 0.5 * static_cast<double>(s) / static_cast<double>(samples));
-            profile.push_back({radius * std::sin(theta), radius * (1.0 - std::cos(theta))});
-        }
-        profile.push_back({radius, radius + height});
-        profile.push_back({0.0, radius + height});
-        break;
-    }
-
-    case ToolType::Sphere:
-    {
-        constexpr int samples = 8;
-        profile.reserve(samples + 1);
-        for (int s = 0; s <= samples; ++s)
-        {
-            const double theta = pi * (1.0 - static_cast<double>(s) / static_cast<double>(samples));
-            profile.push_back({radius * std::sin(theta), radius * (1.0 - std::cos(theta))});
-        }
-        break;
-    }
-
-    case ToolType::BullNose:
-    {
-        const double fillet = std::min(radius * 0.35, radius * 0.999);
-        const double flatR = radius - fillet;
-        profile.push_back({0.0, 0.0});
-        if (flatR > 1.0e-9) profile.push_back({flatR, 0.0});
-
-        constexpr int filletSamples = 8;
-        for (int s = 1; s <= filletSamples; ++s)
-        {
-            const double phi = (0.5 * pi) * (static_cast<double>(s) / static_cast<double>(filletSamples));
-            profile.push_back({flatR + fillet * std::sin(phi), fillet * (1.0 - std::cos(phi))});
-        }
-        profile.push_back({radius, fillet + height});
-        profile.push_back({0.0, fillet + height});
-        break;
-    }
-
-    case ToolType::None:
-        break;
-    }
-
-    return profile;
 }
 
 void addTriangle(TriangleMesh& mesh,
@@ -159,113 +48,508 @@ void stitchQuad(TriangleMesh& mesh,
     addTriangle(mesh, a00, a11, a10);
 }
 
-// Profile sample spun around the tool axis (frame.z) — used for loft rings.
-// Meridian rests in the +y / +z half-plane: local (0, r, z).
-vsg::dvec3 profileAroundToolAxis(const ProfilePoint& p, double theta)
+vsg::dvec3 sphereCentre(const ToolPose& tip, double radius)
 {
-    return vsg::dvec3(p.r * std::sin(theta), p.r * std::cos(theta), p.z);
+    return tip.position + normalizeOr(tip.direction, vsg::dvec3(0.0, 0.0, 1.0)) * radius;
 }
 
-// Cap revolve: same axis as the tool axis (local z / frame.z). Starts at
-// (0, r, z); rotation about +z by `angle` (sign set by flipWinding).
-vsg::dvec3 profileAroundRevolvingAxis(const ProfilePoint& p, double angle)
+void capsuleLateralFrame(const vsg::dvec3& along, vsg::dvec3& side, vsg::dvec3& axis)
 {
-    const double c = std::cos(angle);
-    const double s = std::sin(angle);
-    return vsg::dvec3(p.r * s, p.r * c, p.z);
+    vsg::dvec3 up(0.0, 0.0, 1.0);
+    if (std::abs(vsg::dot(along, up)) > 0.95) up = vsg::dvec3(1.0, 0.0, 0.0);
+    side = normalizeOr(vsg::cross(up, along), vsg::dvec3(1.0, 0.0, 0.0));
+    axis = vsg::cross(along, side);
 }
 
-void appendProfileLoft(TriangleMesh& mesh,
-                       const ToolPose& tipA,
-                       const ToolPose& tipB,
-                       const SegmentFrame& frameA,
-                       const SegmentFrame& frameB,
-                       const std::vector<ProfilePoint>& profile,
-                       int azimuthSegments)
+vsg::dvec3 capsuleRingPoint(const vsg::dvec3& centre,
+                            const vsg::dvec3& side,
+                            const vsg::dvec3& axis,
+                            double radius,
+                            int k,
+                            int segments)
 {
-    if (profile.empty() || azimuthSegments < 3) return;
+    const double a = (2.0 * pi * static_cast<double>(k)) / static_cast<double>(segments);
+    return centre + (side * std::cos(a) + axis * std::sin(a)) * radius;
+}
 
-    const auto nProfile = static_cast<int>(profile.size());
+void loftRingPair(TriangleMesh& mesh,
+                  const vsg::dvec3& a0, const vsg::dvec3& aSide, const vsg::dvec3& aAxis,
+                  const vsg::dvec3& b0, const vsg::dvec3& bSide, const vsg::dvec3& bAxis,
+                  double radius, int azimuthSegments)
+{
+    for (int k = 0; k < azimuthSegments; ++k)
+    {
+        const int k1 = (k + 1) % azimuthSegments;
+        stitchQuad(mesh,
+                   capsuleRingPoint(a0, aSide, aAxis, radius, k, azimuthSegments),
+                   capsuleRingPoint(a0, aSide, aAxis, radius, k1, azimuthSegments),
+                   capsuleRingPoint(b0, bSide, bAxis, radius, k1, azimuthSegments),
+                   capsuleRingPoint(b0, bSide, bAxis, radius, k, azimuthSegments));
+    }
+}
 
-    auto at = [&](const ToolPose& tip, const SegmentFrame& frame, int i, int k) {
-        const ProfilePoint& p = profile[static_cast<std::size_t>(i)];
-        const double theta =
-            (2.0 * pi * static_cast<double>(k)) / static_cast<double>(azimuthSegments);
-        return transformLocal(tip, frame, profileAroundToolAxis(p, theta));
+void appendFullDisk(TriangleMesh& mesh,
+                    const vsg::dvec3& centre,
+                    const vsg::dvec3& side,
+                    const vsg::dvec3& axis,
+                    double radius,
+                    int azimuthSegments,
+                    bool flipWinding)
+{
+    for (int k = 0; k < azimuthSegments; ++k)
+    {
+        const int k1 = (k + 1) % azimuthSegments;
+        const vsg::dvec3 p0 = capsuleRingPoint(centre, side, axis, radius, k, azimuthSegments);
+        const vsg::dvec3 p1 = capsuleRingPoint(centre, side, axis, radius, k1, azimuthSegments);
+        if (flipWinding) addTriangle(mesh, centre, p1, p0);
+        else addTriangle(mesh, centre, p0, p1);
+    }
+}
+
+// Half-disk in plane ⊥ dir, bulging toward `toward` (unit, ⊥ dir).
+void appendHalfDisk(TriangleMesh& mesh,
+                    const vsg::dvec3& centre,
+                    const vsg::dvec3& dir,
+                    const vsg::dvec3& toward,
+                    double radius,
+                    int segments,
+                    bool flipWinding)
+{
+    if (radius <= 0.0 || segments < 2) return;
+    const vsg::dvec3 y = normalizeOr(toward - dir * vsg::dot(toward, dir), toward);
+    const vsg::dvec3 x = normalizeOr(vsg::cross(dir, y), vsg::dvec3(1.0, 0.0, 0.0));
+
+    for (int k = 0; k < segments; ++k)
+    {
+        const double a0 = -0.5 * pi + pi * (static_cast<double>(k) / static_cast<double>(segments));
+        const double a1 = -0.5 * pi + pi * (static_cast<double>(k + 1) / static_cast<double>(segments));
+        const vsg::dvec3 p0 = centre + (x * std::cos(a0) + y * std::sin(a0)) * radius;
+        const vsg::dvec3 p1 = centre + (x * std::cos(a1) + y * std::sin(a1)) * radius;
+        if (flipWinding) addTriangle(mesh, centre, p1, p0);
+        else addTriangle(mesh, centre, p0, p1);
+    }
+}
+
+// Planar stadium face (Minkowski of a disk with a segment) in planes ≈ ⊥ dir.
+void appendStadiumFace(TriangleMesh& mesh,
+                       const vsg::dvec3& cA,
+                       const vsg::dvec3& cB,
+                       const vsg::dvec3& dir,
+                       double radius,
+                       int segments,
+                       bool flipWinding)
+{
+    if (radius <= 0.0) return;
+
+    vsg::dvec3 delta = cB - cA;
+    delta -= dir * vsg::dot(delta, dir);
+    const double span = vsg::length(delta);
+    if (span <= 1.0e-12)
+    {
+        vsg::dvec3 side, axis;
+        capsuleLateralFrame(dir, side, axis);
+        appendFullDisk(mesh, cA, side, axis, radius, std::max(segments, 3), flipWinding);
+        return;
+    }
+
+    const vsg::dvec3 along = delta / span;
+    const vsg::dvec3 perp = normalizeOr(vsg::cross(dir, along), vsg::dvec3(1.0, 0.0, 0.0));
+    appendHalfDisk(mesh, cA, dir, -along, radius, segments, flipWinding);
+    appendHalfDisk(mesh, cB, dir, along, radius, segments, flipWinding);
+
+    const vsg::dvec3 aPos = cA + perp * radius;
+    const vsg::dvec3 aNeg = cA - perp * radius;
+    const vsg::dvec3 bPos = cB + perp * radius;
+    const vsg::dvec3 bNeg = cB - perp * radius;
+    if (flipWinding) stitchQuad(mesh, aPos, aNeg, bNeg, bPos);
+    else stitchQuad(mesh, aPos, bPos, bNeg, aNeg);
+}
+
+// Vertical half-cylinder of radius R from tip to tip+height*dir, outer hemi
+// facing `outward` (⊥ dir).
+void appendVerticalHemiCylinder(TriangleMesh& mesh,
+                                const vsg::dvec3& tip,
+                                const vsg::dvec3& dir,
+                                const vsg::dvec3& outward,
+                                double radius,
+                                double height,
+                                int segments)
+{
+    if (radius <= 0.0 || height <= 0.0 || segments < 2) return;
+    const vsg::dvec3 top = tip + dir * height;
+    const vsg::dvec3 y = normalizeOr(outward - dir * vsg::dot(outward, dir), outward);
+    const vsg::dvec3 x = normalizeOr(vsg::cross(dir, y), vsg::dvec3(1.0, 0.0, 0.0));
+
+    for (int k = 0; k < segments; ++k)
+    {
+        const double a0 = -0.5 * pi + pi * (static_cast<double>(k) / static_cast<double>(segments));
+        const double a1 = -0.5 * pi + pi * (static_cast<double>(k + 1) / static_cast<double>(segments));
+        const vsg::dvec3 r0 = (x * std::cos(a0) + y * std::sin(a0)) * radius;
+        const vsg::dvec3 r1 = (x * std::cos(a1) + y * std::sin(a1)) * radius;
+        stitchQuad(mesh, tip + r0, tip + r1, top + r1, top + r0);
+    }
+}
+
+// Minkowski of a right cylinder (radius R, height H) with tipA→tipB: stadium prism.
+// includeBottom is false for a bull-nose shank sitting on the fillet (avoids an
+// internal face that breaks ray/boolean pairing).
+void appendStadiumPrism(TriangleMesh& mesh,
+                        const ToolPose& tipA,
+                        const ToolPose& tipB,
+                        double radius,
+                        double height,
+                        int segments,
+                        bool includeBottom = true)
+{
+    if (radius <= 0.0 || height <= 0.0) return;
+    if (segments < 3) segments = 3;
+
+    const vsg::dvec3 dirA = normalizeOr(tipA.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    const vsg::dvec3 dirB = normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    const vsg::dvec3 midDir = normalizeOr(dirA + dirB, dirB);
+    const vsg::dvec3 tipPosA = tipA.position;
+    const vsg::dvec3 tipPosB = tipB.position;
+    const vsg::dvec3 topA = tipPosA + dirA * height;
+    const vsg::dvec3 topB = tipPosB + dirB * height;
+    const vsg::dvec3 along = normalizeOr(tipPosB - tipPosA, midDir);
+
+    vsg::dvec3 sideA, axisA, sideB, axisB;
+    capsuleLateralFrame(dirA, sideA, axisA);
+    capsuleLateralFrame(dirB, sideB, axisB);
+    if (vsg::dot(sideA, sideB) < 0.0)
+    {
+        sideB = -sideB;
+        axisB = -axisB;
+    }
+
+    if (std::abs(vsg::dot(along, midDir)) > 0.92)
+    {
+        const bool forward = vsg::dot(tipPosB - tipPosA, midDir) >= 0.0;
+        const vsg::dvec3 bottom = forward ? tipPosA : tipPosB;
+        const vsg::dvec3 top = forward ? topB : topA;
+        const vsg::dvec3 dir = forward ? dirA : dirB;
+        vsg::dvec3 side, axis;
+        capsuleLateralFrame(dir, side, axis);
+        loftRingPair(mesh, bottom, side, axis, top, side, axis, radius, segments);
+        if (includeBottom) appendFullDisk(mesh, bottom, side, axis, radius, segments, true);
+        appendFullDisk(mesh, top, side, axis, radius, segments, false);
+        return;
+    }
+
+    vsg::dvec3 delta = tipPosB - tipPosA;
+    delta -= midDir * vsg::dot(delta, midDir);
+    const vsg::dvec3 alongPlanar = normalizeOr(delta, along);
+    const vsg::dvec3 perp = normalizeOr(vsg::cross(midDir, alongPlanar), sideA);
+
+    if (includeBottom)
+        appendStadiumFace(mesh, tipPosA, tipPosB, midDir, radius, segments, true);
+    appendStadiumFace(mesh, topA, topB, midDir, radius, segments, false);
+
+    stitchQuad(mesh,
+               tipPosA + perp * radius, tipPosB + perp * radius,
+               topB + perp * radius, topA + perp * radius);
+    stitchQuad(mesh,
+               tipPosA - perp * radius, topA - perp * radius,
+               topB - perp * radius, tipPosB - perp * radius);
+
+    appendVerticalHemiCylinder(mesh, tipPosA, dirA, -alongPlanar, radius, height, segments);
+    appendVerticalHemiCylinder(mesh, tipPosB, dirB, alongPlanar, radius, height, segments);
+}
+
+void appendFlatNoseSweep(TriangleMesh& mesh,
+                         const ToolPose& tipA,
+                         const ToolPose& tipB,
+                         double radius,
+                         double height,
+                         int segments)
+{
+    appendStadiumPrism(mesh, tipA, tipB, radius, height, segments);
+}
+
+// Quarter-torus fillet loft between flat tip rim and outer shank rim.
+void appendBullFilletBand(TriangleMesh& mesh,
+                          const ToolPose& tipA,
+                          const ToolPose& tipB,
+                          double flatR,
+                          double fillet,
+                          int azimuthSegments,
+                          int stacks)
+{
+    if (fillet <= 0.0 || stacks < 1) return;
+
+    const vsg::dvec3 dirA = normalizeOr(tipA.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    const vsg::dvec3 dirB = normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    vsg::dvec3 sideA, axisA, sideB, axisB;
+    capsuleLateralFrame(dirA, sideA, axisA);
+    capsuleLateralFrame(dirB, sideB, axisB);
+    if (vsg::dot(sideA, sideB) < 0.0)
+    {
+        sideB = -sideB;
+        axisB = -axisB;
+    }
+
+    auto ringCentre = [](const ToolPose& tip, const vsg::dvec3& dir, double z) {
+        return tip.position + dir * z;
     };
 
-    // Motion loft: each azimuthal edge of each profile sample travels A → B.
-    for (int i = 0; i < nProfile; ++i)
+    for (int s = 0; s < stacks; ++s)
     {
-        if (profile[static_cast<std::size_t>(i)].r <= 1.0e-12) continue;
+        const double t0 = static_cast<double>(s) / static_cast<double>(stacks);
+        const double t1 = static_cast<double>(s + 1) / static_cast<double>(stacks);
+        const double phi0 = 0.5 * pi * t0;
+        const double phi1 = 0.5 * pi * t1;
+        const double z0 = fillet * (1.0 - std::cos(phi0));
+        const double z1 = fillet * (1.0 - std::cos(phi1));
+        const double r0 = flatR + fillet * std::sin(phi0);
+        const double r1 = flatR + fillet * std::sin(phi1);
+
+        const vsg::dvec3 cA0 = ringCentre(tipA, dirA, z0);
+        const vsg::dvec3 cA1 = ringCentre(tipA, dirA, z1);
+        const vsg::dvec3 cB0 = ringCentre(tipB, dirB, z0);
+
         for (int k = 0; k < azimuthSegments; ++k)
         {
             const int k1 = (k + 1) % azimuthSegments;
             stitchQuad(mesh,
-                       at(tipA, frameA, i, k), at(tipA, frameA, i, k1),
-                       at(tipB, frameB, i, k1), at(tipB, frameB, i, k));
-        }
-    }
-
-    // Motion loft of the bands between consecutive profile samples.
-    for (int i = 0; i + 1 < nProfile; ++i)
-    {
-        for (int k = 0; k < azimuthSegments; ++k)
-        {
+                       capsuleRingPoint(cA0, sideA, axisA, r0, k, azimuthSegments),
+                       capsuleRingPoint(cA0, sideA, axisA, r0, k1, azimuthSegments),
+                       capsuleRingPoint(cA1, sideA, axisA, r1, k1, azimuthSegments),
+                       capsuleRingPoint(cA1, sideA, axisA, r1, k, azimuthSegments));
             stitchQuad(mesh,
-                       at(tipA, frameA, i, k), at(tipA, frameA, i + 1, k),
-                       at(tipB, frameB, i + 1, k), at(tipB, frameB, i, k));
+                       capsuleRingPoint(cB0, sideB, axisB, r0, k, azimuthSegments),
+                       capsuleRingPoint(ringCentre(tipB, dirB, z1), sideB, axisB, r1, k, azimuthSegments),
+                       capsuleRingPoint(ringCentre(tipB, dirB, z1), sideB, axisB, r1, k1, azimuthSegments),
+                       capsuleRingPoint(cB0, sideB, axisB, r0, k1, azimuthSegments));
+            stitchQuad(mesh,
+                       capsuleRingPoint(cA0, sideA, axisA, r0, k, azimuthSegments),
+                       capsuleRingPoint(cA0, sideA, axisA, r0, k1, azimuthSegments),
+                       capsuleRingPoint(cB0, sideB, axisB, r0, k1, azimuthSegments),
+                       capsuleRingPoint(cB0, sideB, axisB, r0, k, azimuthSegments));
         }
     }
 }
 
-// Close one tip by revolving the meridional profile 180° around the tool axis
-// (frame.z). flipWinding selects both the revolve sense (+180° vs -180°) and
-// the triangle winding.
-void appendProfileCap(TriangleMesh& mesh,
-                      const ToolPose& tip,
-                      const SegmentFrame& frame,
-                      const std::vector<ProfilePoint>& profile,
-                      int steps,
-                      bool flipWinding)
+void appendBullNoseSweep(TriangleMesh& mesh,
+                         const ToolPose& tipA,
+                         const ToolPose& tipB,
+                         double radius,
+                         double height,
+                         int segments)
 {
-    if (profile.empty() || steps < 1) return;
+    if (radius <= 0.0) return;
+    if (segments < 3) segments = 3;
 
-    const auto nProfile = static_cast<int>(profile.size());
-    std::vector<std::vector<vsg::dvec3>> rings(static_cast<std::size_t>(steps + 1));
-    const double sense = flipWinding ? -1.0 : 1.0;
+    const double fillet = std::min(radius * 0.35, radius * 0.999);
+    const double flatR = radius - fillet;
 
-    for (int s = 0; s <= steps; ++s)
+    // Flat tip (disk sweep).
+    if (flatR > 1.0e-9)
     {
-        const double angle =
-            sense * pi * (static_cast<double>(s) / static_cast<double>(steps));
+        const vsg::dvec3 midDir = normalizeOr(
+            normalizeOr(tipA.direction, vsg::dvec3(0.0, 0.0, 1.0)) +
+                normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0)),
+            vsg::dvec3(0.0, 0.0, 1.0));
+        appendStadiumFace(mesh, tipA.position, tipB.position, midDir, flatR, segments, true);
+    }
+
+    // Corner fillet (quarter-torus loft).
+    appendBullFilletBand(mesh, tipA, tipB, flatR, fillet, segments, filletStacks);
+
+    // Shank: stadium prism of full radius starting at the fillet equator.
+    ToolPose shankA = tipA;
+    ToolPose shankB = tipB;
+    const vsg::dvec3 dirA = normalizeOr(tipA.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    const vsg::dvec3 dirB = normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    shankA.position = tipA.position + dirA * fillet;
+    shankB.position = tipB.position + dirB * fillet;
+    appendStadiumPrism(mesh, shankA, shankB, radius, height, segments, false);
+}
+
+void appendHemisphere(TriangleMesh& mesh,
+                      const vsg::dvec3& centre,
+                      const vsg::dvec3& outward,
+                      const vsg::dvec3& side,
+                      const vsg::dvec3& axis,
+                      double radius,
+                      int azimuthSegments,
+                      int stacks)
+{
+    if (radius <= 0.0 || azimuthSegments < 3 || stacks < 1) return;
+
+    std::vector<std::vector<vsg::dvec3>> rings(static_cast<std::size_t>(stacks + 1));
+    for (int s = 0; s <= stacks; ++s)
+    {
+        const double theta =
+            (0.5 * pi) * (static_cast<double>(s) / static_cast<double>(stacks));
+        const double ringR = radius * std::cos(theta);
+        const double along = radius * std::sin(theta);
         auto& ring = rings[static_cast<std::size_t>(s)];
-        ring.reserve(static_cast<std::size_t>(nProfile));
-        for (int i = 0; i < nProfile; ++i)
+
+        if (s == stacks)
         {
-            const ProfilePoint& p = profile[static_cast<std::size_t>(i)];
-            ring.push_back(transformLocal(tip, frame, profileAroundRevolvingAxis(p, angle)));
+            ring.push_back(centre + outward * radius);
+            continue;
+        }
+
+        ring.reserve(static_cast<std::size_t>(azimuthSegments));
+        for (int k = 0; k < azimuthSegments; ++k)
+        {
+            const double a =
+                (2.0 * pi * static_cast<double>(k)) / static_cast<double>(azimuthSegments);
+            ring.push_back(centre + outward * along +
+                           (side * std::cos(a) + axis * std::sin(a)) * ringR);
         }
     }
 
-    for (int s = 0; s < steps; ++s)
+    for (int s = 0; s < stacks; ++s)
     {
         const auto& a = rings[static_cast<std::size_t>(s)];
         const auto& b = rings[static_cast<std::size_t>(s + 1)];
-        for (int i = 0; i + 1 < nProfile; ++i)
+        if (b.size() == 1)
         {
-            if (flipWinding)
-                stitchQuad(mesh, a[static_cast<std::size_t>(i)],
-                           b[static_cast<std::size_t>(i)],
-                           b[static_cast<std::size_t>(i + 1)],
-                           a[static_cast<std::size_t>(i + 1)]);
-            else
-                stitchQuad(mesh, a[static_cast<std::size_t>(i)],
-                           a[static_cast<std::size_t>(i + 1)],
-                           b[static_cast<std::size_t>(i + 1)],
-                           b[static_cast<std::size_t>(i)]);
+            for (int k = 0; k < azimuthSegments; ++k)
+            {
+                const int k1 = (k + 1) % azimuthSegments;
+                addTriangle(mesh, a[static_cast<std::size_t>(k)],
+                            a[static_cast<std::size_t>(k1)], b[0]);
+            }
+        }
+        else
+        {
+            for (int k = 0; k < azimuthSegments; ++k)
+            {
+                const int k1 = (k + 1) % azimuthSegments;
+                stitchQuad(mesh,
+                           a[static_cast<std::size_t>(k)], a[static_cast<std::size_t>(k1)],
+                           b[static_cast<std::size_t>(k1)], b[static_cast<std::size_t>(k)]);
+            }
         }
     }
+}
+
+void appendCapsuleCylinder(TriangleMesh& mesh,
+                           const vsg::dvec3& cA,
+                           const vsg::dvec3& cB,
+                           const vsg::dvec3& side,
+                           const vsg::dvec3& axis,
+                           double radius,
+                           int azimuthSegments)
+{
+    if (vsg::length(cB - cA) <= 1.0e-12) return;
+    loftRingPair(mesh, cA, side, axis, cB, side, axis, radius, azimuthSegments);
+}
+
+void appendSphereCapsule(TriangleMesh& mesh,
+                         const ToolPose& tipA,
+                         const ToolPose& tipB,
+                         double radius,
+                         int azimuthSegments)
+{
+    if (radius <= 0.0) return;
+    if (azimuthSegments < 3) azimuthSegments = 3;
+
+    const vsg::dvec3 cA = sphereCentre(tipA, radius);
+    const vsg::dvec3 cB = sphereCentre(tipB, radius);
+    const vsg::dvec3 along =
+        normalizeOr(cB - cA, normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0)));
+
+    vsg::dvec3 side, axis;
+    capsuleLateralFrame(along, side, axis);
+
+    appendCapsuleCylinder(mesh, cA, cB, side, axis, radius, azimuthSegments);
+    appendHemisphere(mesh, cA, -along, side, axis, radius, azimuthSegments, capRevolveSteps);
+    appendHemisphere(mesh, cB, along, side, axis, radius, azimuthSegments, capRevolveSteps);
+}
+
+void appendTopDisc(TriangleMesh& mesh,
+                   const vsg::dvec3& centre,
+                   const vsg::dvec3& side,
+                   const vsg::dvec3& axis,
+                   double radius,
+                   int azimuthSegments,
+                   bool flipWinding)
+{
+    appendFullDisk(mesh, centre, side, axis, radius, azimuthSegments, flipWinding);
+}
+
+void appendLowerHemisphere(TriangleMesh& mesh,
+                           const vsg::dvec3& centre,
+                           const vsg::dvec3& outward,
+                           const vsg::dvec3& side,
+                           const vsg::dvec3& axis,
+                           const vsg::dvec3& toolDir,
+                           double radius,
+                           int azimuthSegments,
+                           int stacks)
+{
+    TriangleMesh temp;
+    appendHemisphere(temp, centre, outward, side, axis, radius, azimuthSegments, stacks);
+    for (const MeshTriangle& tri : temp.triangles)
+    {
+        const vsg::dvec3 c(
+            (static_cast<double>(tri.v0.x) + tri.v1.x + tri.v2.x) / 3.0,
+            (static_cast<double>(tri.v0.y) + tri.v1.y + tri.v2.y) / 3.0,
+            (static_cast<double>(tri.v0.z) + tri.v1.z + tri.v2.z) / 3.0);
+        if (vsg::dot(c - centre, toolDir) <= 1.0e-8)
+            mesh.triangles.push_back(tri);
+    }
+}
+
+void appendBallNoseSweep(TriangleMesh& mesh,
+                         const ToolPose& tipA,
+                         const ToolPose& tipB,
+                         double radius,
+                         double height,
+                         int azimuthSegments)
+{
+    if (radius <= 0.0) return;
+    if (azimuthSegments < 3) azimuthSegments = 3;
+
+    const vsg::dvec3 dirA = normalizeOr(tipA.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    const vsg::dvec3 dirB = normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0));
+    const vsg::dvec3 cA = sphereCentre(tipA, radius);
+    const vsg::dvec3 cB = sphereCentre(tipB, radius);
+    const vsg::dvec3 along = normalizeOr(cB - cA, dirB);
+
+    vsg::dvec3 side, axis;
+    capsuleLateralFrame(along, side, axis);
+    appendCapsuleCylinder(mesh, cA, cB, side, axis, radius, azimuthSegments);
+
+    vsg::dvec3 tipSideA, tipAxisA, tipSideB, tipAxisB;
+    capsuleLateralFrame(dirA, tipSideA, tipAxisA);
+    capsuleLateralFrame(dirB, tipSideB, tipAxisB);
+    if (vsg::dot(tipSideA, tipSideB) < 0.0)
+    {
+        tipSideB = -tipSideB;
+        tipAxisB = -tipAxisB;
+    }
+
+    const vsg::dvec3 midDir = normalizeOr(dirA + dirB, dirB);
+    if (std::abs(vsg::dot(along, midDir)) > 0.92)
+    {
+        appendHemisphere(mesh, cA, -dirA, tipSideA, tipAxisA, radius, azimuthSegments,
+                         capRevolveSteps);
+        appendHemisphere(mesh, cB, -dirB, tipSideB, tipAxisB, radius, azimuthSegments,
+                         capRevolveSteps);
+    }
+    else
+    {
+        appendLowerHemisphere(mesh, cA, -along, side, axis, dirA, radius, azimuthSegments,
+                              capRevolveSteps);
+        appendLowerHemisphere(mesh, cB, along, side, axis, dirB, radius, azimuthSegments,
+                              capRevolveSteps);
+    }
+
+    if (height <= 0.0) return;
+
+    const vsg::dvec3 topA = cA + dirA * height;
+    const vsg::dvec3 topB = cB + dirB * height;
+
+    loftRingPair(mesh, cA, tipSideA, tipAxisA, topA, tipSideA, tipAxisA, radius, azimuthSegments);
+    loftRingPair(mesh, cB, tipSideB, tipAxisB, topB, tipSideB, tipAxisB, radius, azimuthSegments);
+    loftRingPair(mesh, topA, tipSideA, tipAxisA, topB, tipSideB, tipAxisB, radius, azimuthSegments);
+    appendTopDisc(mesh, topA, tipSideA, tipAxisA, radius, azimuthSegments, false);
+    appendTopDisc(mesh, topB, tipSideB, tipAxisB, radius, azimuthSegments, true);
 }
 
 } // namespace
@@ -295,25 +579,29 @@ void SweptVolume::appendSegment(ToolType type,
                                 int circleSegments)
 {
     if (type == ToolType::None || radius <= 0.0f) return;
-    if (circleSegments < 3) circleSegments = 3;
 
-    const std::vector<ProfilePoint> profile =
-        toolProfile(type, static_cast<double>(radius), static_cast<double>(height));
-    if (profile.empty()) return;
+    const double R = static_cast<double>(radius);
+    const double H = static_cast<double>(height);
 
-    const vsg::dvec3 motion = tipB.position - tipA.position;
-    const SegmentFrame frameA = makeSegmentFrame(tipA, motion);
-    const SegmentFrame frameB = makeSegmentFrame(tipB, motion);
-
-    // 1) Rings around the tool axis at each tip, lofted A → B.
-    appendProfileLoft(_mesh, tipA, tipB, frameA, frameB, profile, circleSegments);
-
-    // 2) Caps: revolve the same profile 180° around the tool axis (frame.z).
-    appendProfileCap(_mesh, tipA, frameA, profile, capRevolveSteps, false);
-    appendProfileCap(_mesh, tipB, frameB, profile, capRevolveSteps, true);
+    switch (type)
+    {
+    case ToolType::Sphere:
+        appendSphereCapsule(_mesh, tipA, tipB, R, circleSegments);
+        break;
+    case ToolType::BallNose:
+        appendBallNoseSweep(_mesh, tipA, tipB, R, H, circleSegments);
+        break;
+    case ToolType::FlatNose:
+        appendFlatNoseSweep(_mesh, tipA, tipB, R, H, circleSegments);
+        break;
+    case ToolType::BullNose:
+        appendBullNoseSweep(_mesh, tipA, tipB, R, H, circleSegments);
+        break;
+    case ToolType::None:
+        return;
+    }
 
     rebuildBvh();
     _lastPose = tipB;
 }
-
 } // namespace app

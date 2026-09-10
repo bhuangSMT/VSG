@@ -1,15 +1,17 @@
+// RayBoolean - subtract/union a SweptVolume against independent RayGrids.
 #include "RayBoolean.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <thread>
 #include <vector>
 
-#include <tbb/blocked_range.h>
-#include <tbb/parallel_for.h>
 #include <vsg/maths/transform.h>
 
 #include "BoundingBox.h"
 #include "BVH.h"
+#include "RayGrid.h"
 #include "TriangleMesh.h"
 
 namespace app
@@ -17,23 +19,12 @@ namespace app
 namespace
 {
 
-struct Interval
-{
-    double lo = 0.0;
-    double hi = 0.0;
-    Normal3f loNormal{0.0f, 0.0f, 0.0f};
-    Normal3f hiNormal{0.0f, 0.0f, 0.0f};
-};
-
 struct Hit
 {
     double along = 0.0;
     Normal3f normal{0.0f, 0.0f, 0.0f};
 };
 
-// Query the SweptVolume's own mesh/BVH in world space. Fitting is uniform scale
-// + translate, so model-space axis-aligned rays stay axis-aligned in world space
-// and the existing BVH can be used without copying or rebuilding.
 struct WorldSweep
 {
     const TriangleMesh& mesh;
@@ -43,13 +34,13 @@ struct WorldSweep
     vsg::dmat4 worldToModel{};
 };
 
-vsg::dvec3 transformNormal(const vsg::dmat4& m, const float n[3])
+Normal3f toNormal3f(const vsg::dvec3& n)
 {
-    const vsg::dvec4 d = m * vsg::dvec4(n[0], n[1], n[2], 0.0);
-    vsg::dvec3 out(d.x, d.y, d.z);
-    const double len = vsg::length(out);
-    if (len > 0.0) out /= len;
-    return out;
+    const double len = vsg::length(n);
+    if (!(len > 0.0)) return Normal3f{0.0f, 0.0f, 0.0f};
+    return Normal3f{static_cast<float>(n.x / len),
+                    static_cast<float>(n.y / len),
+                    static_cast<float>(n.z / len)};
 }
 
 void sortAndMerge(std::vector<Hit>& hits, double tolerance)
@@ -64,33 +55,6 @@ void sortAndMerge(std::vector<Hit>& hits, double tolerance)
     hits.erase(last, hits.end());
 }
 
-Normal3f orientOutward(Normal3f normal, std::size_t axis, bool entering)
-{
-    const float along = normal[axis];
-    const bool flip = entering ? (along > 0.0f) : (along < 0.0f);
-    if (flip)
-    {
-        for (int i = 0; i < 3; ++i) normal[i] = -normal[i];
-    }
-    return normal;
-}
-
-Normal3f axisOutward(std::size_t axis, bool entering)
-{
-    Normal3f n{0.0f, 0.0f, 0.0f};
-    n[axis] = entering ? -1.0f : 1.0f;
-    return n;
-}
-
-Normal3f safeOrientOutward(Normal3f normal, std::size_t axis, bool entering)
-{
-    const float len2 = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
-    if (len2 < 1.0e-12f) return axisOutward(axis, entering);
-    return orientOutward(normal, axis, entering);
-}
-
-// Axis-aligned hits against the world-space sweep BVH. (u0, v0) are model-space
-// grid coordinates; hits come back in model space along `axis`.
 void collectHits(const WorldSweep& sweep,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
@@ -143,245 +107,250 @@ void collectHits(const WorldSweep& sweep,
         worldHit[axis] = alongWorld;
         const vsg::dvec3 modelHit = sweep.worldToModel * worldHit;
 
-        Hit hit;
-        hit.along = modelHit[axis];
+        const vsg::dvec3 e1(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+        const vsg::dvec3 e2(c[0] - a[0], c[1] - a[1], c[2] - a[2]);
+        const vsg::dvec3 nWorld = vsg::cross(e1, e2);
+        // w=0 so translation in worldToModel does not affect the normal.
+        const vsg::dvec4 nModel4 =
+            sweep.worldToModel * vsg::dvec4(nWorld.x, nWorld.y, nWorld.z, 0.0);
 
-        const double e1[3]{b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-        const double e2[3]{c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-        const double n[3]{e1[1] * e2[2] - e1[2] * e2[1],
-                          e1[2] * e2[0] - e1[0] * e2[2],
-                          e1[0] * e2[1] - e1[1] * e2[0]};
-        const double length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        if (length > 0.0)
-        {
-            const float nw[3]{static_cast<float>(n[0] / length),
-                              static_cast<float>(n[1] / length),
-                              static_cast<float>(n[2] / length)};
-            const vsg::dvec3 nm = transformNormal(sweep.worldToModel, nw);
-            hit.normal = {static_cast<float>(nm.x), static_cast<float>(nm.y),
-                          static_cast<float>(nm.z)};
-        }
-
-        hits.push_back(hit);
+        hits.push_back(Hit{modelHit[axis], toNormal3f(vsg::dvec3(nModel4.x, nModel4.y, nModel4.z))});
     });
 }
 
-std::vector<Interval> intervalsFromHits(std::vector<Hit>& hits,
-                                        std::size_t axis,
-                                        double tolerance)
+std::vector<Interval> removalTicksFromHits(std::vector<Hit>& hits,
+                                           const RayGrid& grid,
+                                           double mergeTol)
 {
-    sortAndMerge(hits, tolerance);
+    sortAndMerge(hits, mergeTol);
 
     std::vector<Interval> intervals;
     for (std::size_t i = 0; i + 1 < hits.size(); i += 2)
     {
         Interval iv;
-        iv.lo = hits[i].along;
-        iv.hi = hits[i + 1].along;
-        if (!(iv.hi > iv.lo)) continue;
-        iv.loNormal = safeOrientOutward(hits[i].normal, axis, true);
-        iv.hiNormal = safeOrientOutward(hits[i + 1].normal, axis, false);
-        intervals.push_back(iv);
+        iv.begin = grid.toTick(hits[i].along);
+        iv.end = grid.toTick(hits[i + 1].along);
+        iv.beginNormal = hits[i].normal;
+        iv.endNormal = hits[i + 1].normal;
+        iv.setFromBoolean(true);
+        if (iv.end > iv.begin) intervals.push_back(iv);
     }
     return intervals;
 }
 
-bool chainMayHitSweep(const WorldSweep& sweep,
-                      std::size_t axis,
-                      const RayChain& chain)
+std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
+                                    const std::vector<Interval>& cutters)
 {
-    if (!sweep.worldBounds.valid() || chain.rays.empty()) return false;
-
-    const std::size_t u = (axis + 1) % 3;
-    const std::size_t v = (axis + 2) % 3;
-    const Point3d& sample = chain.rays.front().startPoint;
-    const double u0 = sample[u];
-    const double v0 = sample[v];
-
-    double tMin = chain.rays.front().startPoint[axis];
-    double tMax = chain.rays.front().endPoint[axis];
-    for (const Ray& ray : chain.rays)
-    {
-        tMin = std::min(tMin, std::min(ray.startPoint[axis], ray.endPoint[axis]));
-        tMax = std::max(tMax, std::max(ray.startPoint[axis], ray.endPoint[axis]));
-    }
-
-    vsg::dvec3 modelLo;
-    modelLo[u] = u0;
-    modelLo[v] = v0;
-    modelLo[axis] = tMin;
-    vsg::dvec3 modelHi = modelLo;
-    modelHi[axis] = tMax;
-
-    const vsg::dvec3 worldLo = sweep.modelToWorld * modelLo;
-    const vsg::dvec3 worldHi = sweep.modelToWorld * modelHi;
-
-    const double wu0 = worldLo[u];
-    const double wv0 = worldLo[v];
-    const double wtMin = std::min(worldLo[axis], worldHi[axis]);
-    const double wtMax = std::max(worldLo[axis], worldHi[axis]);
-
-    const Point3d& bmin = sweep.worldBounds.min();
-    const Point3d& bmax = sweep.worldBounds.max();
-    if (wu0 < bmin[u] || wu0 > bmax[u] || wv0 < bmin[v] || wv0 > bmax[v]) return false;
-    return !(wtMax < bmin[axis] || wtMin > bmax[axis]);
-}
-
-std::vector<Interval> subtractIntervals(const Interval& solid,
-                                        const std::vector<Interval>& cutters)
-{
-    std::vector<Interval> remaining{solid};
+    std::vector<Interval> remaining = solid;
     for (const Interval& cut : cutters)
     {
         std::vector<Interval> next;
         for (const Interval& piece : remaining)
         {
-            if (cut.hi <= piece.lo || cut.lo >= piece.hi)
+            if (cut.end <= piece.begin || cut.begin >= piece.end)
             {
                 next.push_back(piece);
                 continue;
             }
 
-            if (cut.lo > piece.lo + 1.0e-12)
+            if (cut.begin > piece.begin)
             {
                 Interval left = piece;
-                left.hi = cut.lo;
-                left.hiNormal = piece.hiNormal;
-                next.push_back(left);
+                left.end = cut.begin;
+                left.endNormal = cut.beginNormal;
+                if (left.end > left.begin) next.push_back(left);
             }
-            if (cut.hi < piece.hi - 1.0e-12)
+            if (cut.end < piece.end)
             {
                 Interval right = piece;
-                right.lo = cut.hi;
-                right.loNormal = piece.loNormal;
-                next.push_back(right);
+                right.begin = cut.end;
+                right.beginNormal = cut.endNormal;
+                right.setFromBoolean(true);
+                if (right.end > right.begin) next.push_back(right);
             }
         }
-        remaining.swap(next);
+        remaining = std::move(next);
     }
     return remaining;
 }
 
-std::vector<Interval> unionIntervals(const Interval& solid,
-                                     const std::vector<Interval>& added)
+std::vector<Interval> unionTicks(const std::vector<Interval>& solid,
+                                 const std::vector<Interval>& add)
 {
-    std::vector<Interval> all{solid};
-    for (const Interval& cut : added)
-    {
-        Interval piece = cut;
-        piece.loNormal = solid.loNormal;
-        piece.hiNormal = solid.hiNormal;
-        all.push_back(piece);
-    }
+    std::vector<Interval> all = solid;
+    all.insert(all.end(), add.begin(), add.end());
     if (all.empty()) return all;
 
     std::sort(all.begin(), all.end(),
-              [](const Interval& a, const Interval& b) { return a.lo < b.lo; });
+              [](const Interval& a, const Interval& b) { return a.begin < b.begin; });
 
     std::vector<Interval> merged;
     merged.push_back(all.front());
     for (std::size_t i = 1; i < all.size(); ++i)
     {
-        Interval& last = merged.back();
-        const Interval& cur = all[i];
-        if (cur.lo <= last.hi + 1.0e-12)
+        Interval& cur = merged.back();
+        const Interval& nxt = all[i];
+        if (nxt.begin <= cur.end)
         {
-            if (cur.hi > last.hi)
+            if (nxt.end > cur.end)
             {
-                last.hi = cur.hi;
-                last.hiNormal = cur.hiNormal;
+                cur.end = nxt.end;
+                cur.endNormal = nxt.endNormal;
             }
+            if (nxt.fromBoolean()) cur.setFromBoolean(true);
         }
         else
         {
-            merged.push_back(cur);
+            merged.push_back(nxt);
         }
     }
     return merged;
 }
 
-Ray makeRay(std::size_t axis, std::size_t u, std::size_t v,
-            double along0, double along1,
-            double u0, double v0,
-            const Normal3f& n0, const Normal3f& n1,
-            bool fromBoolean)
+void replaceSlotIntervals(RayGrid& grid, RaySlot& slot, const std::vector<Interval>& next)
 {
-    Ray ray;
-    ray.startPoint[axis] = along0;
-    ray.startPoint[u] = u0;
-    ray.startPoint[v] = v0;
-    ray.endPoint[axis] = along1;
-    ray.endPoint[u] = u0;
-    ray.endPoint[v] = v0;
-    ray.startNormal = n0;
-    ray.endNormal = n1;
-    ray.fromBoolean = fromBoolean;
-    return ray;
+    if (next.empty())
+    {
+        slot.intervalCount = 0;
+        return;
+    }
+    if (!grid.pool.tryReplaceInPlace(slot, next.data(),
+                                     static_cast<std::uint32_t>(next.size())))
+        grid.pool.append(slot, next);
 }
 
-RayChain processChain(std::size_t axis,
-                      const RayChain& chain,
-                      const WorldSweep& sweep,
-                      BooleanOp op,
-                      double mergeTol)
+void processAxisGrid(RayGrid& grid,
+                     const WorldSweep& sweep,
+                     BooleanOp op,
+                     double mergeTol)
 {
+    if (grid.empty() || !sweep.worldBounds.valid()) return;
+
+    const std::size_t axis = grid.axis;
     const std::size_t u = (axis + 1) % 3;
     const std::size_t v = (axis + 2) % 3;
 
-    RayChain out;
-    out.u = chain.u;
-    out.v = chain.v;
-    if (chain.rays.empty()) return out;
-
-    const double u0 = chain.rays.front().startPoint[u];
-    const double v0 = chain.rays.front().startPoint[v];
+    std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
+    if (!gridWindowFromWorldAabb(grid, sweep.worldBounds, sweep.worldToModel,
+                                 iu0, iu1, iv0, iv1))
+        return;
 
     std::vector<Hit> hits;
-    collectHits(sweep, axis, u, v, u0, v0, hits);
-    if (hits.empty())
+    for (std::uint32_t iv = iv0; iv <= iv1; ++iv)
     {
-        out.rays = chain.rays;
-        return out;
-    }
-
-    const std::vector<Interval> sweepSolid = intervalsFromHits(hits, axis, mergeTol);
-    if (sweepSolid.empty())
-    {
-        out.rays = chain.rays;
-        return out;
-    }
-
-    for (const Ray& ray : chain.rays)
-    {
-        const double t0 = ray.startPoint[axis];
-        const double t1 = ray.endPoint[axis];
-        if (!(t1 > t0)) continue;
-
-        Interval solid;
-        solid.lo = t0;
-        solid.hi = t1;
-        solid.loNormal = ray.startNormal;
-        solid.hiNormal = ray.endNormal;
-
-        std::vector<Interval> result;
-        if (op == BooleanOp::Subtraction)
-            result = subtractIntervals(solid, sweepSolid);
-        else
-            result = unionIntervals(solid, sweepSolid);
-
-        for (const Interval& iv : result)
+        for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
         {
-            if (!(iv.hi > iv.lo)) continue;
-            out.rays.push_back(makeRay(axis, u, v, iv.lo, iv.hi, u0, v0,
-                                       ray.startNormal, ray.endNormal,
-                                       true));
+            RaySlot& slot = grid.at(iu, iv);
+            const double u0 = grid.sampleU(iu);
+            const double v0 = grid.sampleV(iv);
+
+            collectHits(sweep, axis, u, v, u0, v0, hits);
+            if (hits.size() < 2)
+            {
+                if (op == BooleanOp::Subtraction) continue;
+                // Union with empty sweep solid: unchanged.
+                continue;
+            }
+
+            const std::vector<Interval> sweepSolid =
+                removalTicksFromHits(hits, grid, mergeTol);
+            if (sweepSolid.empty()) continue;
+
+            std::vector<Interval> current;
+            if (!slot.empty())
+            {
+                auto spans = grid.pool.span(slot);
+                current.assign(spans.begin(), spans.end());
+            }
+
+            std::vector<Interval> result;
+            if (op == BooleanOp::Subtraction)
+            {
+                if (current.empty()) continue;
+                result = subtractTicks(current, sweepSolid);
+            }
+            else
+            {
+                result = unionTicks(current, sweepSolid);
+            }
+
+            replaceSlotIntervals(grid, slot, result);
         }
     }
+}
 
-    return out;
+RayGrid copyGrid(const RayGrid& src)
+{
+    RayGrid dst;
+    dst.width = src.width;
+    dst.height = src.height;
+    dst.spacingU = src.spacingU;
+    dst.spacingV = src.spacingV;
+    dst.originU = src.originU;
+    dst.originV = src.originV;
+    dst.originT = src.originT;
+    dst.unit = src.unit;
+    dst.axis = src.axis;
+    dst.cells = src.cells;
+    dst.pool.data = src.pool.data;
+    return dst;
 }
 
 } // namespace
+
+BoundingBox modelAabbFromWorld(const BoundingBox& worldBounds,
+                               const vsg::dmat4& worldToModel)
+{
+    BoundingBox out;
+    if (!worldBounds.valid()) return out;
+
+    const Point3d& wmin = worldBounds.min();
+    const Point3d& wmax = worldBounds.max();
+    for (int ix = 0; ix < 2; ++ix)
+        for (int iy = 0; iy < 2; ++iy)
+            for (int iz = 0; iz < 2; ++iz)
+            {
+                const vsg::dvec3 corner = worldToModel *
+                    vsg::dvec3(ix ? wmax[0] : wmin[0],
+                               iy ? wmax[1] : wmin[1],
+                               iz ? wmax[2] : wmin[2]);
+                out.expand(Point3d{corner.x, corner.y, corner.z});
+            }
+    return out;
+}
+
+bool gridWindowFromWorldAabb(const RayGrid& grid,
+                             const BoundingBox& worldBounds,
+                             const vsg::dmat4& worldToModel,
+                             std::uint32_t& iu0, std::uint32_t& iu1,
+                             std::uint32_t& iv0, std::uint32_t& iv1)
+{
+    if (grid.empty() || !worldBounds.valid()) return false;
+
+    const BoundingBox modelAabb = modelAabbFromWorld(worldBounds, worldToModel);
+    return gridWindowFromModelAabb(grid, modelAabb, iu0, iu1, iv0, iv1);
+}
+
+bool gridWindowFromModelAabb(const RayGrid& grid,
+                             const BoundingBox& modelAabb,
+                             std::uint32_t& iu0, std::uint32_t& iu1,
+                             std::uint32_t& iv0, std::uint32_t& iv1)
+{
+    if (grid.empty() || !modelAabb.valid()) return false;
+
+    const std::size_t u = (grid.axis + 1) % 3;
+    const std::size_t v = (grid.axis + 2) % 3;
+    const Point3d& lo = modelAabb.min();
+    const Point3d& hi = modelAabb.max();
+
+    iu0 = grid.indexU(lo[u]);
+    iu1 = grid.indexU(hi[u]);
+    iv0 = grid.indexV(lo[v]);
+    iv1 = grid.indexV(hi[v]);
+    if (iu0 > iu1) std::swap(iu0, iu1);
+    if (iv0 > iv1) std::swap(iv0, iv1);
+    return true;
+}
 
 RayModel applyBoolean(const RayModel& source,
                       const SweptVolume& sweep,
@@ -394,58 +363,43 @@ RayModel applyBoolean(const RayModel& source,
     result._bounds = source.bounds();
     result._resolution = source.resolution();
 
-    if (op == BooleanOp::None || sweep.empty() || sweep.bvh().empty())
+    // Deep-copy present grids so we can mutate independently.
+    for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        result._chains = source._chains;
-        return result;
+        if (const RayGrid* g = source.grid(axis))
+            result._grids[axis] = copyGrid(*g);
     }
+
+    if (op == BooleanOp::None || sweep.empty() || sweep.bvh().empty())
+        return result;
 
     const WorldSweep worldSweep{sweep.mesh(), sweep.bvh(), sweep.bvh().bounds(),
                                 modelToWorld, vsg::inverse(modelToWorld)};
-    if (!worldSweep.worldBounds.valid())
-    {
-        result._chains = source._chains;
-        return result;
-    }
+    if (!worldSweep.worldBounds.valid()) return result;
 
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
+    // One thread per present axis; each writes only its own grid (no mutex).
+    std::thread workers[2];
+    int workerCount = 0;
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        const auto& inChains = source._chains[axis];
-        std::vector<RayChain> outChains(inChains.size());
-        std::vector<char> keep(inChains.size(), 0);
+        RayGrid* g = result.grid(axis);
+        if (!g) continue;
 
-        tbb::parallel_for(
-            tbb::blocked_range<std::size_t>(0, inChains.size()),
-            [&](const tbb::blocked_range<std::size_t>& range) {
-                for (std::size_t i = range.begin(); i != range.end(); ++i)
-                {
-                    const RayChain& chain = inChains[i];
-                    if (!chainMayHitSweep(worldSweep, axis, chain))
-                    {
-                        outChains[i] = chain;
-                        keep[i] = 1;
-                        continue;
-                    }
-
-                    RayChain updated = processChain(axis, chain, worldSweep, op, mergeTol);
-                    if (!updated.rays.empty())
-                    {
-                        outChains[i] = std::move(updated);
-                        keep[i] = 1;
-                    }
-                }
-            });
-
-        std::vector<RayChain> compacted;
-        compacted.reserve(inChains.size());
-        for (std::size_t i = 0; i < inChains.size(); ++i)
+        if (workerCount < 2)
         {
-            if (keep[i]) compacted.push_back(std::move(outChains[i]));
+            workers[workerCount++] = std::thread(
+                [g, &worldSweep, op, mergeTol]() {
+                    processAxisGrid(*g, worldSweep, op, mergeTol);
+                });
         }
-        result._chains[axis] = std::move(compacted);
+        else
+        {
+            processAxisGrid(*g, worldSweep, op, mergeTol);
+        }
     }
+    for (int i = 0; i < workerCount; ++i) workers[i].join();
 
     return result;
 }

@@ -366,6 +366,14 @@ try
     radiusSpin->setValue(app::Parameter::instance().toolRadius());
     grid->addWidget(radiusSpin, row++, 0);
 
+    grid->addWidget(new QLabel("Length"), row++, 0);
+
+    auto lengthSpin = new QDoubleSpinBox();
+    lengthSpin->setDecimals(6);
+    lengthSpin->setRange(1.0e-9, 1.0e9);
+    lengthSpin->setValue(app::Parameter::instance().toolLength());
+    grid->addWidget(lengthSpin, row++, 0);
+
     auto sweptVolumeCheck = new QCheckBox("Show swept volume");
     sweptVolumeCheck->setChecked(app::Parameter::instance().sweptVolume());
     grid->addWidget(sweptVolumeCheck, row++, 0);
@@ -432,6 +440,8 @@ try
     };
 
     // Default cutter radius: 5% of the BRep bounding-box diagonal, in model space.
+    // Default length matches the previous fixed shank factor (2.8 × radius).
+    constexpr double defaultToolLengthFactor = 2.8;
     auto defaultToolRadius = [](const app::BRep& brep) {
         const app::BoundingBox bounds = app::BoundingBox::fromBRep(brep);
         const double diagonal = bounds.valid() ? bounds.diagonal() : 1.0;
@@ -442,6 +452,21 @@ try
         radiusSpin->blockSignals(true);
         radiusSpin->setValue(radius);
         radiusSpin->blockSignals(false);
+    };
+
+    auto writeToolLength = [lengthSpin](double length) {
+        lengthSpin->blockSignals(true);
+        lengthSpin->setValue(length);
+        lengthSpin->blockSignals(false);
+    };
+
+    auto seedToolSize = [&](const app::BRep& brep) {
+        const double radius = defaultToolRadius(brep);
+        const double length = radius * defaultToolLengthFactor;
+        app::Parameter::instance().setToolRadius(radius);
+        app::Parameter::instance().setToolLength(length);
+        writeToolRadius(radius);
+        writeToolLength(length);
     };
 
     // --- Compose panel (left) + render surface (right) ---------------------
@@ -463,11 +488,7 @@ try
     auto renderManager = std::make_shared<app::RenderManager>(viewer, vsg_scene, options);
 
     const app::BRep startupBRep = createCubeBRep();
-    {
-        const double radius = defaultToolRadius(startupBRep);
-        app::Parameter::instance().setToolRadius(radius);
-        writeToolRadius(radius);
-    }
+    seedToolSize(startupBRep);
     renderManager->showBRep(startupBRep);
     writeResolution(defaultResolution(startupBRep));
 
@@ -496,6 +517,11 @@ try
     QObject::connect(radiusSpin, &QDoubleSpinBox::valueChanged,
                      [renderManager](double radius) {
                          app::Parameter::instance().setToolRadius(radius);
+                         renderManager->updateToolGeometry();
+                     });
+    QObject::connect(lengthSpin, &QDoubleSpinBox::valueChanged,
+                     [renderManager](double length) {
+                         app::Parameter::instance().setToolLength(length);
                          renderManager->updateToolGeometry();
                      });
     QObject::connect(sweptVolumeCheck, &QCheckBox::toggled, [renderManager](bool on) {
@@ -583,7 +609,7 @@ try
     // --import startup option.
     auto importModel = [mainWindow, renderManager, buildRayModel,
                         writeResolution, defaultResolution,
-                        writeToolRadius, defaultToolRadius](const std::string& path) {
+                        seedToolSize](const std::string& path) {
         try
         {
             const app::TriangleMesh mesh = importMesh(path);
@@ -608,11 +634,9 @@ try
 
             app::Parameter::instance().setLastImportPath(path);
 
-            // Reseed radius for the new model before showBRep so the tool mesh
-            // (if any) is rebuilt at the default 5% diagonal size.
-            const double radius = defaultToolRadius(brep);
-            app::Parameter::instance().setToolRadius(radius);
-            writeToolRadius(radius);
+            // Reseed radius/length for the new model before showBRep so the tool
+            // mesh (if any) is rebuilt at the default size.
+            seedToolSize(brep);
 
             renderManager->showBRep(brep);
 

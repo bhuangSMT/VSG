@@ -5,10 +5,10 @@
 // subgraph for the already-running viewer and swaps it into the scene.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <map>
 #include <optional>
-#include <thread>
 #include <vector>
 
 #include <vsg/all.h>
@@ -19,6 +19,7 @@
 #include "BoundingBox.h"
 #include "BooleanOp.h"
 #include "GaussianSplat.h"
+#include "GaussianSplatCache.h"
 #include "RayModel.h"
 #include "SweptVolume.h"
 #include "ToolType.h"
@@ -81,16 +82,18 @@ public:
     void setToolType(ToolType type);
     ToolType toolType() const { return _toolType; }
 
-    // Rebuild the tool mesh from Parameter::toolRadius() (and the current type).
-    // Keeps the existing pose when the tool was already on screen.
+    // Rebuild the tool mesh from Parameter::toolRadius() / toolLength() (and
+    // the current type). Keeps the existing pose when the tool was already on
+    // screen.
     void updateToolGeometry();
 
-    // Place the active tool so its tip sits at position and its axis follows
-    // direction (both in world space). No-op when the tool type is None.
-    // While a tool is active, motion always accumulates a CPU swept volume.
-    // Each mesh change re-applies the active boolean op and rebuilds Ray /
-    // Ray-GS. The swept-volume checkbox only controls whether that mesh is
-    // drawn in VSG.
+    // Place the active tool at position with axis along direction (world space).
+    // For flat / bull nose, position is the tip. For ball nose / sphere, position
+    // is the sphere centre — the tip is shifted down the axis by the tool radius.
+    // No-op when the tool type is None. While a tool is active, motion always
+    // accumulates a CPU swept volume. Each mesh change re-applies the active
+    // boolean op and rebuilds Ray / Ray-GS. The swept-volume checkbox only
+    // controls whether that mesh is drawn in VSG.
     void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
 
     // Show or hide the swept-volume drawable. Does not start/stop recording.
@@ -149,14 +152,16 @@ private:
     // when fitting is off / bounds are empty.
     vsg::dmat4 fitMatrix(const BoundingBox& bounds) const;
 
-    // Build (or rebuild) the tool subgraph for the current type and the radius
-    // held in Parameter. preservePose keeps the previous MatrixTransform so a
-    // radius edit does not jump the cutter back to the default placement.
+    // Build (or rebuild) the tool subgraph for the current type and the
+    // radius/length held in Parameter. preservePose keeps the previous
+    // MatrixTransform so a radius edit does not jump the cutter back to the
+    // default placement.
     void rebuildTool(bool preservePose);
 
-    // Model-space radius from Parameter, converted into the space the tool is
-    // drawn in (world / fitted), matching applyFit()'s scale.
+    // Model-space radius / length from Parameter, converted into the space the
+    // tool is drawn in (world / fitted), matching applyFit()'s scale.
     float worldToolRadius() const;
+    float worldToolLength() const;
 
     // Rebuild the swept-volume scene node from the CPU SweptVolume.
     void publishSweptVolume();
@@ -170,6 +175,14 @@ private:
     // applyFit() maps into.
     float splatRadius(const RayModel& rayModel, std::size_t axis) const;
 
+    // Radii for all three axes, already multiplied by the display stride.
+    std::array<float, 3> splatRadii(const RayModel& rayModel, int stride) const;
+
+    SplatStyle splatStyle() const;
+
+    // Full Ray-GS rebuild through the Gaussian cache, then attach.
+    void rebuildSplatCache();
+
     // Compile a subgraph against the running viewer, then attach it.
     // replaceExisting swaps the model node only; the tool transform is kept.
     void attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting);
@@ -181,13 +194,6 @@ private:
     // Drop every cast model. The rays belong to the BRep they were cast
     // through, so this runs whenever that changes.
     void clearRayModels();
-
-    // Wait for a background degenerate-ray cleanup to finish before the model
-    // it mutates is replaced or destroyed.
-    void joinRayCleanup();
-
-    // Non-const view of whatever _rayModel currently points at, or null.
-    RayModel* mutableDisplayedRayModel();
 
     vsg::ref_ptr<vsgQt::Viewer> _viewer;
     vsg::ref_ptr<vsg::Group> _scene;
@@ -228,12 +234,13 @@ private:
     // high enough that a few of them still build up to a solid surface.
     float _splatOpacity = 0.5f;
 
+    // Incremental GPU splat buffers for Ray-GS. Cleared when the cast model or
+    // resolution changes; patched in-place for boolean AABB windows.
+    GaussianSplatCache _splatCache;
+
     bool _fitToUnitBox = true;
     ViewMode _viewMode = ViewMode::Facet;
     ToolType _toolType = ToolType::None;
-
-    // Shank length as a multiple of the (world-space) cutter radius.
-    static constexpr float toolHeightFactor = 2.8f;
 
     // Kept so a view mode change can rebuild the geometry from the source
     // topology rather than from whatever is currently in the scene.
@@ -276,9 +283,6 @@ private:
 
     // What is drawn: either _sourceRayModel or &_booleanRayModel.
     const RayModel* _rayModel = nullptr;
-
-    // Background pass that strips sub-resolution spans from the displayed model.
-    std::thread _rayCleanupThread;
 };
 
 } // namespace app

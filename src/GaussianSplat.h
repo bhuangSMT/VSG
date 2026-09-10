@@ -12,6 +12,7 @@
 // per-frame sort, but it only matters between splats sampling the same surface.
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 #include <vsg/all.h>
@@ -39,6 +40,31 @@ struct Splat
     vsg::vec3 normal;
     vsg::vec4 color;
     float radius;
+};
+
+// Mutable GPU splat buffers used by the incremental cache. Slots may have
+// radius <= 0 (padding); the shader clips those away.
+class GaussianSplatSet
+{
+public:
+    void resize(std::size_t splatCount);
+    void set(std::size_t index, const Splat& splat);
+    void clearSlot(std::size_t index);
+    void markDirty();
+
+    std::size_t capacity() const { return _capacity; }
+    vsg::ref_ptr<vsg::Node> node() const { return _root; }
+    bool empty() const { return !_root || _capacity == 0; }
+
+private:
+    std::size_t _capacity = 0;
+    vsg::ref_ptr<vsg::vec4Array> _centerRadius;
+    vsg::ref_ptr<vsg::vec2Array> _corners;
+    vsg::ref_ptr<vsg::vec4Array> _colors;
+    vsg::ref_ptr<vsg::vec3Array> _normals;
+    vsg::ref_ptr<vsg::uintArray> _indices;
+    vsg::ref_ptr<vsg::VertexIndexDraw> _draw;
+    vsg::ref_ptr<vsg::Group> _root;
 };
 
 // Builds the subgraph that draws splats.
