@@ -911,9 +911,11 @@ void RenderManager::applyBooleanToRayModel()
     }
     else
     {
-        // Cumulative: each new sweep segment cuts the last boolean result.
-        const RayModel& input = _booleanRayModel ? *_booleanRayModel : *_sourceRayModel;
-        const BoundingBox bounds = input.bounds();
+        // Cumulative: mutate a working copy in place. Fork from source once.
+        if (!_booleanRayModel)
+            _booleanRayModel = _sourceRayModel->clone();
+
+        const BoundingBox bounds = _booleanRayModel->bounds();
         const vsg::dmat4 modelToWorld = fitMatrix(bounds);
         const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
 
@@ -924,8 +926,7 @@ void RenderManager::applyBooleanToRayModel()
             haveDirtyRegion = dirtyModelAabb.valid();
         }
 
-        RayModel next = input.withBoolean(*_sweptVolume, op, modelToWorld);
-        _booleanRayModel = std::move(next);
+        _booleanRayModel->booleanInPlace(*_sweptVolume, op, modelToWorld);
         _rayModel = &*_booleanRayModel;
     }
 

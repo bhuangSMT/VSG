@@ -168,7 +168,8 @@ int main(int argc, char** argv)
     const vsg::dmat4 identity{};
 
     // --- Boolean ---
-    auto timeBoolean = [&](const char* label, app::SweptVolume& sweep) {
+    // Copy+mutate (withBoolean) — first-cut / fork cost.
+    auto timeBooleanCopy = [&](const char* label, app::SweptVolume& sweep) {
         double total = 0.0;
         std::size_t outIntervals = 0;
         for (int i = 0; i < repeats; ++i)
@@ -182,11 +183,27 @@ int main(int argc, char** argv)
         rows.push_back({label, total / repeats,
                         std::to_string(outIntervals) + " intervals after cut"});
     };
-    timeBoolean("boolean Sphere", sphereSweep);
-    timeBoolean("boolean BallNose", ballSweep);
-    timeBoolean("boolean FlatNose", flatSweep);
+    timeBooleanCopy("boolean copy Sphere", sphereSweep);
+    timeBooleanCopy("boolean copy BallNose", ballSweep);
+    timeBooleanCopy("boolean copy FlatNose", flatSweep);
 
-    // Cumulative boolean (10 successive cuts on a moving segment) — interactive path.
+    // In-place mutate (interactive steady-state after first fork).
+    {
+        double total = 0.0;
+        std::size_t outIntervals = 0;
+        for (int i = 0; i < repeats; ++i)
+        {
+            app::RayModel working = stock.clone();
+            const auto t0 = Clock::now();
+            working.booleanInPlace(sphereSweep, app::BooleanOp::Subtraction, identity);
+            total += elapsedMs(t0);
+            outIntervals = working.rayCount();
+        }
+        rows.push_back({"boolean inPlace Sphere", total / repeats,
+                        std::to_string(outIntervals) + " intervals after cut"});
+    }
+
+    // Cumulative boolean (10 successive in-place cuts) — interactive path.
     {
         double total = 0.0;
         app::RayModel working = app::RayModel::fromBRep(brep, res);
@@ -200,7 +217,7 @@ int main(int argc, char** argv)
             step.appendSegment(app::ToolType::Sphere, static_cast<float>(toolR),
                                static_cast<float>(toolL), a, b, 12);
             const auto t0 = Clock::now();
-            working = working.withBoolean(step, app::BooleanOp::Subtraction, identity);
+            working.booleanInPlace(step, app::BooleanOp::Subtraction, identity);
             total += elapsedMs(t0);
         }
         rows.push_back({"boolean cumulative x10", total,
@@ -214,7 +231,7 @@ int main(int argc, char** argv)
         double coldTotal = 0.0;
         for (int i = 0; i < repeats; ++i)
         {
-            cache.clear();
+            cache.release();
             const auto t0 = Clock::now();
             cache.rebuild(stock, stride, splatRadii, style);
             coldTotal += elapsedMs(t0);
@@ -227,6 +244,7 @@ int main(int argc, char** argv)
         double warmTotal = 0.0;
         for (int i = 0; i < repeats; ++i)
         {
+            cache.clear(); // soft: keep buffers
             const auto t0 = Clock::now();
             cache.rebuild(stock, stride, splatRadii, style);
             warmTotal += elapsedMs(t0);

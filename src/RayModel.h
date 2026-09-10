@@ -35,9 +35,18 @@ public:
     static RayModel fromBRep(const BRep& brep, const Point3d& resolution);
     static Point3d finestCastableResolution(const BRep& brep, const Point3d& requested);
 
+    // Deep-copy grids into a new model (one-time fork from source stock).
+    RayModel clone() const;
+
+    // Copy-then-mutate (allocates a new model). Prefer booleanInPlace for cuts.
     RayModel withBoolean(const SweptVolume& sweep,
                          BooleanOp op,
                          const vsg::dmat4& modelToWorld) const;
+
+    // Mutate this model's grids in place (no deep copy).
+    void booleanInPlace(const SweptVolume& sweep,
+                        BooleanOp op,
+                        const vsg::dmat4& modelToWorld);
 
     // nullptr when that axis was not built.
     const RayGrid* grid(std::size_t axis) const;
@@ -60,6 +69,10 @@ private:
                                  const SweptVolume& sweep,
                                  BooleanOp op,
                                  const vsg::dmat4& modelToWorld);
+    friend void applyBooleanInPlace(RayModel& model,
+                                    const SweptVolume& sweep,
+                                    BooleanOp op,
+                                    const vsg::dmat4& modelToWorld);
 
     std::array<std::optional<RayGrid>, 3> _grids;
     BoundingBox _bounds;

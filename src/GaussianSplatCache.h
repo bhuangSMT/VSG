@@ -32,8 +32,9 @@ public:
     // Soft per-cell ceiling (not reserved storage). Larger counts force rebuild.
     static constexpr int maxEndpointsPerCell = 64;
 
-    void clear();
-    bool empty() const { return _set.empty(); }
+    void clear();   // Invalidate layout; keep GPU buffers for a warm rebuild.
+    void release(); // Free GPU buffers (cold next rebuild). Used for teardown/profile.
+    bool empty() const { return _stride == 0; }
 
     std::size_t capacity() const { return _capacity; }
     std::size_t liveEndpoints() const { return _live; }

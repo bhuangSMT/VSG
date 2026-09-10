@@ -50,6 +50,26 @@ std::uint32_t endpointNeed(const RaySlot& slot)
 
 void GaussianSplatCache::clear()
 {
+    // Soft clear: keep GPU capacity/pipelines so the next rebuild stays warm.
+    if (_live > 0)
+    {
+        const auto end = std::min(_live, _capacity);
+        for (std::size_t i = 0; i < end; ++i)
+            _set.clearSlot(i);
+        _set.markDirty();
+    }
+
+    _axes = {};
+    for (auto& refs : _cellRefs) refs.clear();
+    _freeList.clear();
+    _resolution = Point3d{0.0, 0.0, 0.0};
+    _stride = 0;
+    _live = 0;
+    _capacity = _set.capacity();
+}
+
+void GaussianSplatCache::release()
+{
     _set.resize(0);
     _axes = {};
     for (auto& refs : _cellRefs) refs.clear();
@@ -63,7 +83,7 @@ void GaussianSplatCache::clear()
 bool GaussianSplatCache::layoutMatches(const RayModel& rayModel, int stride) const
 {
     if (stride != _stride || rayModel.resolution() != _resolution) return false;
-    if (_capacity == 0 || _set.empty()) return false;
+    if (_stride == 0 || _capacity == 0 || _set.capacity() == 0) return false;
 
     for (std::size_t axis = 0; axis < 3; ++axis)
     {

@@ -23,6 +23,12 @@ RayModel applyBoolean(const RayModel& source,
                       BooleanOp op,
                       const vsg::dmat4& modelToWorld);
 
+// Mutate model grids in place (dirty AABB window only). No deep copy.
+void applyBooleanInPlace(RayModel& model,
+                         const SweptVolume& sweep,
+                         BooleanOp op,
+                         const vsg::dmat4& modelToWorld);
+
 // Map a world-space AABB through worldToModel (8 corners) into model space.
 BoundingBox modelAabbFromWorld(const BoundingBox& worldBounds,
                                const vsg::dmat4& worldToModel);

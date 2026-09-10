@@ -61,74 +61,127 @@ Point3d toPoint(const vsg::vec3& v)
                    static_cast<double>(v.z)};
 }
 
+// Precomputed triangle for casting: double verts, unit normal, and per-axis
+// UV bounds + barycentric coefficients (axis = cast direction).
+struct CastFace
+{
+    struct AxisProj
+    {
+        double loU = 0.0, hiU = 0.0, loV = 0.0, hiV = 0.0;
+        double denom = 0.0;
+        double w0u = 0.0, w0v = 0.0, w0c = 0.0;
+        double w1u = 0.0, w1v = 0.0, w1c = 0.0;
+        bool usable = false;
+    };
+
+    Point3d a{0.0, 0.0, 0.0};
+    Point3d b{0.0, 0.0, 0.0};
+    Point3d c{0.0, 0.0, 0.0};
+    Normal3f normal{0.0f, 0.0f, 0.0f};
+    AxisProj proj[3]{};
+    bool valid = false;
+};
+
+std::vector<CastFace> buildCastFaces(const BRep& brep)
+{
+    const auto& verts = brep.vertices();
+    const auto& faceOffsets = brep.faceOffsets();
+    const auto& faceVertices = brep.faceVertices();
+    const std::size_t faceCount = brep.faceCount();
+
+    std::vector<CastFace> faces(faceCount);
+    for (std::size_t f = 0; f < faceCount; ++f)
+    {
+        const std::uint32_t begin = faceOffsets[f];
+        if (faceOffsets[f + 1] - begin < 3) continue;
+
+        CastFace& face = faces[f];
+        face.a = toPoint(verts[faceVertices[begin]]);
+        face.b = toPoint(verts[faceVertices[begin + 1]]);
+        face.c = toPoint(verts[faceVertices[begin + 2]]);
+
+        const double e1[3]{face.b[0] - face.a[0], face.b[1] - face.a[1], face.b[2] - face.a[2]};
+        const double e2[3]{face.c[0] - face.a[0], face.c[1] - face.a[1], face.c[2] - face.a[2]};
+        const double n[3]{e1[1] * e2[2] - e1[2] * e2[1],
+                          e1[2] * e2[0] - e1[0] * e2[2],
+                          e1[0] * e2[1] - e1[1] * e2[0]};
+        const double length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (!(length > 0.0)) continue;
+
+        for (int i = 0; i < 3; ++i)
+            face.normal[i] = static_cast<float>(n[i] / length);
+        face.valid = true;
+
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            const std::size_t u = (axis + 1) % 3;
+            const std::size_t v = (axis + 2) % 3;
+            const double au = face.a[u], av = face.a[v];
+            const double bu = face.b[u], bv = face.b[v];
+            const double cu = face.c[u], cv = face.c[v];
+
+            CastFace::AxisProj& p = face.proj[axis];
+            p.loU = std::min({au, bu, cu});
+            p.hiU = std::max({au, bu, cu});
+            p.loV = std::min({av, bv, cv});
+            p.hiV = std::max({av, bv, cv});
+            p.denom = (bv - cv) * (au - cu) + (cu - bu) * (av - cv);
+            const double areaScale = (p.hiU - p.loU) * (p.hiV - p.loV);
+            if (std::abs(p.denom) <= 1e-12 * std::max(areaScale, 1e-300))
+            {
+                p.usable = false;
+                continue;
+            }
+            const double inv = 1.0 / p.denom;
+            p.w0u = (bv - cv) * inv;
+            p.w0v = (cu - bu) * inv;
+            p.w0c = (-(bv - cv) * cu - (cu - bu) * cv) * inv;
+            p.w1u = (cv - av) * inv;
+            p.w1v = (au - cu) * inv;
+            p.w1c = (-(cv - av) * cu - (au - cu) * cv) * inv;
+            p.usable = true;
+        }
+    }
+    return faces;
+}
+
 struct Hit
 {
     double along = 0.0;
     Normal3f normal{0.0f, 0.0f, 0.0f};
 };
 
-void collectHits(const BRep& brep,
+void collectHits(const std::vector<CastFace>& faces,
+                 const BVH& bvh,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
                  std::vector<Hit>& hits)
 {
     hits.clear();
 
-    const auto& verts = brep.vertices();
-    const auto& faceOffsets = brep.faceOffsets();
-    const auto& faceVertices = brep.faceVertices();
-
     const auto test = [&](std::size_t f) {
-        const std::uint32_t begin = faceOffsets[f];
-        if (faceOffsets[f + 1] - begin < 3) return;
+        if (f >= faces.size()) return;
+        const CastFace& face = faces[f];
+        if (!face.valid) return;
 
-        const Point3d a = toPoint(verts[faceVertices[begin]]);
-        const Point3d b = toPoint(verts[faceVertices[begin + 1]]);
-        const Point3d c = toPoint(verts[faceVertices[begin + 2]]);
+        const CastFace::AxisProj& p = face.proj[axis];
+        if (!p.usable) return;
+        if (u0 < p.loU || u0 > p.hiU || v0 < p.loV || v0 > p.hiV) return;
 
-        const double au = a[u], av = a[v];
-        const double bu = b[u], bv = b[v];
-        const double cu = c[u], cv = c[v];
-
-        const double loU = std::min({au, bu, cu});
-        const double hiU = std::max({au, bu, cu});
-        const double loV = std::min({av, bv, cv});
-        const double hiV = std::max({av, bv, cv});
-        if (u0 < loU || u0 > hiU || v0 < loV || v0 > hiV) return;
-
-        const double denom = (bv - cv) * (au - cu) + (cu - bu) * (av - cv);
-        const double areaScale = (hiU - loU) * (hiV - loV);
-        if (std::abs(denom) <= 1e-12 * std::max(areaScale, 1e-300)) return;
-
-        const double w0 = ((bv - cv) * (u0 - cu) + (cu - bu) * (v0 - cv)) / denom;
-        const double w1 = ((cv - av) * (u0 - cu) + (au - cu) * (v0 - cv)) / denom;
+        const double w0 = p.w0u * u0 + p.w0v * v0 + p.w0c;
+        const double w1 = p.w1u * u0 + p.w1v * v0 + p.w1c;
         const double w2 = 1.0 - w0 - w1;
         if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) return;
 
         Hit hit;
-        hit.along = w0 * a[axis] + w1 * b[axis] + w2 * c[axis];
-
-        const double e1[3]{b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-        const double e2[3]{c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-        const double n[3]{e1[1] * e2[2] - e1[2] * e2[1],
-                          e1[2] * e2[0] - e1[0] * e2[2],
-                          e1[0] * e2[1] - e1[1] * e2[0]};
-
-        const double length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        if (length > 0.0)
-        {
-            for (int i = 0; i < 3; ++i)
-                hit.normal[i] = static_cast<float>(n[i] / length);
-        }
-
+        hit.along = w0 * face.a[axis] + w1 * face.b[axis] + w2 * face.c[axis];
+        hit.normal = face.normal;
         hits.push_back(hit);
     };
 
-    const BVH& bvh = brep.bvh();
     if (bvh.empty())
     {
-        const std::size_t faces = brep.faceCount();
-        for (std::size_t f = 0; f < faces; ++f) test(f);
+        for (std::size_t f = 0; f < faces.size(); ++f) test(f);
         return;
     }
 
@@ -233,6 +286,8 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
     if (!model._bounds.valid() || brep.faceCount() == 0) return model;
 
     const double tolerance = 1e-9 * std::max(model._bounds.diagonal(), 1.0);
+    const std::vector<CastFace> castFaces = buildCastFaces(brep);
+    const BVH& bvh = brep.bvh();
 
     if (!withinCastBudget(model._bounds, resolution))
     {
@@ -254,29 +309,32 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
 
         RayGrid grid = buildGridFromBounds(model._bounds, resolution, axis);
         const int castCount = static_cast<int>(grid.width * grid.height);
+        const auto castCountSz = static_cast<std::size_t>(castCount);
 
-        // Per-slot interval lists built in parallel, then packed into the pool.
-        std::vector<std::vector<Interval>> slotIntervals(
-            static_cast<std::size_t>(castCount));
+        std::vector<std::vector<Interval>> slotIntervals(castCountSz);
 
         tbb::parallel_for(
             tbb::blocked_range<int>(0, castCount),
             [&](const tbb::blocked_range<int>& range) {
                 std::vector<Hit> hits;
+                hits.reserve(8);
+                std::vector<Interval> local;
+                local.reserve(4);
                 for (int cast = range.begin(); cast != range.end(); ++cast)
                 {
-                    const std::uint32_t iu = static_cast<std::uint32_t>(cast % static_cast<int>(grid.width));
-                    const std::uint32_t iv = static_cast<std::uint32_t>(cast / static_cast<int>(grid.width));
+                    const std::uint32_t iu =
+                        static_cast<std::uint32_t>(cast % static_cast<int>(grid.width));
+                    const std::uint32_t iv =
+                        static_cast<std::uint32_t>(cast / static_cast<int>(grid.width));
                     const double u0 = grid.sampleU(iu);
                     const double v0 = grid.sampleV(iv);
 
-                    collectHits(brep, axis, u, v, u0, v0, hits);
+                    collectHits(castFaces, bvh, axis, u, v, u0, v0, hits);
                     if (hits.size() < 2) continue;
 
                     sortAndMerge(hits, tolerance);
 
-                    std::vector<Interval>& out = slotIntervals[static_cast<std::size_t>(cast)];
-                    out.reserve(hits.size() / 2);
+                    local.clear();
                     for (std::size_t h = 0; h + 1 < hits.size(); h += 2)
                     {
                         Interval ivSpan;
@@ -284,17 +342,30 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
                         ivSpan.end = grid.toTick(hits[h + 1].along);
                         ivSpan.beginNormal = hits[h].normal;
                         ivSpan.endNormal = hits[h + 1].normal;
-                        if (ivSpan.end > ivSpan.begin) out.push_back(ivSpan);
+                        if (ivSpan.end > ivSpan.begin) local.push_back(ivSpan);
+                    }
+                    if (!local.empty())
+                    {
+                        slotIntervals[static_cast<std::size_t>(cast)] = std::move(local);
+                        local.clear();
+                        local.reserve(4);
                     }
                 }
             });
+
+        std::size_t packed = 0;
+        for (std::size_t i = 0; i < castCountSz; ++i)
+            packed += slotIntervals[i].size();
+        grid.pool.data.reserve(packed);
 
         for (int cast = 0; cast < castCount; ++cast)
         {
             const std::vector<Interval>& spans = slotIntervals[static_cast<std::size_t>(cast)];
             if (spans.empty()) continue;
-            const std::uint32_t iu = static_cast<std::uint32_t>(cast % static_cast<int>(grid.width));
-            const std::uint32_t iv = static_cast<std::uint32_t>(cast / static_cast<int>(grid.width));
+            const std::uint32_t iu =
+                static_cast<std::uint32_t>(cast % static_cast<int>(grid.width));
+            const std::uint32_t iv =
+                static_cast<std::uint32_t>(cast / static_cast<int>(grid.width));
             grid.pool.append(grid.at(iu, iv), spans);
         }
 

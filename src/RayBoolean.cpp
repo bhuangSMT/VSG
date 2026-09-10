@@ -352,30 +352,44 @@ bool gridWindowFromModelAabb(const RayGrid& grid,
     return true;
 }
 
+RayModel RayModel::clone() const
+{
+    auto lock = lockChains();
+
+    RayModel result;
+    result._bounds = _bounds;
+    result._resolution = _resolution;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        if (const RayGrid* g = grid(axis))
+            result._grids[axis] = copyGrid(*g);
+    }
+    return result;
+}
+
 RayModel applyBoolean(const RayModel& source,
                       const SweptVolume& sweep,
                       BooleanOp op,
                       const vsg::dmat4& modelToWorld)
 {
-    auto sourceLock = source.lockChains();
+    RayModel result = source.clone();
+    applyBooleanInPlace(result, sweep, op, modelToWorld);
+    return result;
+}
 
-    RayModel result;
-    result._bounds = source.bounds();
-    result._resolution = source.resolution();
-
-    // Deep-copy present grids so we can mutate independently.
-    for (std::size_t axis = 0; axis < 3; ++axis)
-    {
-        if (const RayGrid* g = source.grid(axis))
-            result._grids[axis] = copyGrid(*g);
-    }
+void applyBooleanInPlace(RayModel& model,
+                         const SweptVolume& sweep,
+                         BooleanOp op,
+                         const vsg::dmat4& modelToWorld)
+{
+    auto lock = model.lockChains();
 
     if (op == BooleanOp::None || sweep.empty() || sweep.bvh().empty())
-        return result;
+        return;
 
     const WorldSweep worldSweep{sweep.mesh(), sweep.bvh(), sweep.bvh().bounds(),
                                 modelToWorld, vsg::inverse(modelToWorld)};
-    if (!worldSweep.worldBounds.valid()) return result;
+    if (!worldSweep.worldBounds.valid()) return;
 
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
@@ -384,7 +398,7 @@ RayModel applyBoolean(const RayModel& source,
     int workerCount = 0;
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        RayGrid* g = result.grid(axis);
+        RayGrid* g = model.grid(axis);
         if (!g) continue;
 
         if (workerCount < 2)
@@ -400,8 +414,6 @@ RayModel applyBoolean(const RayModel& source,
         }
     }
     for (int i = 0; i < workerCount; ++i) workers[i].join();
-
-    return result;
 }
 
 RayModel RayModel::withBoolean(const SweptVolume& sweep,
@@ -409,6 +421,13 @@ RayModel RayModel::withBoolean(const SweptVolume& sweep,
                                const vsg::dmat4& modelToWorld) const
 {
     return applyBoolean(*this, sweep, op, modelToWorld);
+}
+
+void RayModel::booleanInPlace(const SweptVolume& sweep,
+                              BooleanOp op,
+                              const vsg::dmat4& modelToWorld)
+{
+    applyBooleanInPlace(*this, sweep, op, modelToWorld);
 }
 
 } // namespace app
