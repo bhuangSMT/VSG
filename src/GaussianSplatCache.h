@@ -54,12 +54,13 @@ public:
 
     // Packed refill from the displayed RayModel. Reuses the compiled GPU
     // arrays when they already hold enough slots. Issues only the packed live
-    // endpoints. Throws if the model has no intervals.
+    // endpoints. skipCutSplats drops cutBegin/cutEnd discs (Inspection window,
+    // or Probe / Subtraction / Union leftovers covered by the cut-face overlay).
     vsg::ref_ptr<vsg::Node> rebuild(const RayModel& rayModel,
                                     int stride,
                                     const std::array<float, 3>& radii,
                                     const SplatStyle& style,
-                                    const BoundingBox& sectionAabb = {});
+                                    bool skipCutSplats = false);
 
     // Regenerate only cells overlapping modelAabb. Anything but PatchResult::Ok
     // leaves the region partly updated, so the caller has to rebuild.
@@ -68,13 +69,29 @@ public:
                              int stride,
                              const std::array<float, 3>& radii,
                              const SplatStyle& style,
-                             const BoundingBox& sectionAabb = {});
+                             bool skipCutSplats = false);
 
-    // Inspection: fill boolean cut-face ends in sectionAabb as a UV triangle
-    // mesh and parent it under the splat Group. Empty/invalid box hides it.
+    // Inspection preview: replace the GPU overlay with UV quads in sectionAabb.
+    // Does not touch the accumulated Subtraction triangle list.
     void updateSectionGrid(const RayModel& rayModel, int stride, const BoundingBox& sectionAabb,
                            const vsg::vec4& color);
+    // Hide the GPU overlay; keep any stored Subtraction triangles.
     void clearSectionGrid();
+
+    // Subtraction: drop tris in the dirty UV window, remesh a larger overlapping
+    // halo of cut-tagged ends on those rays, and upload.
+    void patchSubtractSection(const RayModel& rayModel, int stride,
+                              const BoundingBox& dirtyModelAabb, const vsg::vec4& color);
+    // Subtraction splat-rebuild fallback: remesh every cut-tagged end at stride.
+    void rebuildSubtractSection(const RayModel& rayModel, int stride, const vsg::vec4& color);
+    // Re-upload stored Subtraction tris when stride/resolution still match;
+    // otherwise remesh every cut-tagged end at the new display stride.
+    void restoreSubtractSection(const RayModel& rayModel, int stride, const vsg::vec4& color);
+    // Re-upload stored Subtraction tris (leave Inspection without a remesh).
+    void showSubtractSection();
+    // Drop stored Subtraction tris and hide the overlay (Union / new model).
+    void clearSubtractSection();
+    bool hasSubtractSection() const { return !_subtractTris.empty(); }
 
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
     void markDirty();
@@ -137,6 +154,21 @@ private:
                            float radius,
                            const SplatStyle& style);
 
+    struct OverlayVert
+    {
+        vsg::vec3 pos{0.0f, 0.0f, 0.0f};
+        vsg::vec3 normal{0.0f, 0.0f, 1.0f};
+    };
+    struct OverlayTri
+    {
+        OverlayVert v[3]{};
+        std::uint8_t axis = 0;
+    };
+
+    void uploadSectionTris(const std::vector<OverlayTri>& tris, const vsg::vec4& color);
+    void appendSubtractTris(const RayModel& rayModel, int stride, const BoundingBox& box,
+                            std::vector<OverlayTri>& out, bool clipToAabb, int haloCells) const;
+
     GaussianSplatSet _set;
     std::array<AxisLayout, 3> _axes{};
     std::array<std::vector<CellRef>, 3> _cellRefs{};
@@ -147,7 +179,11 @@ private:
     std::size_t _live = 0;
     std::uint32_t _allocEnd = 0; // one past the last allocated slot
     bool _gpuNeedsCompile = false;
-    BoundingBox _sectionAabb;
+    bool _skipCutSplats = false;
+    int _subtractStride = 0;
+    Point3d _subtractResolution{0.0, 0.0, 0.0};
+    vsg::vec4 _subtractColor{0.95f, 0.35f, 0.10f, 1.0f};
+    std::vector<OverlayTri> _subtractTris;
     SectionLineSet _section;
 };
 

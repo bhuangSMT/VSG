@@ -27,6 +27,17 @@ namespace
 
 using ProfileClock = std::chrono::steady_clock;
 
+bool skipCutSplatEnds(BooleanOp op, bool inspectionBoxValid)
+{
+    if (op == BooleanOp::Inspection) return inspectionBoxValid;
+    return true;
+}
+
+bool accumulatesCutMesh(BooleanOp op)
+{
+    return op == BooleanOp::Subtraction || op == BooleanOp::Union;
+}
+
 double millisSince(ProfileClock::time_point start)
 {
     const std::chrono::duration<double, std::milli> elapsed = ProfileClock::now() - start;
@@ -419,13 +430,15 @@ void RenderManager::rebuildSplatCache()
 {
     if (!_rayModel || _rayModel->rayCount() == 0) return;
 
+    const BooleanOp op = Parameter::instance().booleanOp();
     const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
-    const BoundingBox section =
-        Parameter::instance().booleanOp() == BooleanOp::Inspection ? _inspectionPrevAabb
-                                                                  : BoundingBox{};
+    const bool skipCutSplats = skipCutSplatEnds(op, _inspectionPrevAabb.valid());
     _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
-                        section);
-    syncInspectionSectionGrid(section);
+                        skipCutSplats);
+    if (op == BooleanOp::Inspection)
+        syncInspectionSectionGrid(_inspectionPrevAabb);
+    else
+        _splatCache.restoreSubtractSection(*_rayModel, stride, splatStyle().toolColor);
     presentSplatCache();
 }
 
@@ -1170,11 +1183,20 @@ void RenderManager::setBooleanOp(BooleanOp op)
     {
         // Keep whatever RayModel is on screen; only stop applying new cuts.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
-        if (_viewer) _viewer->request();
+        if (_viewMode == ViewMode::RayGS && _rayModel && _rayModel->rayCount() > 0)
+            rebuildSplatCache();
+        else if (_viewer)
+            _viewer->request();
         return;
     }
 
     applyBooleanToRayModel();
+    // No new segment: still drop/restore the overlay and cut-end splat skip
+    // for the op we just entered.
+    if ((op == BooleanOp::Subtraction || op == BooleanOp::Union) &&
+        (!_cutSweep || _cutSweep->empty()) && _viewMode == ViewMode::RayGS && _rayModel &&
+        _rayModel->rayCount() > 0)
+        rebuildSplatCache();
 }
 
 void RenderManager::applyBooleanToRayModel()
@@ -1297,27 +1319,32 @@ void RenderManager::applyBooleanToRayModel()
         const auto patchStart = ProfileClock::now();
         const auto radii = splatRadii(*_rayModel, stride);
         const SplatStyle style = splatStyle();
-        const BoundingBox sectionAabb =
-            op == BooleanOp::Inspection ? dirtyModelAabb : BoundingBox{};
+        const bool skipCutSplats = skipCutSplatEnds(op, dirtyModelAabb.valid());
         PatchResult patched = PatchResult::Ok;
         if (restoreAabb.valid())
         {
             patched = _splatCache.updateRegion(*_rayModel, restoreAabb, stride, radii, style,
-                                               sectionAabb);
+                                               skipCutSplats);
             if (patched == PatchResult::Ok && dirtyModelAabb.valid())
                 patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii,
-                                                   style, sectionAabb);
+                                                   style, skipCutSplats);
         }
         else
         {
             patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii, style,
-                                               sectionAabb);
+                                               skipCutSplats);
         }
         if (patched == PatchResult::Ok)
         {
             const double splatMs = millisSince(patchStart);
             const auto sectionStart = ProfileClock::now();
-            syncInspectionSectionGrid(dirtyModelAabb);
+            if (op == BooleanOp::Inspection)
+                syncInspectionSectionGrid(dirtyModelAabb);
+            else if (accumulatesCutMesh(op))
+                _splatCache.patchSubtractSection(*_rayModel, stride, dirtyModelAabb,
+                                                 splatStyle().toolColor);
+            else
+                _splatCache.restoreSubtractSection(*_rayModel, stride, splatStyle().toolColor);
             const double sectionMs = millisSince(sectionStart);
             logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
             if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
@@ -1336,7 +1363,6 @@ void RenderManager::applyBooleanToRayModel()
         if (!_rayModel || _rayModel->rayCount() == 0)
         {
             _splatCache.clear();
-            syncInspectionSectionGrid({});
             if (_current) attach(createNode(*_current), true);
             else if (_viewer) _viewer->request();
             logCutProfile(booleanMs, "no-draw", 0.0, dirtyModelAabb, cloneMs);
@@ -1347,13 +1373,17 @@ void RenderManager::applyBooleanToRayModel()
         if (_viewMode == ViewMode::RayGS)
         {
             const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
-            const BoundingBox sectionAabb =
-                op == BooleanOp::Inspection ? dirtyModelAabb : BoundingBox{};
+            const bool skipCutSplats = skipCutSplatEnds(op, dirtyModelAabb.valid());
             _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
-                                sectionAabb);
+                                skipCutSplats);
             const double splatMs = millisSince(rebuildStart);
             const auto sectionStart = ProfileClock::now();
-            syncInspectionSectionGrid(sectionAabb);
+            if (op == BooleanOp::Inspection)
+                syncInspectionSectionGrid(dirtyModelAabb);
+            else if (accumulatesCutMesh(op))
+                _splatCache.rebuildSubtractSection(*_rayModel, stride, splatStyle().toolColor);
+            else
+                _splatCache.restoreSubtractSection(*_rayModel, stride, splatStyle().toolColor);
             const double sectionMs = millisSince(sectionStart);
             presentSplatCache();
             logCutProfile(booleanMs, "rebuild", splatMs, dirtyModelAabb, cloneMs, sectionMs);

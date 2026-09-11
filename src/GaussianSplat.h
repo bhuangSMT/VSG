@@ -96,9 +96,10 @@ private:
     vsg::ref_ptr<vsg::Node> _overlay;
 };
 
-// Mutable TRIANGLE_LIST overlay. Inspection fills the cut face from UV quads;
-// the node is a child of GaussianSplatSet. Arrays are DYNAMIC_DATA so
-// mouse-move only dirty()s after the first compile.
+// Mutable TRIANGLE_LIST overlay. Inspection replaces the draw in the current
+// cutter window; Subtraction uploads a persistent CPU triangle list. The node
+// is a child of GaussianSplatSet. Arrays are DYNAMIC_DATA so mouse-move only
+// dirty()s after the first compile.
 class SectionLineSet
 {
 public:

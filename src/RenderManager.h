@@ -206,6 +206,7 @@ private:
     void rebuildSplatCache();
     void presentSplatCache();
     bool splatOnScreen() const;
+    // Inspection: replace-in-window overlay. Does not touch stored subtract tris.
     void syncInspectionSectionGrid(const BoundingBox& sectionAabb);
 
     // One --profile line for a completed cut. drawPath names how the display

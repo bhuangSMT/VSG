@@ -61,7 +61,7 @@ struct SectionVert
 };
 
 void collectSectionPoints(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
-                          std::uint32_t iv, const BoundingBox& box,
+                          std::uint32_t iv, const BoundingBox& box, bool clipToAabb,
                           std::vector<SectionPoint>& out)
 {
     out.clear();
@@ -83,9 +83,11 @@ void collectSectionPoints(const RayGrid& grid, std::size_t axis, std::uint32_t i
         end[u] = u0;
         start[v] = v0;
         end[v] = v0;
-        // Only the ends the boolean just cut (tool surface). Every remaining
-        // stock end in the cutter AABB would fill that AABB as a square.
-        if (span.cutBegin() && box.contains(start))
+        // Inspection clips to the cutter AABB so leftover stock ends in that
+        // box do not fill it as a square. Subtraction walks a UV window and
+        // takes every tagged leftover on those rays (steep faces jump outside
+        // the 3D box between adjacent samples).
+        if (span.cutBegin() && (!clipToAabb || !box.valid() || box.contains(start)))
         {
             out.push_back({start[axis],
                            vsg::vec3(static_cast<float>(start[0]),
@@ -93,7 +95,7 @@ void collectSectionPoints(const RayGrid& grid, std::size_t axis, std::uint32_t i
                                      static_cast<float>(start[2])),
                            normalOrAxis(span.beginNormal, axis, true)});
         }
-        if (span.cutEnd() && box.contains(end))
+        if (span.cutEnd() && (!clipToAabb || !box.valid() || box.contains(end)))
         {
             out.push_back({end[axis],
                            vsg::vec3(static_cast<float>(end[0]),
@@ -168,6 +170,147 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
     }
 }
 
+struct SampledWindow
+{
+    bool valid = false;
+    std::uint32_t su0 = 0;
+    std::uint32_t su1 = 0;
+    std::uint32_t sv0 = 0;
+    std::uint32_t sv1 = 0;
+};
+
+struct CollectedTri
+{
+    std::array<SectionVert, 3> verts;
+    std::uint8_t axis = 0;
+};
+
+double vecComponent(const vsg::vec3& p, std::size_t axis)
+{
+    if (axis == 0) return static_cast<double>(p.x);
+    if (axis == 1) return static_cast<double>(p.y);
+    return static_cast<double>(p.z);
+}
+
+constexpr int kSubtractHaloCells = 4;
+constexpr float kInspectionMaxEdgeScale = 2.5f;
+constexpr float kSubtractMaxEdgeScale = 8.0f;
+
+void growGridWindowByStride(const RayGrid& grid, int stride, int haloCells,
+                            std::uint32_t& iu0, std::uint32_t& iu1,
+                            std::uint32_t& iv0, std::uint32_t& iv1)
+{
+    if (haloCells < 1 || stride < 1 || grid.width == 0 || grid.height == 0) return;
+    const auto pad = static_cast<std::uint32_t>(stride) * static_cast<std::uint32_t>(haloCells);
+    if (iu0 >= pad) iu0 -= pad;
+    else iu0 = 0;
+    if (iv0 >= pad) iv0 -= pad;
+    else iv0 = 0;
+    const auto lastU = grid.width - 1;
+    const auto lastV = grid.height - 1;
+    if (lastU - iu1 >= pad) iu1 += pad;
+    else iu1 = lastU;
+    if (lastV - iv1 >= pad) iv1 += pad;
+    else iv1 = lastV;
+}
+
+SampledWindow makeSampledWindow(const RayGrid& grid, const BoundingBox& box, int stride,
+                                int haloCells)
+{
+    SampledWindow w;
+    if (stride < 1) return w;
+
+    std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
+    if (box.valid())
+    {
+        if (!gridWindowFromModelAabb(grid, box, iu0, iu1, iv0, iv1)) return w;
+        growGridWindowByStride(grid, stride, haloCells, iu0, iu1, iv0, iv1);
+    }
+    else
+    {
+        if (grid.width == 0 || grid.height == 0) return w;
+        iu1 = grid.width - 1;
+        iv1 = grid.height - 1;
+    }
+
+    w.valid = true;
+    w.su0 = sampledIndex(iu0, stride);
+    w.sv0 = sampledIndex(iv0, stride);
+    w.su1 = sampledIndex(iu1, stride);
+    w.sv1 = sampledIndex(iv1, stride);
+    return w;
+}
+
+bool sampledWindowContains(const SampledWindow& w, const vsg::vec3& pos, std::size_t axis,
+                           const RayGrid& grid, int stride)
+{
+    if (!w.valid) return false;
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    const auto su = sampledIndex(grid.indexU(vecComponent(pos, u)), stride);
+    const auto sv = sampledIndex(grid.indexV(vecComponent(pos, v)), stride);
+    return su >= w.su0 && su <= w.su1 && sv >= w.sv0 && sv <= w.sv1;
+}
+
+void collectSectionTris(const RayModel& rayModel, int stride, const BoundingBox& box,
+                        bool clipToAabb, int haloCells, std::vector<CollectedTri>& tris)
+{
+    if (stride < 1) return;
+
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* grid = rayModel.grid(axis);
+        if (!grid || grid->empty()) continue;
+
+        const SampledWindow w = makeSampledWindow(*grid, box, stride, haloCells);
+        if (!w.valid) continue;
+
+        const auto sampledW = w.su1 - w.su0 + 1;
+        const auto cellCount =
+            static_cast<std::size_t>(sampledW) * static_cast<std::size_t>(w.sv1 - w.sv0 + 1);
+        std::vector<std::vector<SectionPoint>> cells(cellCount);
+
+        for (std::uint32_t sv = w.sv0; sv <= w.sv1; ++sv)
+        {
+            const auto iv = sv * static_cast<std::uint32_t>(stride);
+            if (iv >= grid->height) continue;
+            for (std::uint32_t su = w.su0; su <= w.su1; ++su)
+            {
+                const auto iu = su * static_cast<std::uint32_t>(stride);
+                if (iu >= grid->width) continue;
+                const auto flat = static_cast<std::size_t>(sv - w.sv0) * sampledW +
+                                  static_cast<std::size_t>(su - w.su0);
+                collectSectionPoints(*grid, axis, iu, iv, box, clipToAabb, cells[flat]);
+            }
+        }
+
+        const double du = grid->spacingU * static_cast<double>(stride);
+        const double dv = grid->spacingV * static_cast<double>(stride);
+        const float edgeScale = clipToAabb ? kInspectionMaxEdgeScale : kSubtractMaxEdgeScale;
+        const float maxEdge = edgeScale * static_cast<float>(std::sqrt(du * du + dv * dv));
+
+        std::vector<std::array<SectionVert, 3>> quads;
+        for (std::uint32_t sv = w.sv0; sv < w.sv1; ++sv)
+        {
+            for (std::uint32_t su = w.su0; su < w.su1; ++su)
+            {
+                const auto flat = static_cast<std::size_t>(sv - w.sv0) * sampledW +
+                                  static_cast<std::size_t>(su - w.su0);
+                const auto east = flat + 1;
+                const auto north = flat + sampledW;
+                const auto northEast = north + 1;
+                emitSectionQuad(cells[flat], cells[east], cells[north], cells[northEast],
+                                maxEdge, quads);
+            }
+        }
+
+        const auto axisByte = static_cast<std::uint8_t>(axis);
+        tris.reserve(tris.size() + quads.size());
+        for (const auto& q : quads)
+            tris.push_back({q, axisByte});
+    }
+}
+
 } // namespace
 
 const char* toString(PatchResult result)
@@ -202,10 +345,10 @@ void GaussianSplatCache::clear()
     _live = 0;
     _allocEnd = 0;
     _gpuNeedsCompile = false;
-    _sectionAabb = {};
+    _skipCutSplats = false;
     _capacity = _set.capacity();
     _set.setDrawCount(0);
-    clearSectionGrid();
+    clearSubtractSection();
 }
 
 void GaussianSplatCache::release()
@@ -221,7 +364,10 @@ void GaussianSplatCache::release()
     _live = 0;
     _allocEnd = 0;
     _gpuNeedsCompile = true;
-    _sectionAabb = {};
+    _skipCutSplats = false;
+    _subtractTris.clear();
+    _subtractStride = 0;
+    _subtractResolution = Point3d{0.0, 0.0, 0.0};
     _section.release();
 }
 
@@ -390,8 +536,8 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
 
             const double modelLength = end[axis] - start[axis];
             const float spanRadius = splatRadiusForSpan(radius, modelLength, cellDiag, stride);
-            const bool skipStart = _sectionAabb.valid() && span.cutBegin();
-            const bool skipEnd = _sectionAabb.valid() && span.cutEnd();
+            const bool skipStart = _skipCutSplats && span.cutBegin();
+            const bool skipEnd = _skipCutSplats && span.cutEnd();
 
             if (!skipStart)
             {
@@ -424,7 +570,7 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
     // Rebuild packs into a reused GPU buffer and still issues the whole
     // block. Skipped cut-face ends (and any unused tail) must be radius 0
     // or leftover dots show through the section mesh.
-    if (clearTrailing || _sectionAabb.valid())
+    if (clearTrailing || _skipCutSplats)
     {
         for (std::uint32_t i = written; i < ref.block; ++i)
             _set.clearSlot(static_cast<std::size_t>(ref.first + i));
@@ -507,9 +653,9 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
                                                     int stride,
                                                     const std::array<float, 3>& radii,
                                                     const SplatStyle& style,
-                                                    const BoundingBox& sectionAabb)
+                                                    bool skipCutSplats)
 {
-    _sectionAabb = sectionAabb;
+    _skipCutSplats = skipCutSplats;
     auto lock = rayModel.lockChains();
 
     if (rayModel.rayCount() == 0)
@@ -641,11 +787,11 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
                                              int stride,
                                              const std::array<float, 3>& radii,
                                              const SplatStyle& style,
-                                             const BoundingBox& sectionAabb)
+                                             bool skipCutSplats)
 {
     if (!layoutMatches(rayModel, stride)) return PatchResult::LayoutChanged;
     if (!modelAabb.valid()) return PatchResult::LayoutChanged;
-    _sectionAabb = sectionAabb;
+    _skipCutSplats = skipCutSplats;
 
     auto lock = rayModel.lockChains();
 
@@ -697,6 +843,51 @@ void GaussianSplatCache::clearSectionGrid()
     _section.markDirty();
 }
 
+void GaussianSplatCache::clearSubtractSection()
+{
+    _subtractTris.clear();
+    _subtractStride = 0;
+    _subtractResolution = Point3d{0.0, 0.0, 0.0};
+    clearSectionGrid();
+}
+
+void GaussianSplatCache::uploadSectionTris(const std::vector<OverlayTri>& tris,
+                                           const vsg::vec4& color)
+{
+    if (tris.empty())
+    {
+        clearSectionGrid();
+        return;
+    }
+
+    _section.ensureCapacity(tris.size());
+    for (std::size_t i = 0; i < tris.size(); ++i)
+        _section.setTriangle(i, tris[i].v[0].pos, tris[i].v[1].pos, tris[i].v[2].pos,
+                             tris[i].v[0].normal, tris[i].v[1].normal, tris[i].v[2].normal, color);
+    _section.setDrawCount(tris.size());
+    _section.markDirty();
+    _set.setOverlay(_section.node());
+}
+
+void GaussianSplatCache::appendSubtractTris(const RayModel& rayModel, int stride,
+                                            const BoundingBox& box,
+                                            std::vector<OverlayTri>& out, bool clipToAabb,
+                                            int haloCells) const
+{
+    std::vector<CollectedTri> collected;
+    collectSectionTris(rayModel, stride, box, clipToAabb, haloCells, collected);
+    out.reserve(out.size() + collected.size());
+    for (const auto& t : collected)
+    {
+        OverlayTri tri;
+        tri.v[0] = {t.verts[0].pos, t.verts[0].normal};
+        tri.v[1] = {t.verts[1].pos, t.verts[1].normal};
+        tri.v[2] = {t.verts[2].pos, t.verts[2].normal};
+        tri.axis = t.axis;
+        out.push_back(tri);
+    }
+}
+
 void GaussianSplatCache::updateSectionGrid(const RayModel& rayModel, int stride,
                                            const BoundingBox& sectionAabb,
                                            const vsg::vec4& color)
@@ -708,72 +899,85 @@ void GaussianSplatCache::updateSectionGrid(const RayModel& rayModel, int stride,
     }
 
     auto lock = rayModel.lockChains();
+    std::vector<OverlayTri> tris;
+    appendSubtractTris(rayModel, stride, sectionAabb, tris, true, 0);
+    uploadSectionTris(tris, color);
+}
 
-    std::vector<std::array<SectionVert, 3>> tris;
+void GaussianSplatCache::patchSubtractSection(const RayModel& rayModel, int stride,
+                                              const BoundingBox& dirtyModelAabb,
+                                              const vsg::vec4& color)
+{
+    if (!dirtyModelAabb.valid() || stride < 1) return;
 
+    _subtractColor = color;
+    _subtractStride = stride;
+    _subtractResolution = rayModel.resolution();
+
+    auto lock = rayModel.lockChains();
+    std::array<SampledWindow, 3> windows{};
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
         const RayGrid* grid = rayModel.grid(axis);
         if (!grid || grid->empty()) continue;
-
-        std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
-        if (!gridWindowFromModelAabb(*grid, sectionAabb, iu0, iu1, iv0, iv1)) continue;
-
-        const std::uint32_t su0 = sampledIndex(iu0, stride);
-        const std::uint32_t sv0 = sampledIndex(iv0, stride);
-        const std::uint32_t su1 = sampledIndex(iu1, stride);
-        const std::uint32_t sv1 = sampledIndex(iv1, stride);
-        const auto sampledW = su1 - su0 + 1;
-        const auto sampledH = sv1 - sv0 + 1;
-        const auto cellCount = static_cast<std::size_t>(sampledW) * static_cast<std::size_t>(sampledH);
-        std::vector<std::vector<SectionPoint>> cells(cellCount);
-
-        for (std::uint32_t sv = sv0; sv <= sv1; ++sv)
-        {
-            const auto iv = sv * static_cast<std::uint32_t>(stride);
-            if (iv < iv0 || iv > iv1 || iv >= grid->height) continue;
-            for (std::uint32_t su = su0; su <= su1; ++su)
-            {
-                const auto iu = su * static_cast<std::uint32_t>(stride);
-                if (iu < iu0 || iu > iu1 || iu >= grid->width) continue;
-                const auto flat = static_cast<std::size_t>(sv - sv0) * sampledW +
-                                  static_cast<std::size_t>(su - su0);
-                collectSectionPoints(*grid, axis, iu, iv, sectionAabb, cells[flat]);
-            }
-        }
-
-        const double du = grid->spacingU * static_cast<double>(stride);
-        const double dv = grid->spacingV * static_cast<double>(stride);
-        const float maxEdge = static_cast<float>(2.5 * std::sqrt(du * du + dv * dv));
-
-        for (std::uint32_t sv = sv0; sv < sv1; ++sv)
-        {
-            for (std::uint32_t su = su0; su < su1; ++su)
-            {
-                const auto flat = static_cast<std::size_t>(sv - sv0) * sampledW +
-                                  static_cast<std::size_t>(su - su0);
-                const auto east = flat + 1;
-                const auto north = flat + sampledW;
-                const auto northEast = north + 1;
-                emitSectionQuad(cells[flat], cells[east], cells[north], cells[northEast],
-                                maxEdge, tris);
-            }
-        }
+        windows[axis] = makeSampledWindow(*grid, dirtyModelAabb, stride, 0);
     }
 
-    if (tris.empty())
+    _subtractTris.erase(std::remove_if(_subtractTris.begin(), _subtractTris.end(),
+                                       [&](const OverlayTri& tri)
+                                       {
+                                           if (tri.axis > 2) return false;
+                                           const RayGrid* grid = rayModel.grid(tri.axis);
+                                           if (!grid) return false;
+                                           const SampledWindow& w = windows[tri.axis];
+                                           for (const OverlayVert& vert : tri.v)
+                                           {
+                                               if (sampledWindowContains(w, vert.pos, tri.axis,
+                                                                         *grid, stride))
+                                                   return true;
+                                           }
+                                           return false;
+                                       }),
+                        _subtractTris.end());
+
+    appendSubtractTris(rayModel, stride, dirtyModelAabb, _subtractTris, false,
+                       kSubtractHaloCells);
+    uploadSectionTris(_subtractTris, _subtractColor);
+}
+
+void GaussianSplatCache::rebuildSubtractSection(const RayModel& rayModel, int stride,
+                                                const vsg::vec4& color)
+{
+    _subtractColor = color;
+    _subtractStride = stride;
+    _subtractResolution = rayModel.resolution();
+    _subtractTris.clear();
+    if (stride < 1)
     {
         clearSectionGrid();
         return;
     }
 
-    _section.ensureCapacity(tris.size());
-    for (std::size_t i = 0; i < tris.size(); ++i)
-        _section.setTriangle(i, tris[i][0].pos, tris[i][1].pos, tris[i][2].pos,
-                             tris[i][0].normal, tris[i][1].normal, tris[i][2].normal, color);
-    _section.setDrawCount(tris.size());
-    _section.markDirty();
-    _set.setOverlay(_section.node());
+    auto lock = rayModel.lockChains();
+    appendSubtractTris(rayModel, stride, BoundingBox{}, _subtractTris, false, 0);
+    uploadSectionTris(_subtractTris, _subtractColor);
+}
+
+void GaussianSplatCache::showSubtractSection()
+{
+    uploadSectionTris(_subtractTris, _subtractColor);
+}
+
+void GaussianSplatCache::restoreSubtractSection(const RayModel& rayModel, int stride,
+                                                const vsg::vec4& color)
+{
+    if (stride == _subtractStride && rayModel.resolution() == _subtractResolution)
+    {
+        _subtractColor = color;
+        showSubtractSection();
+        return;
+    }
+    rebuildSubtractSection(rayModel, stride, color);
 }
 
 } // namespace app
