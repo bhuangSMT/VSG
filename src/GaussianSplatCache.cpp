@@ -266,12 +266,15 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
             end[v] = v0;
 
             const double modelLength = end[axis] - start[axis];
+            // 0.5 left gaps (orange cut-face dots sat apart). 0.85 still
+            // tightens the hole wall without breaking the sheet.
+            constexpr float sectionScale = 0.85f;
             const float startRadius = splatRadiusForSpan(
-                _sectionAabb.contains(start) ? radius * 0.5f : radius, modelLength, cellDiag,
-                stride);
+                _sectionAabb.contains(start) ? radius * sectionScale : radius, modelLength,
+                cellDiag, stride);
             const float endRadius = splatRadiusForSpan(
-                _sectionAabb.contains(end) ? radius * 0.5f : radius, modelLength, cellDiag,
-                stride);
+                _sectionAabb.contains(end) ? radius * sectionScale : radius, modelLength,
+                cellDiag, stride);
 
             const vsg::vec4& color = span.fromBoolean() ? tool : stock;
             const auto base = static_cast<std::size_t>(ref.first + written);

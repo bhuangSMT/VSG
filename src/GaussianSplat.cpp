@@ -59,8 +59,10 @@ void main()
 
     // On-screen size as a fraction of half the viewport height. Cap it so
     // zooming in shrinks world-space radius instead of ballooning into beads.
+    // 0.12 filled a tenth of the view per splat and read as balls up close;
+    // 0.03 keeps the far sheet and only bites when the camera is near.
     float apparent = radius * abs(pc.projection[1][1]) / max(-centerEye.z, 1e-6);
-    const float maxApparent = 0.12;
+    const float maxApparent = 0.03;
     if (apparent > maxApparent)
         radius *= maxApparent / apparent;
 
