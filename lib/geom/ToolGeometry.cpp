@@ -294,7 +294,7 @@ TriangleMesh createToolMesh(ToolType type, float radius, float height,
     case ToolType::BallNose:
         return ballNoseTool(radius, height, slices, stacks);
     case ToolType::BullNose:
-        return bullNoseTool(radius, height, radius * 0.35f, slices, filletStacks);
+        return bullNoseTool(radius, height, bullNoseFilletRadius(radius), slices, filletStacks);
     case ToolType::None:
         break;
     }

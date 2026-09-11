@@ -41,10 +41,41 @@ std::uint32_t sampledIndex(std::uint32_t i, int stride)
     return i / static_cast<std::uint32_t>(stride);
 }
 
-std::uint32_t endpointNeed(const RaySlot& slot)
+void skipSplatEnds(const Interval& span, double modelLength, float cellRadius,
+                   bool skipCutSplats, bool& skipStart, bool& skipEnd)
 {
-    const auto endpoints = slot.intervalCount * 2u;
-    return endpoints;
+    const bool cutStart = span.cutBegin();
+    const bool cutEnd = span.cutEnd();
+    skipStart = skipCutSplats && cutStart;
+    skipEnd = skipCutSplats && cutEnd;
+    // Partner stock disc of a leftover shorter than two cell radii sits on
+    // the overlay. Hide both ends so the previous GPU slots can be freed.
+    if (skipCutSplats && (cutStart || cutEnd) &&
+        modelLength <= 2.0 * static_cast<double>(cellRadius))
+    {
+        skipStart = true;
+        skipEnd = true;
+    }
+}
+
+std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv,
+                           float radius, bool skipCutSplats)
+{
+    const RaySlot& slot = grid.at(iu, iv);
+    if (slot.empty()) return 0;
+
+    std::uint32_t n = 0;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        if (!span.hasSolidLength()) continue;
+        const double modelLength = grid.fromTick(span.end) - grid.fromTick(span.begin);
+        bool skipStart = false;
+        bool skipEnd = false;
+        skipSplatEnds(span, modelLength, radius, skipCutSplats, skipStart, skipEnd);
+        if (!skipStart) ++n;
+        if (!skipEnd) ++n;
+    }
+    return n;
 }
 
 struct SectionPoint
@@ -75,6 +106,7 @@ void collectSectionPoints(const RayGrid& grid, std::size_t axis, std::uint32_t i
     auto spans = grid.pool.span(slot);
     for (const Interval& span : spans)
     {
+        if (!span.hasSolidLength()) continue;
         Point3d start{0.0, 0.0, 0.0};
         Point3d end{0.0, 0.0, 0.0};
         start[axis] = grid.fromTick(span.begin);
@@ -525,6 +557,7 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
         auto spans = grid->pool.span(slot);
         for (const Interval& span : spans)
         {
+            if (!span.hasSolidLength()) continue;
             Point3d start{0.0, 0.0, 0.0};
             Point3d end{0.0, 0.0, 0.0};
             start[axis] = grid->fromTick(span.begin);
@@ -536,8 +569,9 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
 
             const double modelLength = end[axis] - start[axis];
             const float spanRadius = splatRadiusForSpan(radius, modelLength, cellDiag, stride);
-            const bool skipStart = _skipCutSplats && span.cutBegin();
-            const bool skipEnd = _skipCutSplats && span.cutEnd();
+            bool skipStart = false;
+            bool skipEnd = false;
+            skipSplatEnds(span, modelLength, radius, _skipCutSplats, skipStart, skipEnd);
 
             if (!skipStart)
             {
@@ -596,7 +630,7 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
     if (su >= layout.sampledW || sv >= layout.sampledH) return PatchResult::Ok;
 
     CellRef& ref = cellRef(axis, su, sv);
-    const std::uint32_t needed = endpointNeed(grid->at(iu, iv));
+    const std::uint32_t needed = endpointNeed(*grid, iu, iv, radius, _skipCutSplats);
 
     if (needed > static_cast<std::uint32_t>(maxEndpointsPerCell))
         return PatchResult::CellTooDense;
@@ -703,7 +737,7 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
             const auto sv = flat / layout.sampledW;
             const auto iu = static_cast<std::uint32_t>(su) * static_cast<std::uint32_t>(stride);
             const auto iv = static_cast<std::uint32_t>(sv) * static_cast<std::uint32_t>(stride);
-            auto n = endpointNeed(grid->at(iu, iv));
+            auto n = endpointNeed(*grid, iu, iv, radii[axis], skipCutSplats);
             if (n > static_cast<std::uint32_t>(maxEndpointsPerCell))
                 n = static_cast<std::uint32_t>(maxEndpointsPerCell);
             needs[axis][flat] = n;
@@ -741,6 +775,11 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     if (live > 0)
         _allocEnd = static_cast<std::uint32_t>(live);
 
+    // Reused arrays still hold the previous packed/patched discs. Zero them
+    // before refill so skipped leftovers cannot linger in old GPU slots.
+    for (std::size_t i = 0; i < _capacity; ++i)
+        _set.clearSlot(i);
+
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
         if (!_axes[axis].present) continue;
@@ -764,7 +803,7 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
             ref.first = axisBase + prefix[axis][flat];
             ref.block = static_cast<std::uint16_t>(n);
             ref.count = 0;
-            fillCell(rayModel, axis, iu, iv, radius, style, ref, false);
+            fillCell(rayModel, axis, iu, iv, radius, style, ref, true);
         });
     }
 
@@ -803,6 +842,7 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
 
         std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
         if (!gridWindowFromModelAabb(*grid, modelAabb, iu0, iu1, iv0, iv1)) continue;
+        growGridWindowByStride(*grid, _stride, kSubtractHaloCells, iu0, iu1, iv0, iv1);
 
         const float radius = radii[axis];
         for (std::uint32_t iv = iv0; iv <= iv1; ++iv)

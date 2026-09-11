@@ -116,7 +116,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
         {
             if (cut.end <= piece.begin || cut.begin >= piece.end)
             {
-                next.push_back(piece);
+                if (piece.hasSolidLength()) next.push_back(piece);
                 continue;
             }
 
@@ -126,7 +126,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
                 left.end = cut.begin;
                 left.endNormal = cut.beginNormal;
                 left.setCutEnd(true);
-                if (left.end > left.begin) next.push_back(left);
+                if (left.hasSolidLength()) next.push_back(left);
             }
             if (cut.end < piece.end)
             {
@@ -135,7 +135,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
                 right.beginNormal = cut.endNormal;
                 right.setFromBoolean(true);
                 right.setCutBegin(true);
-                if (right.end > right.begin) next.push_back(right);
+                if (right.hasSolidLength()) next.push_back(right);
             }
         }
         remaining = std::move(next);

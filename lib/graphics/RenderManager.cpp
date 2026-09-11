@@ -609,6 +609,7 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
 
                 for (const Interval& span : spans)
                 {
+                    if (!span.hasSolidLength()) continue;
                     Point3d start{0.0, 0.0, 0.0};
                     Point3d end{0.0, 0.0, 0.0};
                     start[axis] = grid->fromTick(span.begin);
@@ -985,12 +986,13 @@ void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& di
 
     const vsg::dvec3 y = vsg::cross(z, x);
 
-    // Mesh / sweep frames put the tip at the origin and the sphere centre at
-    // +radius along the tool axis. For ball nose and sphere, the mouse hit is
-    // that centre, so shift the tip down by radius along -z.
+    // Mesh / sweep frames put the tip at the origin. The mouse / table hit is
+    // the sphere or fillet centre for ball, sphere, and bull, so shift the tip
+    // down the axis by that offset.
     vsg::dvec3 tip = position;
-    if (_toolType == ToolType::BallNose || _toolType == ToolType::Sphere)
-        tip = position - z * static_cast<double>(worldToolRadius());
+    const double centerOffset = static_cast<double>(toolCenterOffset(_toolType, worldToolRadius()));
+    if (centerOffset > 0.0)
+        tip = position - z * centerOffset;
 
     commitToolTip(tip, x, y, z);
 }
@@ -1015,6 +1017,22 @@ void RenderManager::setToolTipPose(const ToolPose& pose)
     commitToolTip(pose.position, x, vsg::cross(z, x), z);
 }
 
+std::optional<ToolPose> RenderManager::lastReferencePose() const
+{
+    if (!_lastToolPose) return std::nullopt;
+
+    ToolPose pose = *_lastToolPose;
+    const double offset = static_cast<double>(toolCenterOffset(_toolType, worldToolRadius()));
+    if (offset <= 0.0) return pose;
+
+    vsg::dvec3 z = pose.direction;
+    const double zLen = vsg::length(z);
+    if (zLen <= 0.0) z = vsg::dvec3(0.0, 0.0, 1.0);
+    else z /= zLen;
+    pose.position = pose.position + z * offset;
+    return pose;
+}
+
 void RenderManager::resetSweepAnchor()
 {
     if (_sweptNode)
@@ -1028,6 +1046,20 @@ void RenderManager::resetSweepAnchor()
         _sweptVolume = SweptVolume{};
     else
         _sweptVolume.reset();
+}
+
+void RenderManager::resetBooleanStock()
+{
+    _booleanRayModel.reset();
+    _inspectionRayModel.reset();
+    _inspectionPrevAabb = {};
+    _inspectionBooleanPose.reset();
+    _rayModel = _sourceRayModel;
+    _splatCache.clearSubtractSection();
+    if (usesRayModel(_viewMode) && _rayModel && _rayModel->rayCount() > 0)
+        rebuild();
+    else if (_viewer)
+        _viewer->request();
 }
 
 void RenderManager::retractToolAndResetSweep()
@@ -1407,7 +1439,7 @@ void RenderManager::ensureTrajectoryCapacity()
 
 void RenderManager::appendToolTrajectory(const vsg::dvec3& position)
 {
-    if (Parameter::instance().booleanOp() == BooleanOp::None) return;
+    if (!recordsToolPath(Parameter::instance().booleanOp())) return;
     if (_toolType == ToolType::None) return;
 
     const vsg::vec3 point(static_cast<float>(position.x), static_cast<float>(position.y),
@@ -1443,7 +1475,7 @@ void RenderManager::setBooleanOp(BooleanOp op)
 {
     const BooleanOp previous = Parameter::instance().booleanOp();
     Parameter::instance().setBooleanOp(op);
-    if (op == BooleanOp::None) _trajectoryConnect = false;
+    if (!recordsToolPath(op)) _trajectoryConnect = false;
 
     if (previous == BooleanOp::Inspection && op != BooleanOp::Inspection)
     {

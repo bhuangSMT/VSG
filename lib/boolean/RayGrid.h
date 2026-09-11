@@ -51,6 +51,9 @@ struct Interval
         if (on) flags = static_cast<std::uint8_t>(flags | flagCutEnd);
         else flags = static_cast<std::uint8_t>(flags & ~flagCutEnd);
     }
+
+    // Pairing drops 1-tick spans so they never draw as orphan Gaussians.
+    bool hasSolidLength() const { return end - begin >= 2; }
 };
 
 struct RaySlot

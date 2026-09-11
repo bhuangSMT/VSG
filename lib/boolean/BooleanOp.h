@@ -12,6 +12,7 @@ enum class BooleanOp
     Union,
     // Preview only: restore the cached original RayModel each mouse move,
     // subtract the cutter at the current pose, and do not accumulate cuts.
+    // Same as None for Interactive recording: no pose table, no path line.
     Inspection
 };
 
@@ -19,6 +20,12 @@ inline bool appliesBoolean(BooleanOp op)
 {
     return op == BooleanOp::Subtraction || op == BooleanOp::Union ||
            op == BooleanOp::Inspection;
+}
+
+// Probe / Subtraction / Union collect Interactive poses and the tool path.
+inline bool recordsToolPath(BooleanOp op)
+{
+    return op == BooleanOp::Probe || op == BooleanOp::Subtraction || op == BooleanOp::Union;
 }
 
 } // namespace app

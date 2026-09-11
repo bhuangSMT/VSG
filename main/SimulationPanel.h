@@ -4,7 +4,6 @@
 #include <memory>
 #include <optional>
 
-#include <QtCore/QElapsedTimer>
 #include <QtCore/QPoint>
 #include <QtWidgets/QWidget>
 
@@ -42,7 +41,7 @@ public:
 
     // Push a sample from the mouse-move path. Queues one drain event if none
     // is already pending. No-op unless Interactive, Ray / Ray-GS, and Operation
-    // is not None.
+    // records a tool path (not None or Inspection).
     void record(const ToolPose& pose);
 
     void popupExitCollectionMenu(const QPoint& globalPos);
@@ -51,6 +50,9 @@ public:
 signals:
     void noneOperationRequested();
     void probeOperationRequested();
+    void subtractionOperationRequested();
+    void unionOperationRequested();
+    void inspectionOperationRequested();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -60,6 +62,7 @@ private slots:
     void drainPoseBuffer();
     void onModeChanged(int index);
     void onRerun();
+    void onReset();
     void onPlayStep();
     void onWaitSliderChanged(int value);
 
@@ -79,12 +82,13 @@ private:
     QTableWidget* _table = nullptr;
     QWidget* _tableHost = nullptr;
     QPushButton* _rerunButton = nullptr;
+    QPushButton* _resetButton = nullptr;
     QSlider* _waitSlider = nullptr;
     QTimer* _playTimer = nullptr;
     ToolPoseLog _log;
     std::optional<ToolSample> _lastRecorded;
     std::shared_ptr<RenderManager> _renderManager;
-    QElapsedTimer _menuGuard;
+    bool _menuOpen = false;
     bool _playing = false;
     int _playRow = 0;
 };

@@ -673,13 +673,18 @@ try
                      [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::None); });
     QObject::connect(simPanel, &app::SimulationPanel::probeOperationRequested,
                      [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Probe); });
+    QObject::connect(simPanel, &app::SimulationPanel::subtractionOperationRequested,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Subtraction); });
+    QObject::connect(simPanel, &app::SimulationPanel::unionOperationRequested,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Union); });
+    QObject::connect(simPanel, &app::SimulationPanel::inspectionOperationRequested,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Inspection); });
     booleanCombo->setContextMenuPolicy(Qt::CustomContextMenu);
     QObject::connect(booleanCombo, &QWidget::customContextMenuRequested,
                      [booleanCombo, simPanel](const QPoint& pos) {
                          simPanel->popupExitCollectionMenu(booleanCombo->mapToGlobal(pos));
                      });
     window->installEventFilter(new ViewportContextMenuFilter(simPanel, window));
-    renderWidget->installEventFilter(new ViewportContextMenuFilter(simPanel, renderWidget));
     // Cast rays through whatever BRep is on display, at the resolution held in
     // the store, and hand the result to the RenderManager. Resolutions already
     // cast through this BRep are still held there, so switching between view

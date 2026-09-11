@@ -9,6 +9,7 @@
 #include <QtGui/QHideEvent>
 #include <QtGui/QStandardItemModel>
 #include <QtWidgets/QComboBox>
+#include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QHeaderView>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QMenu>
@@ -104,8 +105,14 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
     _table->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     tableLayout->addWidget(_table, 1);
 
+    auto* buttonRow = new QHBoxLayout();
+    buttonRow->setContentsMargins(0, 0, 0, 0);
+    buttonRow->setSpacing(6);
     _rerunButton = new QPushButton("Rerun");
-    tableLayout->addWidget(_rerunButton);
+    _resetButton = new QPushButton("Reset");
+    buttonRow->addWidget(_rerunButton);
+    buttonRow->addWidget(_resetButton);
+    tableLayout->addLayout(buttonRow);
 
     _waitSlider = new QSlider(Qt::Horizontal);
     _waitSlider->setRange(0, sliderMax);
@@ -121,6 +128,7 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
 
     connect(_modeCombo, &QComboBox::currentIndexChanged, this, &SimulationPanel::onModeChanged);
     connect(_rerunButton, &QPushButton::clicked, this, &SimulationPanel::onRerun);
+    connect(_resetButton, &QPushButton::clicked, this, &SimulationPanel::onReset);
     connect(_waitSlider, &QSlider::valueChanged, this, &SimulationPanel::onWaitSliderChanged);
     connect(_playTimer, &QTimer::timeout, this, &SimulationPanel::onPlayStep);
 
@@ -148,7 +156,7 @@ void SimulationPanel::record(const ToolPose& pose)
     const Parameter& store = Parameter::instance();
     if (store.simulationMode() != SimulationMode::Interactive) return;
     if (!usesRayModel(store.viewMode())) return;
-    if (store.booleanOp() == BooleanOp::None) return;
+    if (!recordsToolPath(store.booleanOp())) return;
 
     const ToolSample sample = toolSampleFromPose(pose);
     if (_lastRecorded && !movedEnough(*_lastRecorded, sample)) return;
@@ -180,7 +188,7 @@ void SimulationPanel::hideEvent(QHideEvent* event)
 
 void SimulationPanel::notifyBooleanOp(BooleanOp op)
 {
-    if (op != BooleanOp::None) return;
+    if (recordsToolPath(op)) return;
     drainPoseBuffer();
     appendNullRow();
     _lastRecorded.reset();
@@ -188,19 +196,33 @@ void SimulationPanel::notifyBooleanOp(BooleanOp op)
 
 void SimulationPanel::popupExitCollectionMenu(const QPoint& globalPos)
 {
-    if (_menuGuard.isValid() && _menuGuard.elapsed() < 250) return;
-    _menuGuard.start();
+    if (_menuOpen) return;
+    _menuOpen = true;
 
-    QMenu menu(this);
-    QAction* exitAction = menu.addAction("Exit data collection");
-    connect(exitAction, &QAction::triggered, this, &SimulationPanel::noneOperationRequested);
-    QAction* probeAction = menu.addAction("Probe");
-    connect(probeAction, &QAction::triggered, this, &SimulationPanel::probeOperationRequested);
-    QAction* clearPathAction = menu.addAction("Clear path line");
-    connect(clearPathAction, &QAction::triggered, this, [this]() {
-        if (_renderManager) _renderManager->clearTrajectory();
+    // Wait until the right-button event finishes. Opening during release
+    // dismisses the menu immediately, so the first click looks like a miss.
+    QTimer::singleShot(0, this, [this, globalPos]() {
+        QMenu menu(this);
+        QAction* exitAction = menu.addAction("Exit data collection");
+        connect(exitAction, &QAction::triggered, this, &SimulationPanel::noneOperationRequested);
+        QAction* probeAction = menu.addAction("Probe");
+        connect(probeAction, &QAction::triggered, this, &SimulationPanel::probeOperationRequested);
+        QAction* subtractAction = menu.addAction("Subtraction");
+        connect(subtractAction, &QAction::triggered, this,
+                &SimulationPanel::subtractionOperationRequested);
+        QAction* unionAction = menu.addAction("Union");
+        connect(unionAction, &QAction::triggered, this, &SimulationPanel::unionOperationRequested);
+        QAction* inspectAction = menu.addAction("Inspection");
+        connect(inspectAction, &QAction::triggered, this,
+                &SimulationPanel::inspectionOperationRequested);
+        menu.addSeparator();
+        QAction* clearPathAction = menu.addAction("Clear path line");
+        connect(clearPathAction, &QAction::triggered, this, [this]() {
+            if (_renderManager) _renderManager->clearTrajectory();
+        });
+        menu.exec(globalPos);
+        _menuOpen = false;
     });
-    menu.exec(globalPos);
 }
 
 void SimulationPanel::drainPoseBuffer()
@@ -302,7 +324,10 @@ void SimulationPanel::applyRow(int row)
     if (isNullRow(row))
         _renderManager->retractToolAndResetSweep();
     else
-        _renderManager->setToolTipPose(toolPoseFromSample(sampleAt(row)));
+    {
+        const ToolPose pose = toolPoseFromSample(sampleAt(row));
+        _renderManager->setToolPose(pose.position, pose.direction);
+    }
 }
 
 void SimulationPanel::stopPlayback()
@@ -318,12 +343,24 @@ void SimulationPanel::finishPlayback()
     emit noneOperationRequested();
 }
 
+void SimulationPanel::onReset()
+{
+    stopPlayback();
+    _table->setRowCount(0);
+    _log.take();
+    _lastRecorded.reset();
+}
+
 void SimulationPanel::onRerun()
 {
     stopPlayback();
     if (!_renderManager || _table->rowCount() < 1) return;
     if (Parameter::instance().toolType() == ToolType::None) return;
 
+    // Replay must start from the original cast. Recutting already-subtracted
+    // stock leaves 1–2 tick islands that draw as orphan Gaussians.
+    if (appliesBoolean(Parameter::instance().booleanOp()))
+        _renderManager->resetBooleanStock();
     _renderManager->resetSweepAnchor();
     _playing = true;
     _playRow = 0;

@@ -76,7 +76,7 @@ private:
 
         if (_simulationPanel)
         {
-            if (const std::optional<ToolPose>& pose = _renderManager->lastToolPose())
+            if (const std::optional<ToolPose> pose = _renderManager->lastReferencePose())
                 _simulationPanel->record(*pose);
         }
     }

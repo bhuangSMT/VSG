@@ -429,6 +429,15 @@ cmake --build build -j"$(sysctl -n hw.ncpu)"
 ./scripts/run.sh
 ```
 
+To put the executable and its dylibs in a copyable `dist/bin` folder:
+
+```bash
+./scripts/package.sh
+./dist/run.sh
+```
+
+Copy the whole `dist/` folder to another Apple Silicon Mac. That machine still needs Homebrew Qt (`brew install qt`); Vulkan, TBB, and MoltenVK are included in `dist/bin`. Release builds use `-march=native`, so stay on Apple Silicon.
+
 ## Build & run (Windows)
 
 Prerequisites:

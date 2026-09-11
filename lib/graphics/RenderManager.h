@@ -89,15 +89,9 @@ public:
     void updateToolGeometry();
 
     // Place the active tool at position with axis along direction (world space).
-    // For flat / bull nose, position is the tip. For ball nose / sphere, position
-    // is the sphere centre — the tip is shifted down the axis by the tool radius.
-    // No-op when the tool type is None. While a tool is active, motion always
-    // accumulates a CPU swept volume. Each new segment is booleaned once into
-    // the stock RayModel (prior cuts stay). Inspection skips the path: it
-    // treats the cutter at the current pose as the swept volume (wireframe)
-    // and subtracts a preview from a fresh copy of the original RayModel.
-    // The swept-volume checkbox controls whether the cutter path (Inspection:
-    // the cutter wireframe) is drawn in VSG.
+    // Position is the sphere centre for ball nose / sphere, the fillet-torus
+    // centre for bull nose, and the tip for flat nose. The sweep still uses
+    // the tip (shifted down the axis by toolCenterOffset).
     void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
 
     // Place the cutter tip at pose.position with axis pose.direction. Unlike
@@ -109,6 +103,10 @@ public:
     // start pose. Does not revert boolean stock.
     void resetSweepAnchor();
 
+    // Throw away accumulated cuts and show the original cast. Rerun uses this
+    // so replay does not recut leftover slivers into orphan Gaussians.
+    void resetBooleanStock();
+
     // Move the cutter along its +axis until it is outside the stock AABB,
     // without boolean. Clears the sweep last-pose so the next setToolTipPose
     // only seeds the start.
@@ -116,6 +114,9 @@ public:
 
     // Tip and axis last written by setToolPose, if a cutter is active.
     const std::optional<ToolPose>& lastToolPose() const { return _lastToolPose; }
+
+    // Mouse / table location: centre for ball, sphere, and bull; tip otherwise.
+    std::optional<ToolPose> lastReferencePose() const;
 
     // Show or hide the swept-volume drawable. Does not start/stop recording.
     void setSweptVolumeVisible(bool visible);
