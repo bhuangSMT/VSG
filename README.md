@@ -10,6 +10,7 @@ UCAM/
 ├── CMakeLists.txt              # find_package(vsg, vsgQt, Vulkan, Qt6) + app + ucam libs
 ├── cmake/UcamLibrary.cmake     # shared vs static add_library helper
 ├── cmake/ucamConfig.cmake.in   # find_package(ucam) package file
+├── lib/APTParser/              # ucam_aptparser
 ├── lib/geom/                   # ucam_geom
 │   ├── TriangleMesh.h          # the triangle soup every importer produces
 │   ├── BRep.*                  # boundary rep (CSR topology) + watertight validation

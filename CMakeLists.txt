@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(UCAM_BUILD_SHARED "Build geom/boolean/graphics as shared libraries" ON)
+option(UCAM_BUILD_SHARED "Build geom/boolean/graphics/aptparser as shared libraries" ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
@@ -84,12 +84,13 @@ find_package(TBB REQUIRED)
 find_package(ZLIB REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Libraries: geom → boolean → graphics
+# Libraries: geom → boolean → graphics, plus APTParser
 # ---------------------------------------------------------------------------
 include(${PROJECT_SOURCE_DIR}/cmake/UcamLibrary.cmake)
 add_subdirectory(lib/geom)
 add_subdirectory(lib/boolean)
 add_subdirectory(lib/graphics)
+add_subdirectory(lib/APTParser)
 
 # ---------------------------------------------------------------------------
 # Application
@@ -136,7 +137,7 @@ endif()
 # Install libraries, headers (from each subdir), and CMake package files so
 # an external project can find_package(ucam) and link ucam::graphics.
 # ---------------------------------------------------------------------------
-install(TARGETS ucam_geom ucam_boolean ucam_graphics
+install(TARGETS ucam_geom ucam_boolean ucam_graphics ucam_aptparser
     EXPORT ucamTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -179,6 +180,7 @@ if(WIN32)
                 $<TARGET_FILE:ucam_geom>
                 $<TARGET_FILE:ucam_boolean>
                 $<TARGET_FILE:ucam_graphics>
+                $<TARGET_FILE:ucam_aptparser>
                 $<TARGET_FILE_DIR:vsg_qt_cube>
         )
     endif()

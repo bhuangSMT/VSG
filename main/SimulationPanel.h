@@ -72,7 +72,9 @@ private:
     void appendNullRow();
     void setTableVisibleForMode();
     void stopPlayback();
+    void pausePlayback();
     void finishPlayback();
+    void updateRerunButton();
     void applyRow(int row);
     ToolSample sampleAt(int row) const;
     bool isNullRow(int row) const;
@@ -90,6 +92,7 @@ private:
     std::shared_ptr<RenderManager> _renderManager;
     bool _menuOpen = false;
     bool _playing = false;
+    bool _paused = false;
     int _playRow = 0;
 };
 

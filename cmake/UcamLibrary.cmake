@@ -1,4 +1,4 @@
-# Shared setup for ucam_geom / ucam_boolean / ucam_graphics.
+# Shared setup for ucam_geom / ucam_boolean / ucam_graphics / ucam_aptparser.
 function(ucam_add_library target export_name)
     if(UCAM_BUILD_SHARED)
         add_library(${target} SHARED ${ARGN})

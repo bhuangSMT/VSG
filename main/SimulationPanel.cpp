@@ -330,11 +330,27 @@ void SimulationPanel::applyRow(int row)
     }
 }
 
+void SimulationPanel::updateRerunButton()
+{
+    if (_rerunButton)
+        _rerunButton->setText(_playing ? QStringLiteral("Pause") : QStringLiteral("Rerun"));
+}
+
 void SimulationPanel::stopPlayback()
 {
     _playing = false;
+    _paused = false;
     _playRow = 0;
     if (_playTimer) _playTimer->stop();
+    updateRerunButton();
+}
+
+void SimulationPanel::pausePlayback()
+{
+    _playing = false;
+    _paused = true;
+    if (_playTimer) _playTimer->stop();
+    updateRerunButton();
 }
 
 void SimulationPanel::finishPlayback()
@@ -353,17 +369,37 @@ void SimulationPanel::onReset()
 
 void SimulationPanel::onRerun()
 {
-    stopPlayback();
+    if (_playing)
+    {
+        pausePlayback();
+        return;
+    }
     if (!_renderManager || _table->rowCount() < 1) return;
     if (Parameter::instance().toolType() == ToolType::None) return;
+
+    if (_paused && _playRow >= 0 && _playRow < _table->rowCount())
+    {
+        _paused = false;
+        _playing = true;
+        updateRerunButton();
+        if (_playRow + 1 >= _table->rowCount())
+        {
+            finishPlayback();
+            return;
+        }
+        _playTimer->start(waitMsFromSlider());
+        return;
+    }
 
     // Replay must start from the original cast. Recutting already-subtracted
     // stock leaves 1–2 tick islands that draw as orphan Gaussians.
     if (appliesBoolean(Parameter::instance().booleanOp()))
         _renderManager->resetBooleanStock();
     _renderManager->resetSweepAnchor();
+    _paused = false;
     _playing = true;
     _playRow = 0;
+    updateRerunButton();
     applyRow(0);
 
     if (_table->rowCount() == 1)
