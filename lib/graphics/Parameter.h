@@ -12,6 +12,7 @@
 
 #include "Ray.h"
 #include "BooleanOp.h"
+#include "SimulationMode.h"
 #include "ToolType.h"
 #include "ViewMode.h"
 
@@ -74,6 +75,11 @@ public:
     BooleanOp booleanOp() const { return _booleanOp; }
     void setBooleanOp(BooleanOp op) { _booleanOp = op; }
 
+    // How the right-hand Simulation panel is driven. Interactive is the only
+    // implemented mode; ClData / NcMachining are reserved.
+    SimulationMode simulationMode() const { return _simulationMode; }
+    void setSimulationMode(SimulationMode mode) { _simulationMode = mode; }
+
     // The last file the user imported; also where the file dialog reopens.
     const std::string& lastImportPath() const { return _lastImportPath; }
     void setLastImportPath(std::string path) { _lastImportPath = std::move(path); }
@@ -91,6 +97,7 @@ private:
     bool _sweptVolume = false;
     bool _showLastSweptVolumeOnly = true;
     BooleanOp _booleanOp = BooleanOp::None;
+    SimulationMode _simulationMode = SimulationMode::Interactive;
     std::string _lastImportPath;
 };
 

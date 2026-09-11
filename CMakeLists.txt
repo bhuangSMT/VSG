@@ -96,6 +96,7 @@ add_subdirectory(lib/graphics)
 # ---------------------------------------------------------------------------
 set(VSG_QT_CUBE_SOURCES
     main/main.cpp
+    main/SimulationPanel.cpp
     main/StlImporter.cpp
     main/ThreeMfImporter.cpp
 )

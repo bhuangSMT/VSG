@@ -490,7 +490,7 @@ void applyBooleanInPlace(RayModel& model,
 {
     auto lock = model.lockChains();
 
-    if (op == BooleanOp::None || sweep.empty() || sweep.bvh().empty())
+    if (op == BooleanOp::None || op == BooleanOp::Probe || sweep.empty() || sweep.bvh().empty())
         return;
     if (op == BooleanOp::Inspection)
         op = BooleanOp::Subtraction;

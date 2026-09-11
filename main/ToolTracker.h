@@ -8,11 +8,15 @@
 
 #include <cmath>
 #include <memory>
+#include <optional>
 
 #include <vsg/all.h>
 
+#include <QtGui/QCursor>
+
 #include "Parameter.h"
 #include "RenderManager.h"
+#include "SimulationPanel.h"
 
 namespace app
 {
@@ -20,9 +24,11 @@ namespace app
 class ToolTracker : public vsg::Inherit<vsg::Visitor, ToolTracker>
 {
 public:
-    ToolTracker(std::shared_ptr<RenderManager> renderManager, vsg::ref_ptr<vsg::Camera> camera) :
+    ToolTracker(std::shared_ptr<RenderManager> renderManager, vsg::ref_ptr<vsg::Camera> camera,
+                SimulationPanel* simulationPanel = nullptr) :
         _renderManager(std::move(renderManager)),
-        _camera(camera)
+        _camera(camera),
+        _simulationPanel(simulationPanel)
     {
     }
 
@@ -33,13 +39,32 @@ public:
 
     void apply(vsg::ButtonPressEvent& press) override
     {
+        if (press.button == 3)
+        {
+            _rightPressed = true;
+            _rightPressX = press.x;
+            _rightPressY = press.y;
+            return;
+        }
         update(press.x, press.y);
+    }
+
+    void apply(vsg::ButtonReleaseEvent& release) override
+    {
+        if (release.button != 3 || !_rightPressed) return;
+        _rightPressed = false;
+        const int32_t dx = release.x - _rightPressX;
+        const int32_t dy = release.y - _rightPressY;
+        if (dx * dx + dy * dy > 36) return;
+        if (_simulationPanel)
+            _simulationPanel->popupExitCollectionMenu(QCursor::pos());
     }
 
 private:
     void update(int32_t x, int32_t y)
     {
         if (!_renderManager || !_camera) return;
+        if (_simulationPanel && _simulationPanel->isPlaying()) return;
         if (Parameter::instance().toolType() == ToolType::None) return;
 
         vsg::dvec3 position;
@@ -48,6 +73,12 @@ private:
 
         const vsg::dvec3 direction = tiltTowardCamera(position, normal);
         _renderManager->setToolPose(position, direction);
+
+        if (_simulationPanel)
+        {
+            if (const std::optional<ToolPose>& pose = _renderManager->lastToolPose())
+                _simulationPanel->record(*pose);
+        }
     }
 
     vsg::dvec3 tiltTowardCamera(const vsg::dvec3& position, const vsg::dvec3& normal) const
@@ -92,6 +123,10 @@ private:
 
     std::shared_ptr<RenderManager> _renderManager;
     vsg::ref_ptr<vsg::Camera> _camera;
+    SimulationPanel* _simulationPanel = nullptr;
+    bool _rightPressed = false;
+    int32_t _rightPressX = 0;
+    int32_t _rightPressY = 0;
 };
 
 } // namespace app

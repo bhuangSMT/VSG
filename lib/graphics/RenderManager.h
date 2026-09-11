@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <vector>
@@ -99,12 +100,32 @@ public:
     // the cutter wireframe) is drawn in VSG.
     void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
 
+    // Place the cutter tip at pose.position with axis pose.direction. Unlike
+    // setToolPose, position is always the tip (no ball-nose centre offset).
+    // Sweeps from the previous tip and booleans with the current operation.
+    void setToolTipPose(const ToolPose& pose);
+
+    // Drop the recorded sweep path so the next setToolTipPose only seeds the
+    // start pose. Does not revert boolean stock.
+    void resetSweepAnchor();
+
+    // Move the cutter along its +axis until it is outside the stock AABB,
+    // without boolean. Clears the sweep last-pose so the next setToolTipPose
+    // only seeds the start.
+    void retractToolAndResetSweep();
+
+    // Tip and axis last written by setToolPose, if a cutter is active.
+    const std::optional<ToolPose>& lastToolPose() const { return _lastToolPose; }
+
     // Show or hide the swept-volume drawable. Does not start/stop recording.
     void setSweptVolumeVisible(bool visible);
     bool sweptVolumeVisible() const { return _showSweptVolume; }
 
     // Drop the accumulated swept-volume mesh (CPU + scene node).
     void clearSweptVolume();
+
+    // Drop the tool-tip polyline node. The next non-None pose starts a new path.
+    void clearTrajectory();
 
     // Apply Parameter::booleanOp() using the current SweptVolume. Subtraction
     // and Union are cumulative: the input is the previous boolean result (or
@@ -143,14 +164,17 @@ private:
 
     // Assemble a StateGroup around one indexed draw. lines selects a line list
     // topology (with culling off) instead of a triangle list. transparent turns
-    // on alpha blending and disables depth writes.
+    // on alpha blending and disables depth writes. overlay disables depth so a
+    // path on the stock surface stays visible. outDraw receives the draw node.
     vsg::ref_ptr<vsg::Node> buildDrawable(vsg::ref_ptr<vsg::vec3Array> positions,
                                           vsg::ref_ptr<vsg::vec3Array> normals,
                                           vsg::ref_ptr<vsg::vec4Array> colors,
                                           VkVertexInputRate colorRate,
                                           vsg::ref_ptr<vsg::uintArray> indices,
                                           bool lines,
-                                          bool transparent = false) const;
+                                          bool transparent = false,
+                                          bool overlay = false,
+                                          vsg::ref_ptr<vsg::VertexIndexDraw>* outDraw = nullptr) const;
 
     // Wrap node in the transform that fits bounds into a unit box, if enabled.
     // Mesh and rays share this so both land in the same place.
@@ -160,6 +184,8 @@ private:
     // Model-space to world-space transform matching applyFit(), or identity
     // when fitting is off / bounds are empty.
     vsg::dmat4 fitMatrix(const BoundingBox& bounds) const;
+
+    BoundingBox worldStockAabb() const;
 
     // Build (or rebuild) the tool subgraph for the current type and the
     // radius/length held in Parameter. preservePose keeps the previous
@@ -182,10 +208,17 @@ private:
     // wireframe; other modes keep the transparent triangle path.
     void publishSweptVolume();
 
+    void appendToolTrajectory(const vsg::dvec3& position);
+    void ensureTrajectoryCapacity();
+
     // Append one linear sweep step onto the current SweptVolume, if far enough.
     // Accumulate one tip-to-tip segment into the swept volume. Returns true when
     // the sweep mesh changed (so callers can re-run boolean / rebuild Ray-GS).
     bool recordSweepStep(const ToolPose& pose);
+
+    // Write the tool matrix from a tip and orthonormal frame, then sweep/boolean.
+    void commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, const vsg::dvec3& y,
+                       const vsg::dvec3& z);
 
     // Inspection: put the cutter mesh at the current tool pose into _cutSweep
     // and publish it as the swept volume. Returns true when the pose moved
@@ -248,6 +281,16 @@ private:
     std::optional<SweptVolume> _cutSweep;
     vsg::ref_ptr<vsg::Node> _sweptNode;
     bool _showSweptVolume = false;
+
+    // Polyline of tool tips while Operation is not None. LINE_LIST so a None
+    // (or retract) can break the strip without connecting the next stroke.
+    vsg::ref_ptr<vsg::Node> _trajectoryNode;
+    vsg::ref_ptr<vsg::VertexIndexDraw> _trajectoryDraw;
+    vsg::ref_ptr<vsg::vec3Array> _trajectoryPositions;
+    vsg::ref_ptr<vsg::uintArray> _trajectoryIndices;
+    uint32_t _trajectoryPointCount = 0;
+    uint32_t _trajectoryIndexCount = 0;
+    bool _trajectoryConnect = false;
 
     vsg::vec4 _surfaceColor{0.80f, 0.80f, 0.85f, 1.0f};
     vsg::vec4 _wireframeColor{0.20f, 0.90f, 0.40f, 1.0f};

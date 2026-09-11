@@ -14,6 +14,7 @@ install(FILES
     ModelPick.h
     Parameter.h
     RenderManager.h
+    SimulationMode.h
     ViewMode.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )

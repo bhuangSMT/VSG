@@ -38,6 +38,51 @@ bool accumulatesCutMesh(BooleanOp op)
     return op == BooleanOp::Subtraction || op == BooleanOp::Union;
 }
 
+BoundingBox expandAabb(const BoundingBox& box, double radius)
+{
+    if (!box.valid()) return {};
+    Point3d mn = box.min();
+    Point3d mx = box.max();
+    mn[0] -= radius;
+    mn[1] -= radius;
+    mn[2] -= radius;
+    mx[0] += radius;
+    mx[1] += radius;
+    mx[2] += radius;
+    return BoundingBox(mn, mx);
+}
+
+// Far-slab hit along dir. 0 when the ray misses or the box is behind.
+double rayAabbExitT(const vsg::dvec3& origin, const vsg::dvec3& dir, const BoundingBox& box)
+{
+    if (!box.valid()) return 0.0;
+
+    double tEnter = -1.0e300;
+    double tExit = 1.0e300;
+    const Point3d& mn = box.min();
+    const Point3d& mx = box.max();
+    for (int i = 0; i < 3; ++i)
+    {
+        const double o = origin[i];
+        const double d = dir[i];
+        const double a = mn[i];
+        const double b = mx[i];
+        if (std::abs(d) < 1.0e-12)
+        {
+            if (o < a || o > b) return 0.0;
+            continue;
+        }
+        double t0 = (a - o) / d;
+        double t1 = (b - o) / d;
+        if (t0 > t1) std::swap(t0, t1);
+        if (t0 > tEnter) tEnter = t0;
+        if (t1 < tExit) tExit = t1;
+        if (tEnter > tExit) return 0.0;
+    }
+    if (tExit < 0.0) return 0.0;
+    return tExit;
+}
+
 double millisSince(ProfileClock::time_point start)
 {
     const std::chrono::duration<double, std::milli> elapsed = ProfileClock::now() - start;
@@ -118,7 +163,9 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
                                                      VkVertexInputRate colorRate,
                                                      vsg::ref_ptr<vsg::uintArray> indices,
                                                      bool lines,
-                                                     bool transparent) const
+                                                     bool transparent,
+                                                     bool overlay,
+                                                     vsg::ref_ptr<vsg::VertexIndexDraw>* outDraw) const
 {
     auto texcoords = vsg::vec2Array::create(positions->size(), vsg::vec2(0.0f, 0.0f));
 
@@ -130,6 +177,16 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
     {
         vsg::ref_ptr<vsg::Data> mat = materialBinding.data;
         if (!mat) mat = vsg::PhongMaterialValue::create();
+        if (overlay)
+        {
+            auto material = vsg::PhongMaterialValue::create();
+            auto& phong = material->value();
+            phong.ambient = _toolColor;
+            phong.diffuse = _toolColor;
+            phong.emissive = _toolColor;
+            phong.specular = vsg::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            mat = material;
+        }
         gpc->assignDescriptor("material", mat);
     }
 
@@ -138,7 +195,7 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
     gpc->enableArray("vsg_TexCoord0", VK_VERTEX_INPUT_RATE_VERTEX, 8);
     gpc->enableArray("vsg_Color", colorRate, 16);
 
-    if (lines || transparent)
+    if (lines || transparent || overlay)
     {
         // Drawing lines instead of triangles: switch the topology and stop
         // back-face culling from hiding the far side of the model. Transparent
@@ -149,6 +206,7 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
         {
             bool lines = false;
             bool transparent = false;
+            bool overlay = false;
 
             void apply(vsg::Object& object) override { object.traverse(*this); }
             void apply(vsg::InputAssemblyState& ias) override
@@ -166,10 +224,16 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
             void apply(vsg::DepthStencilState& dss) override
             {
                 if (transparent) dss.depthWriteEnable = VK_FALSE;
+                if (overlay)
+                {
+                    dss.depthTestEnable = VK_FALSE;
+                    dss.depthWriteEnable = VK_FALSE;
+                }
             }
         } setDrawStates;
         setDrawStates.lines = lines;
         setDrawStates.transparent = transparent;
+        setDrawStates.overlay = overlay;
 
         gpc->accept(setDrawStates);
     }
@@ -182,6 +246,7 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
     vid->assignIndices(indices);
     vid->indexCount = static_cast<uint32_t>(indices->size());
     vid->instanceCount = 1;
+    if (outDraw) *outDraw = vid;
 
     vsg::StateCommands stateCommands;
     if (!gpc->copyTo(stateCommands))
@@ -216,6 +281,31 @@ vsg::dmat4 RenderManager::fitMatrix(const BoundingBox& bounds) const
     const double s = (maxExtent > 0.0) ? 1.0 / maxExtent : 1.0;
 
     return vsg::scale(s, s, s) * vsg::translate(-c[0], -c[1], -c[2]);
+}
+
+BoundingBox RenderManager::worldStockAabb() const
+{
+    BoundingBox model;
+    if (_rayModel && _rayModel->bounds().valid())
+        model = _rayModel->bounds();
+    else if (_current)
+        model = BoundingBox::fromBRep(*_current);
+    if (!model.valid()) return {};
+
+    const vsg::dmat4 toWorld = fitMatrix(model);
+    BoundingBox world;
+    const Point3d& mn = model.min();
+    const Point3d& mx = model.max();
+    for (int ix = 0; ix < 2; ++ix)
+        for (int iy = 0; iy < 2; ++iy)
+            for (int iz = 0; iz < 2; ++iz)
+            {
+                const vsg::dvec3 corner =
+                    toWorld * vsg::dvec3(ix ? mx[0] : mn[0], iy ? mx[1] : mn[1],
+                                         iz ? mx[2] : mn[2]);
+                world.expand(Point3d{corner.x, corner.y, corner.z});
+            }
+    return world;
 }
 
 vsg::ref_ptr<vsg::Node> RenderManager::createNode(const BRep& brep) const
@@ -570,6 +660,7 @@ void RenderManager::showBRep(const BRep& brep)
     _current = brep;
     clearRayModels();
     clearSweptVolume();
+    clearTrajectory();
     rebuild();
 
     // A new model may change units; the caller reseeds Parameter::toolRadius
@@ -701,6 +792,7 @@ void RenderManager::clear()
     _sweptVolume.reset();
     _cutSweep.reset();
     _lastToolPose.reset();
+    clearTrajectory();
     _current.reset();
     clearRayModels();
     if (_viewer) _viewer->request();
@@ -900,6 +992,98 @@ void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& di
     if (_toolType == ToolType::BallNose || _toolType == ToolType::Sphere)
         tip = position - z * static_cast<double>(worldToolRadius());
 
+    commitToolTip(tip, x, y, z);
+}
+
+void RenderManager::setToolTipPose(const ToolPose& pose)
+{
+    if (!_toolTransform || _toolType == ToolType::None) return;
+
+    vsg::dvec3 z = pose.direction;
+    const double zLen = vsg::length(z);
+    if (zLen <= 0.0) z = vsg::dvec3(0.0, 0.0, 1.0);
+    else z /= zLen;
+
+    vsg::dvec3 up(0.0, 0.0, 1.0);
+    if (std::abs(vsg::dot(z, up)) > 0.95) up = vsg::dvec3(1.0, 0.0, 0.0);
+
+    vsg::dvec3 x = vsg::cross(up, z);
+    const double xLen = vsg::length(x);
+    if (xLen <= 0.0) x = vsg::dvec3(1.0, 0.0, 0.0);
+    else x /= xLen;
+
+    commitToolTip(pose.position, x, vsg::cross(z, x), z);
+}
+
+void RenderManager::resetSweepAnchor()
+{
+    if (_sweptNode)
+    {
+        auto& children = _scene->children;
+        children.erase(std::remove(children.begin(), children.end(), _sweptNode), children.end());
+        _sweptNode = nullptr;
+    }
+    _cutSweep.reset();
+    if (_toolType != ToolType::None)
+        _sweptVolume = SweptVolume{};
+    else
+        _sweptVolume.reset();
+}
+
+void RenderManager::retractToolAndResetSweep()
+{
+    if (_toolTransform && _toolType != ToolType::None && _lastToolPose)
+    {
+        vsg::dvec3 z = _lastToolPose->direction;
+        const double zLen = vsg::length(z);
+        if (zLen <= 0.0) z = vsg::dvec3(0.0, 0.0, 1.0);
+        else z /= zLen;
+
+        const vsg::dvec3 tip = _lastToolPose->position;
+        const double radius = static_cast<double>(worldToolRadius());
+        const BoundingBox stock = worldStockAabb();
+        double t = 0.0;
+        if (stock.valid())
+        {
+            const BoundingBox expanded = expandAabb(stock, radius);
+            const Point3d tipPt{tip.x, tip.y, tip.z};
+            if (expanded.contains(tipPt))
+                t = rayAabbExitT(tip, z, expanded);
+            const double extra = std::max(radius, stock.diagonal() * 0.05);
+            t += extra;
+        }
+        else
+        {
+            t = std::max(4.0 * radius, 1.0);
+        }
+
+        const vsg::dvec3 newTip = tip + z * t;
+
+        vsg::dvec3 up(0.0, 0.0, 1.0);
+        if (std::abs(vsg::dot(z, up)) > 0.95) up = vsg::dvec3(1.0, 0.0, 0.0);
+        vsg::dvec3 x = vsg::cross(up, z);
+        const double xLen = vsg::length(x);
+        if (xLen <= 0.0) x = vsg::dvec3(1.0, 0.0, 0.0);
+        else x /= xLen;
+        const vsg::dvec3 y = vsg::cross(z, x);
+
+        _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
+                                            y.x, y.y, y.z, 0.0,
+                                            z.x, z.y, z.z, 0.0,
+                                            newTip.x, newTip.y, newTip.z, 1.0);
+        _lastToolPose = ToolPose{newTip, z};
+    }
+
+    resetSweepAnchor();
+    _trajectoryConnect = false;
+    if (_viewer) _viewer->request();
+}
+
+void RenderManager::commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, const vsg::dvec3& y,
+                                  const vsg::dvec3& z)
+{
+    if (!_toolTransform || _toolType == ToolType::None) return;
+
     _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
                                         y.x, y.y, y.z, 0.0,
                                         z.x, z.y, z.z, 0.0,
@@ -907,6 +1091,7 @@ void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& di
 
     const ToolPose pose{tip, z};
     _lastToolPose = pose;
+    appendToolTrajectory(tip);
 
     if (Parameter::instance().booleanOp() == BooleanOp::Inspection)
     {
@@ -918,8 +1103,6 @@ void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& di
         return;
     }
 
-    // Always record the CPU swept volume while a tool is active. Visibility
-    // of the VSG node is gated separately by _showSweptVolume.
     bool sweepChanged = false;
     if (_toolType != ToolType::None)
         sweepChanged = recordSweepStep(pose);
@@ -984,7 +1167,7 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
     // Keep a small dead-band against mouse jitter. When a boolean op is active,
     // use a tighter threshold so the cut tracks the tool more closely.
     const double minMoveFactor =
-        (Parameter::instance().booleanOp() != BooleanOp::None) ? 0.05 : 0.25;
+        (appliesBoolean(Parameter::instance().booleanOp())) ? 0.05 : 0.25;
     if (move < static_cast<double>(radius) * minMoveFactor) return false;
 
     const ToolPose tipA = *sweep.lastPose();
@@ -1146,10 +1329,121 @@ void RenderManager::publishSweptVolume()
     _scene->addChild(_sweptNode);
 }
 
+void RenderManager::clearTrajectory()
+{
+    if (_trajectoryNode)
+    {
+        auto& children = _scene->children;
+        children.erase(std::remove(children.begin(), children.end(), _trajectoryNode),
+                       children.end());
+    }
+    _trajectoryNode = nullptr;
+    _trajectoryDraw = nullptr;
+    _trajectoryPositions = nullptr;
+    _trajectoryIndices = nullptr;
+    _trajectoryPointCount = 0;
+    _trajectoryIndexCount = 0;
+    _trajectoryConnect = false;
+    if (_viewer) _viewer->request();
+}
+
+void RenderManager::ensureTrajectoryCapacity()
+{
+    const auto neededPoints = _trajectoryPointCount + 1;
+    const auto neededIndices = _trajectoryIndexCount + 2;
+    const bool pointsFit =
+        _trajectoryPositions && neededPoints <= _trajectoryPositions->size();
+    const bool indicesFit =
+        _trajectoryIndices && neededIndices <= _trajectoryIndices->size();
+    if (pointsFit && indicesFit && _trajectoryDraw) return;
+
+    auto newPointCap = _trajectoryPositions ? _trajectoryPositions->size() : 256;
+    if (newPointCap == 0) newPointCap = 256;
+    while (newPointCap < neededPoints) newPointCap *= 2;
+    auto newIndexCap = _trajectoryIndices ? _trajectoryIndices->size() : 512;
+    if (newIndexCap == 0) newIndexCap = 512;
+    while (newIndexCap < neededIndices) newIndexCap *= 2;
+
+    auto positions = vsg::vec3Array::create(newPointCap, vsg::vec3(0.0f, 0.0f, 0.0f));
+    auto normals = vsg::vec3Array::create(newPointCap, vsg::vec3(0.0f, 0.0f, 1.0f));
+    auto indices = vsg::uintArray::create(newIndexCap, 0u);
+    positions->properties.dataVariance = vsg::DYNAMIC_DATA;
+    indices->properties.dataVariance = vsg::DYNAMIC_DATA;
+
+    if (_trajectoryPositions)
+    {
+        for (auto i = decltype(newPointCap){0}; i < _trajectoryPointCount; ++i)
+            (*positions)[i] = (*_trajectoryPositions)[i];
+    }
+    if (_trajectoryIndices)
+    {
+        for (auto i = decltype(newIndexCap){0}; i < _trajectoryIndexCount; ++i)
+            (*indices)[i] = (*_trajectoryIndices)[i];
+    }
+
+    auto colors = vsg::vec4Array::create(1, _toolColor);
+    auto node = buildDrawable(positions, normals, colors, VK_VERTEX_INPUT_RATE_INSTANCE,
+                              indices, true, false, true, &_trajectoryDraw);
+    if (_trajectoryDraw) _trajectoryDraw->indexCount = _trajectoryIndexCount;
+
+    if (_trajectoryNode)
+    {
+        auto& children = _scene->children;
+        children.erase(std::remove(children.begin(), children.end(), _trajectoryNode),
+                       children.end());
+    }
+
+    _trajectoryNode = node;
+    _trajectoryPositions = positions;
+    _trajectoryIndices = indices;
+
+    if (_viewer && _viewer->compileManager)
+    {
+        auto compileResult = _viewer->compileManager->compile(_trajectoryNode);
+        if (compileResult) vsg::updateViewer(*_viewer, compileResult);
+    }
+    _scene->addChild(_trajectoryNode);
+}
+
+void RenderManager::appendToolTrajectory(const vsg::dvec3& position)
+{
+    if (Parameter::instance().booleanOp() == BooleanOp::None) return;
+    if (_toolType == ToolType::None) return;
+
+    const vsg::vec3 point(static_cast<float>(position.x), static_cast<float>(position.y),
+                          static_cast<float>(position.z));
+
+    if (_trajectoryConnect && _trajectoryPointCount > 0 && _trajectoryPositions)
+    {
+        const vsg::vec3 delta = point - (*_trajectoryPositions)[_trajectoryPointCount - 1];
+        if (vsg::length(delta) < 1.0e-4f) return;
+    }
+
+    ensureTrajectoryCapacity();
+    if (!_trajectoryPositions || !_trajectoryIndices || !_trajectoryDraw) return;
+
+    (*_trajectoryPositions)[_trajectoryPointCount] = point;
+
+    if (_trajectoryConnect && _trajectoryPointCount > 0)
+    {
+        (*_trajectoryIndices)[_trajectoryIndexCount] = _trajectoryPointCount - 1;
+        (*_trajectoryIndices)[_trajectoryIndexCount + 1] = _trajectoryPointCount;
+        _trajectoryIndexCount += 2;
+        _trajectoryDraw->indexCount = _trajectoryIndexCount;
+        _trajectoryIndices->dirty();
+    }
+
+    ++_trajectoryPointCount;
+    _trajectoryConnect = true;
+    _trajectoryPositions->dirty();
+    if (_viewer) _viewer->request();
+}
+
 void RenderManager::setBooleanOp(BooleanOp op)
 {
     const BooleanOp previous = Parameter::instance().booleanOp();
     Parameter::instance().setBooleanOp(op);
+    if (op == BooleanOp::None) _trajectoryConnect = false;
 
     if (previous == BooleanOp::Inspection && op != BooleanOp::Inspection)
     {
@@ -1179,7 +1473,7 @@ void RenderManager::setBooleanOp(BooleanOp op)
         return;
     }
 
-    if (op == BooleanOp::None)
+    if (op == BooleanOp::None || op == BooleanOp::Probe)
     {
         // Keep whatever RayModel is on screen; only stop applying new cuts.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
@@ -1226,7 +1520,7 @@ void RenderManager::applyBooleanToRayModel()
         _inspectionRayModel.has_value() && displayedBefore == &*_inspectionRayModel;
     const bool showingSource = displayedBefore == _sourceRayModel;
 
-    if (op == BooleanOp::None)
+    if (op == BooleanOp::None || op == BooleanOp::Probe)
     {
         // Do not revert to the original cast; leave the last result in place.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;

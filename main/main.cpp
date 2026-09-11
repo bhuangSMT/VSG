@@ -8,6 +8,7 @@
 // between facet and wireframe rendering of that BRep.
 //
 // Controls: left-drag to rotate, right-drag / wheel to zoom, middle-drag to pan.
+// Right-click (no drag) opens the Operation context menu (exit data collection).
 
 #include <vsg/all.h>
 
@@ -24,8 +25,10 @@
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QMessageBox>
+#include <QtGui/QCursor>
 #include <QtGui/QFont>
 #include <QtGui/QKeySequence>
+#include <QtGui/QMouseEvent>
 #include <QtGui/QShortcut>
 #include <QtGui/QStandardItemModel>
 
@@ -42,6 +45,7 @@
 #include "Parameter.h"
 #include "RayModel.h"
 #include "RenderManager.h"
+#include "SimulationPanel.h"
 #include "StlImporter.h"
 #include "ThreeMfImporter.h"
 #include "ToolTracker.h"
@@ -154,6 +158,51 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
 
     return trackball;
 }
+
+// Right-click (no drag) on the Vulkan view: Qt context menus never reach a
+// QWindow container, and right-drag is already zoom. Treat a still click as
+// the Simulation "exit data collection" menu.
+class ViewportContextMenuFilter : public QObject
+{
+public:
+    explicit ViewportContextMenuFilter(app::SimulationPanel* panel, QObject* parent = nullptr) :
+        QObject(parent), _panel(panel)
+    {
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (!_panel) return QObject::eventFilter(watched, event);
+
+        if (event->type() == QEvent::MouseButtonPress)
+        {
+            const auto* mouse = static_cast<const QMouseEvent*>(event);
+            if (mouse->button() == Qt::RightButton)
+            {
+                _rightPressed = true;
+                _pressPos = mouse->pos();
+            }
+        }
+        else if (event->type() == QEvent::MouseButtonRelease)
+        {
+            const auto* mouse = static_cast<const QMouseEvent*>(event);
+            if (mouse->button() == Qt::RightButton && _rightPressed)
+            {
+                _rightPressed = false;
+                const QPoint delta = mouse->pos() - _pressPos;
+                if (delta.manhattanLength() <= 6)
+                    _panel->popupExitCollectionMenu(QCursor::pos());
+            }
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    app::SimulationPanel* _panel = nullptr;
+    QPoint _pressPos;
+    bool _rightPressed = false;
+};
 
 } // namespace
 
@@ -353,6 +402,10 @@ try
 
     grid->addWidget(makeDivider(), row++, 0);
 
+    auto stockTitle = new QLabel("Stock:");
+    stockTitle->setFont(titleFont);
+    grid->addWidget(stockTitle, row++, 0);
+
     grid->addWidget(new QLabel("Tool"), row++, 0);
 
     auto toolCombo = new QComboBox();
@@ -392,29 +445,35 @@ try
 
     grid->addWidget(makeDivider(), row++, 0);
 
-    grid->addWidget(new QLabel("Boolean operation"), row++, 0);
+    grid->addWidget(new QLabel("Operation"), row++, 0);
 
     auto booleanCombo = new QComboBox();
     const QString noneKeys =
         QKeySequence(Qt::CTRL | Qt::Key_N).toString(QKeySequence::NativeText);
+    const QString probeKeys =
+        QKeySequence(Qt::CTRL | Qt::Key_P).toString(QKeySequence::NativeText);
     const QString subtractKeys =
         QKeySequence(Qt::CTRL | Qt::Key_S).toString(QKeySequence::NativeText);
     const QString unionKeys =
         QKeySequence(Qt::CTRL | Qt::Key_U).toString(QKeySequence::NativeText);
     const QString inspectKeys =
         QKeySequence(Qt::CTRL | Qt::Key_I).toString(QKeySequence::NativeText);
-    booleanCombo->addItem(QString("Probe (%1)").arg(noneKeys),
+    booleanCombo->addItem(QString("None (%1)").arg(noneKeys),
                           static_cast<int>(app::BooleanOp::None));
+    booleanCombo->addItem(QString("Probe (%1)").arg(probeKeys),
+                          static_cast<int>(app::BooleanOp::Probe));
     booleanCombo->addItem(QString("Subtraction (%1)").arg(subtractKeys),
                           static_cast<int>(app::BooleanOp::Subtraction));
     booleanCombo->addItem(QString("Union (%1)").arg(unionKeys),
                           static_cast<int>(app::BooleanOp::Union));
     booleanCombo->addItem(QString("Inspection (%1)").arg(inspectKeys),
                           static_cast<int>(app::BooleanOp::Inspection));
-    booleanCombo->setCurrentIndex(0);
+    booleanCombo->setCurrentIndex(
+        booleanCombo->findData(static_cast<int>(app::BooleanOp::None)));
     booleanCombo->setToolTip(
-        QString("Probe: %1\nSubtraction: %2\nUnion: %3\nInspection: %4")
-            .arg(noneKeys, subtractKeys, unionKeys, inspectKeys));
+        QString("None: %1 (exit data collection)\nProbe: %2 (record poses, no boolean)\n"
+                "Subtraction: %3\nUnion: %4\nInspection: %5")
+            .arg(noneKeys, probeKeys, subtractKeys, unionKeys, inspectKeys));
     grid->addWidget(booleanCombo, row++, 0);
 
     auto quitButton = new QPushButton("Quit");
@@ -490,13 +549,17 @@ try
         writeToolLength(length);
     };
 
-    // --- Compose panel (left) + render surface (right) ---------------------
+    // --- Compose left panel + render surface + Simulation panel ------------
+    auto simPanel = new app::SimulationPanel();
+    simPanel->hide();
+
     auto central = new QWidget();
     auto hbox = new QHBoxLayout(central);
     hbox->setContentsMargins(0, 0, 0, 0);
     hbox->setSpacing(0);
     hbox->addWidget(panel);
     hbox->addWidget(renderWidget, 1);
+    hbox->addWidget(simPanel);
 
     mainWindow->setCentralWidget(central);
     mainWindow->setGeometry(windowTraits->x, windowTraits->y,
@@ -507,6 +570,7 @@ try
     // Bridges BRep geometry into the VSG scene. Populated before the viewer is
     // initialized so the camera is framed around real geometry.
     auto renderManager = std::make_shared<app::RenderManager>(viewer, vsg_scene, options);
+    simPanel->setRenderManager(renderManager);
     renderManager->setProfilingEnabled(profileCuts);
     if (profileCuts)
     {
@@ -562,10 +626,11 @@ try
         renderManager->clearSweptVolume();
     });
     QObject::connect(booleanCombo, &QComboBox::currentIndexChanged,
-                     [renderManager, booleanCombo](int index) {
+                     [renderManager, booleanCombo, simPanel](int index) {
                          const auto op =
                              static_cast<app::BooleanOp>(booleanCombo->itemData(index).toInt());
                          renderManager->setBooleanOp(op);
+                         simPanel->notifyBooleanOp(op);
                      });
 
     auto selectBooleanOp = [booleanCombo](app::BooleanOp op) {
@@ -585,6 +650,11 @@ try
     QObject::connect(noneShortcut, &QShortcut::activated,
                      [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::None); });
 
+    auto probeShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_P), mainWindow);
+    probeShortcut->setContext(Qt::ApplicationShortcut);
+    QObject::connect(probeShortcut, &QShortcut::activated,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Probe); });
+
     auto subtractShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_S), mainWindow);
     subtractShortcut->setContext(Qt::ApplicationShortcut);
     QObject::connect(subtractShortcut, &QShortcut::activated,
@@ -599,6 +669,17 @@ try
     inspectShortcut->setContext(Qt::ApplicationShortcut);
     QObject::connect(inspectShortcut, &QShortcut::activated,
                      [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Inspection); });
+    QObject::connect(simPanel, &app::SimulationPanel::noneOperationRequested,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::None); });
+    QObject::connect(simPanel, &app::SimulationPanel::probeOperationRequested,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Probe); });
+    booleanCombo->setContextMenuPolicy(Qt::CustomContextMenu);
+    QObject::connect(booleanCombo, &QWidget::customContextMenuRequested,
+                     [booleanCombo, simPanel](const QPoint& pos) {
+                         simPanel->popupExitCollectionMenu(booleanCombo->mapToGlobal(pos));
+                     });
+    window->installEventFilter(new ViewportContextMenuFilter(simPanel, window));
+    renderWidget->installEventFilter(new ViewportContextMenuFilter(simPanel, renderWidget));
     // Cast rays through whatever BRep is on display, at the resolution held in
     // the store, and hand the result to the RenderManager. Resolutions already
     // cast through this BRep are still held there, so switching between view
@@ -623,12 +704,13 @@ try
     const int rayModeIndex = viewModeCombo->findData(static_cast<int>(app::ViewMode::Ray));
 
     QObject::connect(viewModeCombo, &QComboBox::currentIndexChanged,
-                     [mainWindow, renderManager, viewModeCombo, buildRayModel](int index) {
+                     [mainWindow, renderManager, viewModeCombo, buildRayModel, simPanel](int index) {
                          const auto mode =
                              static_cast<app::ViewMode>(viewModeCombo->itemData(index).toInt());
 
                          app::Parameter& store = app::Parameter::instance();
                          store.setViewMode(mode);
+                         simPanel->setVisible(app::usesRayModel(store.viewMode()));
 
                          try
                          {
@@ -741,7 +823,7 @@ try
 
     // Tool tracking has to see moves before (or at least as well as) the
     // trackball; it never marks events handled, so orbit/zoom keep working.
-    viewer->addEventHandler(app::ToolTracker::create(renderManager, camera));
+    viewer->addEventHandler(app::ToolTracker::create(renderManager, camera, simPanel));
     viewer->addEventHandler(vsg::CloseHandler::create(viewer));
     viewer->compile();
 
