@@ -48,6 +48,18 @@ std::uint32_t endpointNeed(const RaySlot& slot)
 
 } // namespace
 
+const char* toString(PatchResult result)
+{
+    switch (result)
+    {
+    case PatchResult::Ok: return "ok";
+    case PatchResult::LayoutChanged: return "layout changed";
+    case PatchResult::CellTooDense: return "cell over endpoint ceiling";
+    case PatchResult::OutOfSpace: return "free list exhausted";
+    }
+    return "unknown";
+}
+
 void GaussianSplatCache::clear()
 {
     // Soft clear: keep GPU capacity/pipelines so the next rebuild stays warm.
@@ -263,48 +275,49 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
     return true;
 }
 
-bool GaussianSplatCache::updateCell(const RayModel& rayModel,
-                                    std::size_t axis,
-                                    std::uint32_t iu,
-                                    std::uint32_t iv,
-                                    float radius,
-                                    const SplatStyle& style)
+PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
+                                           std::size_t axis,
+                                           std::uint32_t iu,
+                                           std::uint32_t iv,
+                                           float radius,
+                                           const SplatStyle& style)
 {
     const AxisLayout& layout = _axes[axis];
-    if (!layout.present) return true;
+    if (!layout.present) return PatchResult::Ok;
 
     const RayGrid* grid = rayModel.grid(axis);
-    if (!grid) return true;
+    if (!grid) return PatchResult::Ok;
 
     const std::uint32_t su = sampledIndex(iu, _stride);
     const std::uint32_t sv = sampledIndex(iv, _stride);
-    if (su >= layout.sampledW || sv >= layout.sampledH) return true;
+    if (su >= layout.sampledW || sv >= layout.sampledH) return PatchResult::Ok;
 
     CellRef& ref = cellRef(axis, su, sv);
     const std::uint32_t needed = endpointNeed(grid->at(iu, iv));
 
     if (needed > static_cast<std::uint32_t>(maxEndpointsPerCell))
-        return false;
+        return PatchResult::CellTooDense;
 
     if (needed == 0)
     {
         if (ref.block != 0 && ref.first != CellRef::kInvalid)
             freeBlock(ref.first, ref.block);
         ref = {};
-        return true;
+        return PatchResult::Ok;
     }
 
     if (needed <= ref.block && ref.first != CellRef::kInvalid)
     {
         // Live accounting: block already counted in _live from alloc/rebuild.
-        return fillCell(rayModel, axis, iu, iv, radius, style, ref, true);
+        fillCell(rayModel, axis, iu, iv, radius, style, ref, true);
+        return PatchResult::Ok;
     }
 
     // +2 endpoint slack so a later 1→2 interval split often stays in-block.
     std::uint32_t blockSize = needed + 2;
     if (blockSize > static_cast<std::uint32_t>(maxEndpointsPerCell))
         blockSize = static_cast<std::uint32_t>(maxEndpointsPerCell);
-    if (blockSize < needed) return false;
+    if (blockSize < needed) return PatchResult::CellTooDense;
 
     if (ref.block != 0 && ref.first != CellRef::kInvalid)
         freeBlock(ref.first, ref.block);
@@ -317,7 +330,7 @@ bool GaussianSplatCache::updateCell(const RayModel& rayModel,
         if (!allocBlock(blockSize, &first))
         {
             ref = {};
-            return false;
+            return PatchResult::OutOfSpace;
         }
     }
 
@@ -328,9 +341,9 @@ bool GaussianSplatCache::updateCell(const RayModel& rayModel,
     {
         freeBlock(ref.first, ref.block);
         ref = {};
-        return false;
+        return PatchResult::OutOfSpace;
     }
-    return true;
+    return PatchResult::Ok;
 }
 
 vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
@@ -449,14 +462,14 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     return _set.node();
 }
 
-bool GaussianSplatCache::updateRegion(const RayModel& rayModel,
-                                      const BoundingBox& modelAabb,
-                                      int stride,
-                                      const std::array<float, 3>& radii,
-                                      const SplatStyle& style)
+PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
+                                             const BoundingBox& modelAabb,
+                                             int stride,
+                                             const std::array<float, 3>& radii,
+                                             const SplatStyle& style)
 {
-    if (!layoutMatches(rayModel, stride)) return false;
-    if (!modelAabb.valid()) return false;
+    if (!layoutMatches(rayModel, stride)) return PatchResult::LayoutChanged;
+    if (!modelAabb.valid()) return PatchResult::LayoutChanged;
 
     auto lock = rayModel.lockChains();
 
@@ -476,14 +489,14 @@ bool GaussianSplatCache::updateRegion(const RayModel& rayModel,
             for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
             {
                 if (static_cast<int>(iu) % _stride != 0) continue;
-                if (!updateCell(rayModel, axis, iu, iv, radius, style))
-                    return false;
+                const PatchResult cell = updateCell(rayModel, axis, iu, iv, radius, style);
+                if (cell != PatchResult::Ok) return cell;
             }
         }
     }
 
     _set.markDirty();
-    return true;
+    return PatchResult::Ok;
 }
 
 } // namespace app

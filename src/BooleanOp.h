@@ -8,7 +8,10 @@ enum class BooleanOp
 {
     None,
     Subtraction,
-    Union
+    Union,
+    // Preview only: restore the cached original RayModel each mouse move,
+    // subtract the cutter at the current pose, and do not accumulate cuts.
+    Inspection
 };
 
 } // namespace app

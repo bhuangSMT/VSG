@@ -70,6 +70,7 @@ public:
     void setShowLastSweptVolumeOnly(bool enabled) { _showLastSweptVolumeOnly = enabled; }
 
     // How the swept volume is combined with the current RayModel.
+    // Inspection is a non-destructive preview against the original cast.
     BooleanOp booleanOp() const { return _booleanOp; }
     void setBooleanOp(BooleanOp op) { _booleanOp = op; }
 

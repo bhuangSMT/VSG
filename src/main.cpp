@@ -25,6 +25,8 @@
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QMessageBox>
 #include <QtGui/QFont>
+#include <QtGui/QKeySequence>
+#include <QtGui/QShortcut>
 #include <QtGui/QStandardItemModel>
 
 #include <vsgQt/Window.h>
@@ -393,10 +395,26 @@ try
     grid->addWidget(new QLabel("Boolean operation"), row++, 0);
 
     auto booleanCombo = new QComboBox();
-    booleanCombo->addItem("None", static_cast<int>(app::BooleanOp::None));
-    booleanCombo->addItem("Subtraction", static_cast<int>(app::BooleanOp::Subtraction));
-    booleanCombo->addItem("Union", static_cast<int>(app::BooleanOp::Union));
+    const QString noneKeys =
+        QKeySequence(Qt::CTRL | Qt::Key_N).toString(QKeySequence::NativeText);
+    const QString subtractKeys =
+        QKeySequence(Qt::CTRL | Qt::Key_S).toString(QKeySequence::NativeText);
+    const QString unionKeys =
+        QKeySequence(Qt::CTRL | Qt::Key_U).toString(QKeySequence::NativeText);
+    const QString inspectKeys =
+        QKeySequence(Qt::CTRL | Qt::Key_I).toString(QKeySequence::NativeText);
+    booleanCombo->addItem(QString("None (%1)").arg(noneKeys),
+                          static_cast<int>(app::BooleanOp::None));
+    booleanCombo->addItem(QString("Subtraction (%1)").arg(subtractKeys),
+                          static_cast<int>(app::BooleanOp::Subtraction));
+    booleanCombo->addItem(QString("Union (%1)").arg(unionKeys),
+                          static_cast<int>(app::BooleanOp::Union));
+    booleanCombo->addItem(QString("Inspection (%1)").arg(inspectKeys),
+                          static_cast<int>(app::BooleanOp::Inspection));
     booleanCombo->setCurrentIndex(0);
+    booleanCombo->setToolTip(
+        QString("None: %1\nSubtraction: %2\nUnion: %3\nInspection: %4")
+            .arg(noneKeys, subtractKeys, unionKeys, inspectKeys));
     grid->addWidget(booleanCombo, row++, 0);
 
     auto quitButton = new QPushButton("Quit");
@@ -549,6 +567,38 @@ try
                              static_cast<app::BooleanOp>(booleanCombo->itemData(index).toInt());
                          renderManager->setBooleanOp(op);
                      });
+
+    auto selectBooleanOp = [booleanCombo](app::BooleanOp op) {
+        const int want = static_cast<int>(op);
+        for (int i = 0; i < booleanCombo->count(); ++i)
+        {
+            if (booleanCombo->itemData(i).toInt() == want)
+            {
+                booleanCombo->setCurrentIndex(i);
+                return;
+            }
+        }
+    };
+
+    auto noneShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_N), mainWindow);
+    noneShortcut->setContext(Qt::ApplicationShortcut);
+    QObject::connect(noneShortcut, &QShortcut::activated,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::None); });
+
+    auto subtractShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_S), mainWindow);
+    subtractShortcut->setContext(Qt::ApplicationShortcut);
+    QObject::connect(subtractShortcut, &QShortcut::activated,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Subtraction); });
+
+    auto unionShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_U), mainWindow);
+    unionShortcut->setContext(Qt::ApplicationShortcut);
+    QObject::connect(unionShortcut, &QShortcut::activated,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Union); });
+
+    auto inspectShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_I), mainWindow);
+    inspectShortcut->setContext(Qt::ApplicationShortcut);
+    QObject::connect(inspectShortcut, &QShortcut::activated,
+                     [selectBooleanOp]() { selectBooleanOp(app::BooleanOp::Inspection); });
     // Cast rays through whatever BRep is on display, at the resolution held in
     // the store, and hand the result to the RenderManager. Resolutions already
     // cast through this BRep are still held there, so switching between view

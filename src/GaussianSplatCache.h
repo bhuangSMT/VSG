@@ -26,6 +26,19 @@ struct SplatStyle
     float opacity = 0.5f;
 };
 
+// Why an incremental patch could not be completed. Anything but Ok means the
+// caller has to fall back to a full rebuild, so the reasons are worth telling
+// apart: they have different fixes.
+enum class PatchResult
+{
+    Ok,
+    LayoutChanged, // stride / resolution / grid extents no longer match
+    CellTooDense,  // one cell needs more endpoints than maxEndpointsPerCell
+    OutOfSpace     // free list cannot satisfy a grow
+};
+
+const char* toString(PatchResult result);
+
 class GaussianSplatCache
 {
 public:
@@ -46,14 +59,13 @@ public:
                                     const std::array<float, 3>& radii,
                                     const SplatStyle& style);
 
-    // Regenerate only cells overlapping modelAabb. Returns false when layout
-    // no longer matches, free-list cannot satisfy a grow, or a cell exceeds the
-    // soft endpoint ceiling (caller should rebuild).
-    bool updateRegion(const RayModel& rayModel,
-                      const BoundingBox& modelAabb,
-                      int stride,
-                      const std::array<float, 3>& radii,
-                      const SplatStyle& style);
+    // Regenerate only cells overlapping modelAabb. Anything but PatchResult::Ok
+    // leaves the region partly updated, so the caller has to rebuild.
+    PatchResult updateRegion(const RayModel& rayModel,
+                             const BoundingBox& modelAabb,
+                             int stride,
+                             const std::array<float, 3>& radii,
+                             const SplatStyle& style);
 
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
     void markDirty() { _set.markDirty(); }
@@ -106,12 +118,12 @@ private:
                   bool clearTrailing);
 
     // updateRegion path: resize CellRef via free-list, then fill.
-    bool updateCell(const RayModel& rayModel,
-                    std::size_t axis,
-                    std::uint32_t iu,
-                    std::uint32_t iv,
-                    float radius,
-                    const SplatStyle& style);
+    PatchResult updateCell(const RayModel& rayModel,
+                           std::size_t axis,
+                           std::uint32_t iu,
+                           std::uint32_t iv,
+                           float radius,
+                           const SplatStyle& style);
 
     GaussianSplatSet _set;
     std::array<AxisLayout, 3> _axes{};

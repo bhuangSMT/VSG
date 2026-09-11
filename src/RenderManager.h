@@ -92,8 +92,11 @@ public:
     // is the sphere centre — the tip is shifted down the axis by the tool radius.
     // No-op when the tool type is None. While a tool is active, motion always
     // accumulates a CPU swept volume. Each new segment is booleaned once into
-    // the stock RayModel (prior cuts stay). The swept-volume checkbox only
-    // controls whether the cutter path is drawn in VSG.
+    // the stock RayModel (prior cuts stay). Inspection skips the path: it
+    // treats the cutter at the current pose as the swept volume (wireframe)
+    // and subtracts a preview from a fresh copy of the original RayModel.
+    // The swept-volume checkbox controls whether the cutter path (Inspection:
+    // the cutter wireframe) is drawn in VSG.
     void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
 
     // Show or hide the swept-volume drawable. Does not start/stop recording.
@@ -103,10 +106,11 @@ public:
     // Drop the accumulated swept-volume mesh (CPU + scene node).
     void clearSweptVolume();
 
-    // Apply Parameter::booleanOp() using the current SweptVolume. Each cut is
-    // cumulative: the input is the previous boolean result (or the original
-    // cast on the first cut). None stops further cuts but keeps the current
-    // RayModel as displayed.
+    // Apply Parameter::booleanOp() using the current SweptVolume. Subtraction
+    // and Union are cumulative: the input is the previous boolean result (or
+    // the original cast on the first cut). Inspection restores the cached
+    // original RayModel every move and subtracts only the current cutter.
+    // None stops further cuts but keeps the current RayModel as displayed.
     void setBooleanOp(BooleanOp op);
     void applyBooleanToRayModel();
 
@@ -163,18 +167,30 @@ private:
     // default placement.
     void rebuildTool(bool preservePose);
 
+    // Add / remove the tool transform from the scene without dropping it. The
+    // transform stays the pose source while detached, which is how Inspection
+    // hides the solid cutter and shows only its wireframe.
+    void setToolNodeAttached(bool attached);
+
     // Model-space radius / length from Parameter, converted into the space the
     // tool is drawn in (world / fitted), matching applyFit()'s scale.
     float worldToolRadius() const;
     float worldToolLength() const;
 
-    // Rebuild the swept-volume scene node from the CPU SweptVolume.
+    // Rebuild the swept-volume scene node from the CPU SweptVolume, when the
+    // swept-volume checkbox is on. Inspection draws the current cutter as a
+    // wireframe; other modes keep the transparent triangle path.
     void publishSweptVolume();
 
     // Append one linear sweep step onto the current SweptVolume, if far enough.
     // Accumulate one tip-to-tip segment into the swept volume. Returns true when
     // the sweep mesh changed (so callers can re-run boolean / rebuild Ray-GS).
     bool recordSweepStep(const ToolPose& pose);
+
+    // Inspection: put the cutter mesh at the current tool pose into _cutSweep
+    // and publish it as the swept volume. Returns true when the pose moved
+    // far enough (or forceBoolean) that the preview subtract should re-run.
+    bool placeInspectionCutter(const ToolPose& pose, bool forceBoolean);
 
     // Half-width of a Gaussian splat cast along the given axis, in the space
     // applyFit() maps into.
@@ -297,7 +313,23 @@ private:
     // points here while a subtraction/union session is active.
     std::optional<RayModel> _booleanRayModel;
 
-    // What is drawn: either _sourceRayModel or &_booleanRayModel.
+    // Inspection working copy: cloned from _sourceRayModel each preview move,
+    // then subtracted. Discarded when leaving Inspection so accumulated cuts
+    // in _booleanRayModel stay intact.
+    std::optional<RayModel> _inspectionRayModel;
+
+    // Model-space AABB of the last inspection cutter, so the next move can
+    // patch both the restored hole and the new one.
+    BoundingBox _inspectionPrevAabb;
+
+    // Tip pose last used for an inspection subtract (dead-band).
+    std::optional<ToolPose> _inspectionBooleanPose;
+
+    // Last tool tip / axis written by setToolPose, so Inspection can place a
+    // cutter when the combo is selected without waiting for another move.
+    std::optional<ToolPose> _lastToolPose;
+
+    // What is drawn: _sourceRayModel, &_booleanRayModel, or &_inspectionRayModel.
     const RayModel* _rayModel = nullptr;
 };
 

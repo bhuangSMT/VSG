@@ -439,6 +439,8 @@ void applyBooleanInPlace(RayModel& model,
 
     if (op == BooleanOp::None || sweep.empty() || sweep.bvh().empty())
         return;
+    if (op == BooleanOp::Inspection)
+        op = BooleanOp::Subtraction;
 
     const WorldSweep worldSweep{sweep.mesh(), sweep.bvh(), sweep.bvh().bounds(),
                                 modelToWorld, vsg::inverse(modelToWorld)};

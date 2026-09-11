@@ -266,11 +266,13 @@ int main(int argc, char** argv)
         {
             // Refresh region from already-cut model (steady-state update cost).
             const auto t0 = Clock::now();
-            const bool ok = cache.updateRegion(cut, dirty, stride, splatRadii, style);
+            const app::PatchResult ok =
+                cache.updateRegion(cut, dirty, stride, splatRadii, style);
             total += elapsedMs(t0);
-            if (!ok)
+            if (ok != app::PatchResult::Ok)
             {
-                rows.push_back({"splatCache.updateRegion", total / (i + 1), "FAILED (fell back)"});
+                rows.push_back({"splatCache.updateRegion", total / (i + 1),
+                                std::string("FAILED (") + app::toString(ok) + ")"});
                 break;
             }
             if (i + 1 == repeats)

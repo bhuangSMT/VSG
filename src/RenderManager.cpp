@@ -18,6 +18,7 @@
 #include "RayBoolean.h"
 #include "SweptVolume.h"
 #include "ToolGeometry.h"
+#include "TriangleMesh.h"
 
 namespace app
 {
@@ -50,6 +51,25 @@ std::size_t dirtyWindowCells(const RayModel& model, const BoundingBox& modelAabb
                  static_cast<std::size_t>(iv1 - iv0 + 1);
     }
     return cells;
+}
+
+void transformTriangleMesh(TriangleMesh& mesh, const vsg::dmat4& matrix)
+{
+    for (MeshTriangle& tri : mesh.triangles)
+    {
+        const vsg::dvec3 a = matrix * vsg::dvec3(tri.v0.x, tri.v0.y, tri.v0.z);
+        const vsg::dvec3 b = matrix * vsg::dvec3(tri.v1.x, tri.v1.y, tri.v1.z);
+        const vsg::dvec3 c = matrix * vsg::dvec3(tri.v2.x, tri.v2.y, tri.v2.z);
+        vsg::dvec3 n = vsg::cross(b - a, c - a);
+        const double len = vsg::length(n);
+        if (len > 1.0e-18) n /= len;
+        else n = vsg::dvec3(0.0, 0.0, 1.0);
+
+        tri.v0 = vsg::vec3(static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.z));
+        tri.v1 = vsg::vec3(static_cast<float>(b.x), static_cast<float>(b.y), static_cast<float>(b.z));
+        tri.v2 = vsg::vec3(static_cast<float>(c.x), static_cast<float>(c.y), static_cast<float>(c.z));
+        tri.normal = vsg::vec3(static_cast<float>(n.x), static_cast<float>(n.y), static_cast<float>(n.z));
+    }
 }
 
 // Live intervals vs entries actually held by the per-axis interval pools. The
@@ -512,6 +532,9 @@ void RenderManager::setRayModel(RayModel model)
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
+    _inspectionRayModel.reset();
+    _inspectionPrevAabb = {};
+    _inspectionBooleanPose.reset();
 
     const auto replaced = _rayModels.find(resolution);
     if (replaced != _rayModels.end()) _cachedRays -= replaced->second.rayCount();
@@ -531,6 +554,9 @@ bool RenderManager::useCachedRayModel(const Point3d& resolution)
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
+    _inspectionRayModel.reset();
+    _inspectionPrevAabb = {};
+    _inspectionBooleanPose.reset();
     touchRayModel(resolution);
     _sourceRayModel = &_rayModels.at(resolution);
     applyBooleanToRayModel();
@@ -564,6 +590,9 @@ void RenderManager::clearRayModels()
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
+    _inspectionRayModel.reset();
+    _inspectionPrevAabb = {};
+    _inspectionBooleanPose.reset();
     _rayModels.clear();
     _rayModelOrder.clear();
     _cachedRays = 0;
@@ -604,6 +633,7 @@ void RenderManager::clear()
     _sweptNode = nullptr;
     _sweptVolume.reset();
     _cutSweep.reset();
+    _lastToolPose.reset();
     _current.reset();
     clearRayModels();
     if (_viewer) _viewer->request();
@@ -615,6 +645,7 @@ void RenderManager::setToolType(ToolType type)
     _toolType = type;
     if (type == ToolType::None)
     {
+        _lastToolPose.reset();
         clearSweptVolume();
     }
     else
@@ -738,16 +769,40 @@ void RenderManager::rebuildTool(bool preservePose)
         if (compileResult) vsg::updateViewer(*_viewer, compileResult);
     }
 
-    _scene->addChild(_toolTransform);
+    // Inspection replaces the solid cutter with the wireframe swept volume.
+    setToolNodeAttached(Parameter::instance().booleanOp() != BooleanOp::Inspection);
 
     if (preservePose && hadPose)
+    {
         _toolTransform->matrix = previousMatrix;
+        if (Parameter::instance().booleanOp() == BooleanOp::Inspection && _lastToolPose)
+        {
+            placeInspectionCutter(*_lastToolPose, true);
+            applyBooleanToRayModel();
+        }
+    }
     else
         // Start on the top of a unit-box model so the shank rises toward +Z
         // instead of into the camera. The tracker overwrites this on the next move.
         setToolPose(vsg::dvec3(0.0, 0.0, 0.35), vsg::dvec3(0.0, 0.15, 1.0));
 
     if (_viewer) _viewer->request();
+}
+
+void RenderManager::setToolNodeAttached(bool attached)
+{
+    if (!_toolTransform) return;
+
+    auto& children = _scene->children;
+    const auto found = std::find(children.begin(), children.end(), _toolTransform);
+    if (attached)
+    {
+        if (found == children.end()) _scene->addChild(_toolTransform);
+    }
+    else if (found != children.end())
+    {
+        children.erase(found);
+    }
 }
 
 void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction)
@@ -783,11 +838,24 @@ void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& di
                                         z.x, z.y, z.z, 0.0,
                                         tip.x, tip.y, tip.z, 1.0);
 
+    const ToolPose pose{tip, z};
+    _lastToolPose = pose;
+
+    if (Parameter::instance().booleanOp() == BooleanOp::Inspection)
+    {
+        const bool movedEnough = placeInspectionCutter(pose, false);
+        if (movedEnough)
+            applyBooleanToRayModel();
+        else if (_viewer)
+            _viewer->request();
+        return;
+    }
+
     // Always record the CPU swept volume while a tool is active. Visibility
     // of the VSG node is gated separately by _showSweptVolume.
     bool sweepChanged = false;
     if (_toolType != ToolType::None)
-        sweepChanged = recordSweepStep(ToolPose{tip, z});
+        sweepChanged = recordSweepStep(pose);
 
     if (sweepChanged)
         applyBooleanToRayModel();
@@ -887,6 +955,40 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
     return true;
 }
 
+bool RenderManager::placeInspectionCutter(const ToolPose& pose, bool forceBoolean)
+{
+    if (_toolType == ToolType::None || !_toolTransform) return false;
+
+    TriangleMesh mesh = createToolMesh(_toolType, worldToolRadius(), worldToolLength());
+    if (mesh.triangles.empty()) return false;
+
+    transformTriangleMesh(mesh, _toolTransform->matrix);
+
+    SweptVolume cutter;
+    cutter.appendTriangles(mesh, true);
+    cutter.setLastPose(pose);
+    if (cutter.empty()) return false;
+
+    _cutSweep = std::move(cutter);
+
+    // Keep the path accumulator's tip in step so leaving Inspection does not
+    // boolean a jump from the last real cut to the current mouse pose.
+    if (!_sweptVolume) _sweptVolume = SweptVolume{};
+    _sweptVolume->setLastPose(pose);
+
+    publishSweptVolume();
+
+    if (!forceBoolean && _inspectionBooleanPose)
+    {
+        const float radius = worldToolRadius();
+        const double move = vsg::length(pose.position - _inspectionBooleanPose->position);
+        if (move < static_cast<double>(radius) * 0.05) return false;
+    }
+
+    _inspectionBooleanPose = pose;
+    return true;
+}
+
 void RenderManager::publishSweptVolume()
 {
     if (_sweptNode)
@@ -898,33 +1000,75 @@ void RenderManager::publishSweptVolume()
 
     // Checkbox off: keep the CPU mesh / BVH for boolean, but do not draw it.
     if (!_showSweptVolume) return;
-    if (!_sweptVolume || _sweptVolume->empty()) return;
 
-    const TriangleMesh& mesh = _sweptVolume->mesh();
-    const std::size_t triCount = mesh.triangles.size();
+    // Inspection draws the cutter at the current pose; the other modes draw
+    // the accumulated path.
+    const bool inspection = Parameter::instance().booleanOp() == BooleanOp::Inspection;
+    const SweptVolume* drawn = nullptr;
+    if (inspection)
+    {
+        if (_cutSweep && !_cutSweep->empty()) drawn = &*_cutSweep;
+    }
+    else if (_sweptVolume && !_sweptVolume->empty())
+    {
+        drawn = &*_sweptVolume;
+    }
+    if (!drawn) return;
+
+    const TriangleMesh& mesh = drawn->mesh();
+    const auto triCount = mesh.triangles.size();
+
     auto positions = vsg::vec3Array::create(triCount * 3);
     auto normals = vsg::vec3Array::create(triCount * 3);
-    auto indices = vsg::uintArray::create(triCount * 3);
 
-    for (std::size_t i = 0; i < triCount; ++i)
+    for (auto i = decltype(triCount){0}; i < triCount; ++i)
     {
         const MeshTriangle& tri = mesh.triangles[i];
-        const std::size_t base = i * 3;
+        const auto base = i * 3;
         (*positions)[base] = tri.v0;
         (*positions)[base + 1] = tri.v1;
         (*positions)[base + 2] = tri.v2;
         (*normals)[base] = tri.normal;
         (*normals)[base + 1] = tri.normal;
         (*normals)[base + 2] = tri.normal;
-        (*indices)[base] = static_cast<uint32_t>(base);
-        (*indices)[base + 1] = static_cast<uint32_t>(base + 1);
-        (*indices)[base + 2] = static_cast<uint32_t>(base + 2);
     }
 
-    auto colors = vsg::vec4Array::create(1, _sweptColor);
-    _sweptNode = buildDrawable(positions, normals, colors,
-                               VK_VERTEX_INPUT_RATE_INSTANCE, indices,
-                               false, true);
+    if (inspection)
+    {
+        auto indices = vsg::uintArray::create(triCount * 6);
+        for (auto i = decltype(triCount){0}; i < triCount; ++i)
+        {
+            const auto base = static_cast<uint32_t>(i * 3);
+            const auto edge = i * 6;
+            (*indices)[edge] = base;
+            (*indices)[edge + 1] = base + 1;
+            (*indices)[edge + 2] = base + 1;
+            (*indices)[edge + 3] = base + 2;
+            (*indices)[edge + 4] = base + 2;
+            (*indices)[edge + 5] = base;
+        }
+
+        auto colors = vsg::vec4Array::create(1, _wireframeColor);
+        _sweptNode = buildDrawable(positions, normals, colors,
+                                   VK_VERTEX_INPUT_RATE_INSTANCE, indices,
+                                   true);
+    }
+    else
+    {
+        auto indices = vsg::uintArray::create(triCount * 3);
+        for (auto i = decltype(triCount){0}; i < triCount; ++i)
+        {
+            const auto base = i * 3;
+            (*indices)[base] = static_cast<uint32_t>(base);
+            (*indices)[base + 1] = static_cast<uint32_t>(base + 1);
+            (*indices)[base + 2] = static_cast<uint32_t>(base + 2);
+        }
+
+        auto colors = vsg::vec4Array::create(1, _sweptColor);
+        _sweptNode = buildDrawable(positions, normals, colors,
+                                   VK_VERTEX_INPUT_RATE_INSTANCE, indices,
+                                   false, true);
+    }
 
     if (_viewer && _viewer->compileManager)
     {
@@ -937,7 +1081,36 @@ void RenderManager::publishSweptVolume()
 
 void RenderManager::setBooleanOp(BooleanOp op)
 {
+    const BooleanOp previous = Parameter::instance().booleanOp();
     Parameter::instance().setBooleanOp(op);
+
+    if (previous == BooleanOp::Inspection && op != BooleanOp::Inspection)
+    {
+        // Drop the preview hole and put accumulated cuts (if any) back on
+        // screen. The inspection cutter is not a real cut.
+        _inspectionRayModel.reset();
+        _inspectionPrevAabb = {};
+        _inspectionBooleanPose.reset();
+        _cutSweep.reset();
+        publishSweptVolume();
+        setToolNodeAttached(true);
+        _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
+        if (usesRayModel(_viewMode) && _rayModel)
+            rebuild();
+        else if (_viewer)
+            _viewer->request();
+        return;
+    }
+
+    if (op == BooleanOp::Inspection)
+    {
+        _cutSweep.reset();
+        if (_toolTransform && _toolType != ToolType::None && _lastToolPose)
+            placeInspectionCutter(*_lastToolPose, true);
+        setToolNodeAttached(false);
+        applyBooleanToRayModel();
+        return;
+    }
 
     if (op == BooleanOp::None)
     {
@@ -955,6 +1128,8 @@ void RenderManager::applyBooleanToRayModel()
     if (!_sourceRayModel)
     {
         _booleanRayModel.reset();
+        _inspectionRayModel.reset();
+        _inspectionPrevAabb = {};
         _rayModel = nullptr;
         _splatCache.clear();
         return;
@@ -962,6 +1137,7 @@ void RenderManager::applyBooleanToRayModel()
 
     const BooleanOp op = Parameter::instance().booleanOp();
     BoundingBox dirtyModelAabb;
+    BoundingBox restoreAabb;
     bool haveDirtyRegion = false;
     double booleanMs = 0.0;
     bool raysMutated = false;
@@ -969,11 +1145,55 @@ void RenderManager::applyBooleanToRayModel()
     // Tool motion calls this on every sweep step, so the branches below that
     // only re-point _rayModel must not trigger a redraw of unchanged rays.
     const RayModel* const displayedBefore = _rayModel;
+    const bool wasInspecting =
+        _inspectionRayModel.has_value() && displayedBefore == &*_inspectionRayModel;
+    const bool showingSource = displayedBefore == _sourceRayModel;
 
     if (op == BooleanOp::None)
     {
         // Do not revert to the original cast; leave the last result in place.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
+    }
+    else if (op == BooleanOp::Inspection)
+    {
+        if (!_cutSweep || _cutSweep->empty())
+        {
+            _rayModel = nullptr;
+            _inspectionRayModel.reset();
+            _inspectionPrevAabb = {};
+            _rayModel = _sourceRayModel;
+            raysMutated = !showingSource;
+        }
+        else
+        {
+            // Fresh stock every move: clone the cached original, then subtract
+            // the cutter at this pose. Do not touch _booleanRayModel.
+            _rayModel = nullptr;
+            _inspectionRayModel = _sourceRayModel->clone();
+
+            const BoundingBox bounds = _inspectionRayModel->bounds();
+            const vsg::dmat4 modelToWorld = fitMatrix(bounds);
+            const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
+
+            BoundingBox currentDirty;
+            if (_cutSweep->bvh().bounds().valid())
+                currentDirty = modelAabbFromWorld(_cutSweep->bvh().bounds(), worldToModel);
+
+            const auto booleanStart = ProfileClock::now();
+            _inspectionRayModel->booleanInPlace(*_cutSweep, BooleanOp::Subtraction,
+                                                modelToWorld);
+            booleanMs = millisSince(booleanStart);
+            _rayModel = &*_inspectionRayModel;
+            raysMutated = true;
+
+            dirtyModelAabb = currentDirty;
+            if (wasInspecting) restoreAabb = _inspectionPrevAabb;
+            // Patch when the previous display was already original stock
+            // (plus at most the last preview hole). Accumulated cuts need a
+            // full rebuild so old holes do not linger in the splat cache.
+            haveDirtyRegion = currentDirty.valid() && (wasInspecting || showingSource);
+            _inspectionPrevAabb = currentDirty;
+        }
     }
     else if (!_cutSweep || _cutSweep->empty())
     {
@@ -1018,8 +1238,22 @@ void RenderManager::applyBooleanToRayModel()
     {
         const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
         const auto patchStart = ProfileClock::now();
-        if (_splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
-                                     splatRadii(*_rayModel, stride), splatStyle()))
+        const auto radii = splatRadii(*_rayModel, stride);
+        const SplatStyle style = splatStyle();
+        PatchResult patched = PatchResult::Ok;
+        if (restoreAabb.valid())
+        {
+            patched = _splatCache.updateRegion(*_rayModel, restoreAabb, stride, radii, style);
+            if (patched == PatchResult::Ok && dirtyModelAabb.valid())
+                patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
+                                                   radii, style);
+        }
+        else
+        {
+            patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
+                                               radii, style);
+        }
+        if (patched == PatchResult::Ok)
         {
             logCutProfile(booleanMs, "patch", millisSince(patchStart), dirtyModelAabb);
             if (_viewer) _viewer->request();
@@ -1027,8 +1261,8 @@ void RenderManager::applyBooleanToRayModel()
         }
         // updateRegion bailed part way through; the rebuild below repacks it.
         if (_profiling)
-            std::printf("  splat patch failed (free list exhausted) after %.2f ms\n",
-                        millisSince(patchStart));
+            std::printf("  splat patch failed (%s) after %.2f ms\n",
+                        toString(patched), millisSince(patchStart));
     }
 
     if (usesRayModel(_viewMode))
