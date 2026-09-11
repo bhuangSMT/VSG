@@ -44,6 +44,13 @@ void BoundingBox::expand(const Point3d& p)
     }
 }
 
+void BoundingBox::expand(const BoundingBox& other)
+{
+    if (!other._valid) return;
+    expand(other._min);
+    expand(other._max);
+}
+
 double BoundingBox::extent(std::size_t axis) const
 {
     if (!_valid || axis > 2) return 0.0;

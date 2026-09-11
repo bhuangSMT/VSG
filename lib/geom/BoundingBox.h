@@ -23,6 +23,9 @@ public:
     // Grow the box to include p.
     void expand(const Point3d& p);
 
+    // Grow the box to include other. No-op when other is empty.
+    void expand(const BoundingBox& other);
+
     bool valid() const { return _valid; }
 
     bool contains(const Point3d& p) const

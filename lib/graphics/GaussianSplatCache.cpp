@@ -900,7 +900,7 @@ void GaussianSplatCache::updateSectionGrid(const RayModel& rayModel, int stride,
 
     auto lock = rayModel.lockChains();
     std::vector<OverlayTri> tris;
-    appendSubtractTris(rayModel, stride, sectionAabb, tris, true, 0);
+    appendSubtractTris(rayModel, stride, sectionAabb, tris, false, kSubtractHaloCells);
     uploadSectionTris(tris, color);
 }
 

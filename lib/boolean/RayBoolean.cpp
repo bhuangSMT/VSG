@@ -186,6 +186,89 @@ void maybeCompactPool(RayGrid& grid)
     if (pool.wasted * 2 > pool.data.size()) pool.compact(grid.cells);
 }
 
+// Keep the existing (origin, spacing) lattice and add rows/columns so modelAabb
+// is covered. Existing slots keep their intervals; new slots start empty.
+void growGridToCover(RayGrid& grid, const BoundingBox& modelAabb)
+{
+    if (grid.empty() || !modelAabb.valid()) return;
+    if (!(grid.spacingU > 0.0f) || !(grid.spacingV > 0.0f)) return;
+
+    const auto u = (grid.axis + 1) % 3;
+    const auto v = (grid.axis + 2) % 3;
+    const Point3d& lo = modelAabb.min();
+    const Point3d& hi = modelAabb.max();
+
+    const double spacingU = static_cast<double>(grid.spacingU);
+    const double spacingV = static_cast<double>(grid.spacingV);
+    double originU = static_cast<double>(grid.originU);
+    double originV = static_cast<double>(grid.originV);
+
+    auto padCount = [](double origin, double spacing, double needMin) {
+        if (!(needMin < origin)) return 0;
+        const double raw = (origin - needMin) / spacing;
+        int pad = static_cast<int>(std::ceil(raw - 1.0e-12));
+        if (pad < 1) pad = 1;
+        while (origin - static_cast<double>(pad) * spacing > needMin + 1.0e-12)
+            ++pad;
+        return pad;
+    };
+
+    const int padLeft = padCount(originU, spacingU, lo[u]);
+    const int padBottom = padCount(originV, spacingV, lo[v]);
+    originU -= static_cast<double>(padLeft) * spacingU;
+    originV -= static_cast<double>(padBottom) * spacingV;
+
+    auto lastIndex = [](double origin, double spacing, double needMax) {
+        const double raw = (needMax - origin) / spacing;
+        long long i = static_cast<long long>(std::floor(raw));
+        if (i < 0) i = 0;
+        return i;
+    };
+
+    constexpr int maxDim = 8193;
+    long long newLastU = lastIndex(originU, spacingU, hi[u]);
+    long long newLastV = lastIndex(originV, spacingV, hi[v]);
+    const long long oldLastU = static_cast<long long>(grid.width) - 1 + padLeft;
+    const long long oldLastV = static_cast<long long>(grid.height) - 1 + padBottom;
+    if (newLastU < oldLastU) newLastU = oldLastU;
+    if (newLastV < oldLastV) newLastV = oldLastV;
+
+    long long newWidth = newLastU + 1;
+    long long newHeight = newLastV + 1;
+    if (newWidth > maxDim) newWidth = maxDim;
+    if (newHeight > maxDim) newHeight = maxDim;
+
+    const long long curWidth = static_cast<long long>(grid.width);
+    const long long curHeight = static_cast<long long>(grid.height);
+    if (padLeft == 0 && padBottom == 0 && newWidth == curWidth && newHeight == curHeight)
+        return;
+
+    const auto grownW = static_cast<std::uint32_t>(newWidth);
+    const auto grownH = static_cast<std::uint32_t>(newHeight);
+    std::vector<RaySlot> grown;
+    grown.assign(grownW * grownH, RaySlot{});
+
+    const auto padU = static_cast<std::uint32_t>(padLeft);
+    const auto padV = static_cast<std::uint32_t>(padBottom);
+    for (std::uint32_t iv = 0; iv < grid.height; ++iv)
+    {
+        const std::uint32_t destV = iv + padV;
+        if (destV >= grownH) continue;
+        for (std::uint32_t iu = 0; iu < grid.width; ++iu)
+        {
+            const std::uint32_t destU = iu + padU;
+            if (destU >= grownW) continue;
+            grown[destV * grownW + destU] = grid.cells[iv * grid.width + iu];
+        }
+    }
+
+    grid.cells.swap(grown);
+    grid.width = grownW;
+    grid.height = grownH;
+    grid.originU = static_cast<float>(originU);
+    grid.originV = static_cast<float>(originV);
+}
+
 // Cells whose intervals changed. Pool writes stay on one thread after the
 // parallel window walk; workers only read.
 struct PendingUpdate
@@ -419,6 +502,23 @@ void applyBooleanInPlace(RayModel& model,
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
     model._pairingStats = {};
+
+    const BoundingBox sweepModelAabb =
+        modelAabbFromWorld(worldSweep.worldBounds, worldSweep.worldToModel);
+
+    // Union past the stock AABB: keep the lattice and append the extra rows
+    // and columns. Without this, existing X/Y rays lengthen into the sweep
+    // and the corner between them is never sampled.
+    if (op == BooleanOp::Union && sweepModelAabb.valid())
+    {
+        BoundingBox coverage = model._bounds;
+        coverage.expand(sweepModelAabb);
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            if (RayGrid* g = model.grid(axis))
+                growGridToCover(*g, coverage);
+        }
+    }
 
     // Axes share nothing, but nested TBB (axis × cell) raced the interval
     // pool. Walk axes in order; each axis still parallelizes its dirty window.

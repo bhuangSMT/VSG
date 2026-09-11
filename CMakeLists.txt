@@ -13,6 +13,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(UCAM_BUILD_SHARED "Build geom/boolean/graphics as shared libraries" ON)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
@@ -31,11 +33,28 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     endif()
 endif()
 
-# Keep the executable at the build-tree root for both Ninja and Visual Studio.
+# Keep the executable and libraries at the build-tree root for both Ninja and Visual Studio.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 foreach(_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_BINARY_DIR}")
 endforeach()
+
+include(GNUInstallDirs)
+
+# Shared libs next to the exe in the build tree; installed libs next to each other.
+if(APPLE)
+    set(CMAKE_MACOSX_RPATH ON)
+    set(CMAKE_BUILD_RPATH "@loader_path")
+    set(CMAKE_INSTALL_RPATH "@loader_path;@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+elseif(UNIX)
+    set(CMAKE_BUILD_RPATH "$ORIGIN")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif()
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # Qt code generation (moc/rcc/uic). vsgQt embeds a QWindow, so AUTOMOC is required.
 set(CMAKE_AUTOMOC ON)
@@ -65,25 +84,20 @@ find_package(TBB REQUIRED)
 find_package(ZLIB REQUIRED)
 
 # ---------------------------------------------------------------------------
+# Libraries: geom → boolean → graphics
+# ---------------------------------------------------------------------------
+include(${PROJECT_SOURCE_DIR}/cmake/UcamLibrary.cmake)
+add_subdirectory(lib/geom)
+add_subdirectory(lib/boolean)
+add_subdirectory(lib/graphics)
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 set(VSG_QT_CUBE_SOURCES
-    src/main.cpp
-    src/StlImporter.cpp
-    src/ThreeMfImporter.cpp
-    src/BRep.cpp
-    src/BVH.cpp
-    src/BoundingBox.cpp
-    src/GaussianSplat.cpp
-    src/GaussianSplatCache.cpp
-    src/ModelPick.cpp
-    src/Parameter.cpp
-    src/RayHit.cpp
-    src/RayModel.cpp
-    src/RayBoolean.cpp
-    src/RenderManager.cpp
-    src/SweptVolume.cpp
-    src/ToolGeometry.cpp
+    main/main.cpp
+    main/StlImporter.cpp
+    main/ThreeMfImporter.cpp
 )
 
 if(COMMAND qt_add_executable)
@@ -97,48 +111,77 @@ if(WIN32)
     target_compile_definitions(vsg_qt_cube PRIVATE NOMINMAX)
 endif()
 
+target_include_directories(vsg_qt_cube PRIVATE ${PROJECT_SOURCE_DIR}/main)
+
 target_link_libraries(vsg_qt_cube
     PRIVATE
-        vsgQt::vsgQt
-        vsg::vsg
+        ucam_graphics
         ${QT_PACKAGE_NAME}::Widgets
-        TBB::tbb
         ZLIB::ZLIB
 )
 
-install(TARGETS vsg_qt_cube RUNTIME DESTINATION bin)
+install(TARGETS vsg_qt_cube RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ---------------------------------------------------------------------------
 # Headless hotspot profiler (cast / sweep / boolean / splat cache).
 # ---------------------------------------------------------------------------
-add_executable(profile_hotspots
-    src/profile_hotspots.cpp
-    src/BRep.cpp
-    src/BVH.cpp
-    src/BoundingBox.cpp
-    src/GaussianSplat.cpp
-    src/GaussianSplatCache.cpp
-    src/RayHit.cpp
-    src/RayModel.cpp
-    src/RayBoolean.cpp
-    src/SweptVolume.cpp
-    src/ToolGeometry.cpp
-)
-target_link_libraries(profile_hotspots
-    PRIVATE
-        vsg::vsg
-        TBB::tbb
-)
+add_executable(profile_hotspots main/profile_hotspots.cpp)
+target_link_libraries(profile_hotspots PRIVATE ucam_graphics)
 if(WIN32)
     target_compile_definitions(profile_hotspots PRIVATE NOMINMAX)
 endif()
 
 # ---------------------------------------------------------------------------
-# Windows: copy VSG/vsgQt DLLs next to the exe and run windeployqt so the
-# Qt platform plugin (qwindows.dll) is available when launching from the
-# build tree.
+# Install libraries, headers (from each subdir), and CMake package files so
+# an external project can find_package(ucam) and link ucam::graphics.
+# ---------------------------------------------------------------------------
+install(TARGETS ucam_geom ucam_boolean ucam_graphics
+    EXPORT ucamTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(EXPORT ucamTargets
+    FILE ucamTargets.cmake
+    NAMESPACE ucam::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    ${PROJECT_SOURCE_DIR}/cmake/ucamConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/ucamConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/ucamConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/ucamConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/ucamConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+)
+
+# ---------------------------------------------------------------------------
+# Windows: copy VSG/vsgQt (and ucam) DLLs next to the exe and run windeployqt
+# so the Qt platform plugin (qwindows.dll) is available when launching from
+# the build tree.
 # ---------------------------------------------------------------------------
 if(WIN32)
+    set(_ucam_dll_copy)
+    if(UCAM_BUILD_SHARED)
+        set(_ucam_dll_copy
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ucam_geom>
+                $<TARGET_FILE:ucam_boolean>
+                $<TARGET_FILE:ucam_graphics>
+                $<TARGET_FILE_DIR:vsg_qt_cube>
+        )
+    endif()
+
     add_custom_command(TARGET vsg_qt_cube POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:vsg::vsg>
@@ -146,6 +189,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:vsgQt::vsgQt>
             $<TARGET_FILE_DIR:vsg_qt_cube>
+        ${_ucam_dll_copy}
         COMMENT "Copying VSG DLLs next to vsg_qt_cube"
     )
 

@@ -3,6 +3,9 @@
 // For each present RayGrid, the sweep AABB maps to a dense (iu, iv) window.
 // Only those slots run BVH triangle tests; hits are quantized to int32 ticks
 // and subtracted/unioned into that grid's IntervalPool.
+//
+// Union that grows the stock AABB appends new lattice rows/columns so the
+// corner region is sampled, rather than only stretching existing X/Y spans.
 #pragma once
 
 #include <cstdint>

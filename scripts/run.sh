@@ -26,6 +26,6 @@ else
 fi
 
 export VK_ICD_FILENAMES="$MOLTENVK/etc/vulkan/icd.d/MoltenVK_icd.json"
-export DYLD_LIBRARY_PATH="$DEPS/lib:$VK_LOADER/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+export DYLD_LIBRARY_PATH="$ROOT/build:$DEPS/lib:$VK_LOADER/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 exec "$ROOT/build/vsg_qt_cube" "$@"

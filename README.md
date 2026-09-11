@@ -6,26 +6,42 @@ A minimal C++/CMake project that renders a **cube** with
 [vsgQt](https://github.com/vsg-dev/vsgQt) integration layer.
 
 ```
-VSG/
-├── CMakeLists.txt        # find_package(vsg, vsgQt, Vulkan, Qt6) + build target
-├── src/main.cpp          # QApplication + QMainWindow hosting a vsgQt render surface
-├── src/TriangleMesh.h    # the triangle soup every importer produces
-├── src/StlImporter.*     # ASCII/binary STL reader -> triangle soup
-├── src/ThreeMfImporter.* # 3MF (ZIP + XML) reader -> triangle soup
-├── src/BRep.*            # boundary rep (CSR topology) + watertight validation
-├── src/BVH.*             # face hierarchy built with the BRep, queried when casting
-├── src/Parameter.*       # singleton store every UI control commits to
-├── src/ViewMode.h        # Facet / Wireframe / Ray / Ray-GS
-├── src/Ray.h             # Point3d, Ray, RayChain (with its grid position)
-├── src/BoundingBox.*     # axis-aligned extent used to lay out the ray grid
-├── src/RayModel.*        # axis-aligned rays cast through a BRep
-├── src/GaussianSplat.*   # point set -> camera-facing Gaussian splats
-├── src/RenderManager.*   # BRep <-> VSG scene handshake (build, compile, attach)
+UCAM/
+├── CMakeLists.txt              # find_package(vsg, vsgQt, Vulkan, Qt6) + app + ucam libs
+├── cmake/UcamLibrary.cmake     # shared vs static add_library helper
+├── cmake/ucamConfig.cmake.in   # find_package(ucam) package file
+├── lib/geom/                   # ucam_geom
+│   ├── TriangleMesh.h          # the triangle soup every importer produces
+│   ├── BRep.*                  # boundary rep (CSR topology) + watertight validation
+│   ├── BVH.*                   # face hierarchy built with the BRep, queried when casting
+│   ├── Ray.h                   # Point3d, Ray, RayChain (with its grid position)
+│   ├── BoundingBox.*           # axis-aligned extent used to lay out the ray grid
+│   ├── SweptVolume.*           # tool body swept along a path
+│   ├── ToolGeometry.*          # mill / drill / etc. solid
+│   └── ToolType.h
+├── lib/boolean/                # ucam_boolean
+│   ├── BooleanOp.h
+│   ├── RayGrid.h
+│   ├── RayHit.*
+│   ├── RayModel.*              # axis-aligned rays cast through a BRep
+│   └── RayBoolean.*
+├── lib/graphics/               # ucam_graphics
+│   ├── GaussianSplat.*         # point set -> camera-facing Gaussian splats
+│   ├── GaussianSplatCache.*
+│   ├── RenderManager.*         # BRep <-> VSG scene handshake (build, compile, attach)
+│   ├── ModelPick.*
+│   ├── Parameter.*             # singleton store every UI control commits to
+│   └── ViewMode.h              # Facet / Wireframe / Ray / Ray-GS
+├── main/main.cpp               # QApplication + QMainWindow hosting a vsgQt render surface
+├── main/ToolTracker.h
+├── main/StlImporter.*          # ASCII/binary STL reader -> triangle soup
+├── main/ThreeMfImporter.*      # 3MF (ZIP + XML) reader -> triangle soup
+├── main/profile_hotspots.cpp   # headless timing of cast / sweep / boolean / splat
 ├── scripts/
-│   ├── bootstrap.sh      # macOS: brew + build VSG/vsgQt into ./.deps
-│   ├── bootstrap.ps1     # Windows: Vulkan SDK + Qt6 + build VSG/vsgQt into ./.deps
-│   ├── run.sh            # macOS: run with MoltenVK ICD / dylib paths
-│   └── run.ps1           # Windows: run the exe (PATH + Qt plugins)
+│   ├── bootstrap.sh            # macOS: brew + build VSG/vsgQt into ./.deps
+│   ├── bootstrap.ps1           # Windows: Vulkan SDK + Qt6 + build VSG/vsgQt into ./.deps
+│   ├── run.sh                  # macOS: run with MoltenVK ICD / dylib paths
+│   └── run.ps1                 # Windows: run the exe (PATH + Qt plugins)
 └── README.md
 ```
 
@@ -126,10 +142,10 @@ to the startup cube and to any imported model.
 Selecting **Ray** or **Ray-GS** casts an axis-aligned grid of rays through the
 current `BRep` and draws the stretches of solid material they pass through.
 
-- `Point3d` (`src/Ray.h`) is `std::array<double, 3>`; a `Ray` is a
+- `Point3d` (`lib/geom/Ray.h`) is `std::array<double, 3>`; a `Ray` is a
   `startPoint`/`endPoint` pair and a `RayChain` is the `std::vector<Ray>`
   produced by one cast.
-- `BoundingBox` (`src/BoundingBox.h`) is the axis-aligned extent the grid is
+- `BoundingBox` (`lib/geom/BoundingBox.h`) is the axis-aligned extent the grid is
   laid out over, built with `BoundingBox::fromBRep`.
 - `RayModel::fromBRep(brep, resolution)` holds a `std::vector<RayChain>` for
   each of the x, y and z directions plus the bounding box and the per-axis
@@ -180,7 +196,7 @@ tens of megabytes. The rays belong to the `BRep` they were cast through, so
 `endPoint` becomes one splat, so the result is the sampled surface of the model
 rather than its interior spans.
 
-`createGaussianSplatNode` (`src/GaussianSplat.h`) builds the subgraph from a
+`createGaussianSplatNode` (`lib/graphics/GaussianSplat.h`) builds the subgraph from a
 list of positions, colours and radii. Each splat is a quad that the vertex
 shader positions by transforming the centre into eye space and offsetting the
 corners there, which turns it to face the camera; the fragment shader evaluates

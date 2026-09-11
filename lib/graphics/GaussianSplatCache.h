@@ -71,7 +71,8 @@ public:
                              const SplatStyle& style,
                              bool skipCutSplats = false);
 
-    // Inspection preview: replace the GPU overlay with UV quads in sectionAabb.
+    // Inspection preview: replace the GPU overlay with UV quads in sectionAabb
+    // using the same collect as Subtract (no 3D AABB clip, halo stitch).
     // Does not touch the accumulated Subtraction triangle list.
     void updateSectionGrid(const RayModel& rayModel, int stride, const BoundingBox& sectionAabb,
                            const vsg::vec4& color);
