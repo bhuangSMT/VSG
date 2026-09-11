@@ -42,8 +42,16 @@ struct Splat
     float radius;
 };
 
-// Mutable GPU splat buffers used by the incremental cache. Slots may have
-// radius <= 0 (padding); the shader clips those away.
+// cellRadius is already in the space applyFit() maps into (and includes
+// stride). modelLength is the interval extent in model space; cellDiag is
+// the lateral cell diagonal in the same space. The returned radius never
+// exceeds half the fitted span, so a thin beam or a short leftover after a
+// cut cannot bloom into empty air.
+float splatRadiusForSpan(float cellRadius, double modelLength, double cellDiag, int stride);
+
+// Mutable GPU splat buffers. After a packed rebuild only `setDrawCount`
+// slots are issued; padding is not submitted. The shader also clips
+// radius <= 0 so a sparse updateRegion path can hide free-list holes.
 class GaussianSplatSet
 {
 public:
@@ -55,6 +63,9 @@ public:
     void set(std::size_t index, const Splat& splat);
     void clearSlot(std::size_t index);
     void markDirty();
+    // How many packed slots the draw issues. Unused tail / free-list holes
+    // are not submitted, so a leftover radius on the GPU cannot appear.
+    void setDrawCount(std::size_t splatCount);
 
     std::size_t capacity() const { return _capacity; }
     vsg::ref_ptr<vsg::Node> node() const { return _root; }
@@ -65,8 +76,10 @@ private:
     void initSlotGeometry(std::size_t beginSplat, std::size_t endSplat);
     void zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat);
     void bindDrawArrays();
+    void applyDrawCount();
 
     std::size_t _capacity = 0;
+    std::size_t _drawCount = 0;
     vsg::ref_ptr<vsg::vec4Array> _centerRadius;
     vsg::ref_ptr<vsg::vec2Array> _corners;
     vsg::ref_ptr<vsg::vec4Array> _colors;

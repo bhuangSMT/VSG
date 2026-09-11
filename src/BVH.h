@@ -5,14 +5,15 @@
 // is an infinite line along one axis: it ignores that axis entirely and reduces
 // to a point-in-rectangle test against each node's footprint in the other two.
 //
-// Node bounds are floats taken directly from the (float) vertex positions, so
-// they are exact rather than conservative: a node's bound is the same value the
-// per-triangle test would compute, and no triangle can be rejected here that
-// the exact test would have accepted.
+// Node bounds are floats taken from the vertex positions, expanded by one
+// float ULP on query so a double sample sitting on a shared edge is not
+// dropped by the AABB test while the exact triangle test would accept it.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 #include "BoundingBox.h"
@@ -111,8 +112,14 @@ void BVH::query(std::size_t u, std::size_t v, double u0, double v0, Visitor&& vi
     {
         const Node& node = _nodes[stack[--depth]];
 
-        if (u0 < node.min[u] || u0 > node.max[u] ||
-            v0 < node.min[v] || v0 > node.max[v])
+        // Node AABBs are float; the sample is double. Expand by one float ULP
+        // so a sample that sits on a shared edge is not rejected here and then
+        // accepted by the exact triangle test (or the reverse).
+        const double minU = std::nextafter(node.min[u], -std::numeric_limits<float>::infinity());
+        const double maxU = std::nextafter(node.max[u], std::numeric_limits<float>::infinity());
+        const double minV = std::nextafter(node.min[v], -std::numeric_limits<float>::infinity());
+        const double maxV = std::nextafter(node.max[v], std::numeric_limits<float>::infinity());
+        if (u0 < minU || u0 > maxU || v0 < minV || v0 > maxV)
             continue;
 
         if (node.faceCount != 0)

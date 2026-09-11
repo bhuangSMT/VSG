@@ -1,12 +1,25 @@
 #include "GaussianSplat.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 
 namespace app
 {
+
+float splatRadiusForSpan(float cellRadius, double modelLength, double cellDiag, int stride)
+{
+    if (!(cellRadius > 0.0f) || !(cellDiag > 0.0) || stride < 1) return cellRadius;
+    if (!(modelLength > 0.0)) return cellRadius;
+
+    const double fittedLength = modelLength * (static_cast<double>(cellRadius) /
+                                               (cellDiag * static_cast<double>(stride)));
+    const float cap = static_cast<float>(0.5 * fittedLength);
+    if (!(cap > 0.0f)) return cellRadius;
+    return std::min(cellRadius, cap);
+}
 
 namespace
 {
@@ -285,7 +298,7 @@ void GaussianSplatSet::bindDrawArrays()
 
     _draw->assignArrays(vsg::DataList{_centerRadius, _corners, _colors, _normals});
     _draw->assignIndices(_indices);
-    _draw->indexCount = static_cast<std::uint32_t>(_indices->size());
+    applyDrawCount();
     _draw->instanceCount = 1;
 
     if (!_root)
@@ -348,6 +361,7 @@ void GaussianSplatSet::ensureCapacity(std::size_t needed)
     _normals = normals;
     _indices = indices;
     _capacity = newCap;
+    if (_drawCount > _capacity) _drawCount = _capacity;
 
     initSlotGeometry(oldCap, newCap);
     zeroDynamicRange(oldCap, newCap);
@@ -359,6 +373,7 @@ void GaussianSplatSet::resize(std::size_t splatCount)
     if (splatCount == 0)
     {
         _capacity = 0;
+        _drawCount = 0;
         _centerRadius = nullptr;
         _corners = nullptr;
         _colors = nullptr;
@@ -392,6 +407,7 @@ void GaussianSplatSet::resize(std::size_t splatCount)
         _normals->properties.dataVariance = vsg::DYNAMIC_DATA;
 
         _capacity = splatCount;
+        _drawCount = splatCount;
         initSlotGeometry(0, splatCount);
         zeroDynamicRange(0, splatCount);
         bindDrawArrays();
@@ -428,6 +444,20 @@ void GaussianSplatSet::markDirty()
     if (_centerRadius) _centerRadius->dirty();
     if (_colors) _colors->dirty();
     if (_normals) _normals->dirty();
+}
+
+void GaussianSplatSet::setDrawCount(std::size_t splatCount)
+{
+    _drawCount = splatCount;
+    if (_drawCount > _capacity) _drawCount = _capacity;
+    applyDrawCount();
+}
+
+void GaussianSplatSet::applyDrawCount()
+{
+    if (!_draw) return;
+    const auto n = (_drawCount < _capacity) ? _drawCount : _capacity;
+    _draw->indexCount = static_cast<std::uint32_t>(n * 6);
 }
 
 vsg::ref_ptr<vsg::Node> createGaussianSplatNode(const std::vector<Splat>& splats)

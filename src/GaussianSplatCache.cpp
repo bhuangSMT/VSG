@@ -63,10 +63,11 @@ const char* toString(PatchResult result)
 void GaussianSplatCache::clear()
 {
     // Soft clear: keep GPU capacity/pipelines so the next rebuild stays warm.
-    if (_live > 0)
+    // After updateRegion, used slots are not a packed prefix — _live is only
+    // the allocated count — so every slot in the buffer has to be zeroed.
+    if (_capacity > 0)
     {
-        const auto end = std::min(_live, _capacity);
-        for (std::size_t i = 0; i < end; ++i)
+        for (std::size_t i = 0; i < _capacity; ++i)
             _set.clearSlot(i);
         _set.markDirty();
     }
@@ -77,7 +78,11 @@ void GaussianSplatCache::clear()
     _resolution = Point3d{0.0, 0.0, 0.0};
     _stride = 0;
     _live = 0;
+    _allocEnd = 0;
+    _gpuNeedsCompile = false;
+    _sectionAabb = {};
     _capacity = _set.capacity();
+    _set.setDrawCount(0);
 }
 
 void GaussianSplatCache::release()
@@ -90,6 +95,9 @@ void GaussianSplatCache::release()
     _stride = 0;
     _capacity = 0;
     _live = 0;
+    _allocEnd = 0;
+    _gpuNeedsCompile = true;
+    _sectionAabb = {};
 }
 
 bool GaussianSplatCache::layoutMatches(const RayModel& rayModel, int stride) const
@@ -205,6 +213,8 @@ bool GaussianSplatCache::allocBlock(std::uint32_t length, std::uint32_t* outFirs
         }
         *outFirst = first;
         _live += length;
+        const std::uint32_t end = first + length;
+        if (end > _allocEnd) _allocEnd = end;
         return true;
     }
     return false;
@@ -227,6 +237,11 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
     const std::size_t v = (axis + 2) % 3;
     const double u0 = grid->sampleU(iu);
     const double v0 = grid->sampleV(iv);
+    const double cellDiag = std::sqrt(static_cast<double>(grid->spacingU) *
+                                          static_cast<double>(grid->spacingU) +
+                                      static_cast<double>(grid->spacingV) *
+                                          static_cast<double>(grid->spacingV));
+    const int stride = (_stride > 0) ? _stride : 1;
 
     vsg::vec4 stock = style.stockColor;
     stock.a = style.opacity;
@@ -250,18 +265,26 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
             start[v] = v0;
             end[v] = v0;
 
+            const double modelLength = end[axis] - start[axis];
+            const float startRadius = splatRadiusForSpan(
+                _sectionAabb.contains(start) ? radius * 0.5f : radius, modelLength, cellDiag,
+                stride);
+            const float endRadius = splatRadiusForSpan(
+                _sectionAabb.contains(end) ? radius * 0.5f : radius, modelLength, cellDiag,
+                stride);
+
             const vsg::vec4& color = span.fromBoolean() ? tool : stock;
             const auto base = static_cast<std::size_t>(ref.first + written);
             _set.set(base,
                      {vsg::vec3(static_cast<float>(start[0]),
                                 static_cast<float>(start[1]),
                                 static_cast<float>(start[2])),
-                      normalOrAxis(span.beginNormal, axis, true), color, radius});
+                      normalOrAxis(span.beginNormal, axis, true), color, startRadius});
             _set.set(base + 1,
                      {vsg::vec3(static_cast<float>(end[0]),
                                 static_cast<float>(end[1]),
                                 static_cast<float>(end[2])),
-                      normalOrAxis(span.endNormal, axis, false), color, radius});
+                      normalOrAxis(span.endNormal, axis, false), color, endRadius});
             written += 2;
         }
     }
@@ -349,8 +372,10 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
 vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
                                                     int stride,
                                                     const std::array<float, 3>& radii,
-                                                    const SplatStyle& style)
+                                                    const SplatStyle& style,
+                                                    const BoundingBox& sectionAabb)
 {
+    _sectionAabb = sectionAabb;
     auto lock = rayModel.lockChains();
 
     if (rayModel.rayCount() == 0)
@@ -363,7 +388,6 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     _freeList.clear();
     _resolution = rayModel.resolution();
     _stride = stride;
-    const std::size_t previousLive = _live;
     _live = 0;
 
     std::array<std::vector<std::uint32_t>, 3> needs{};
@@ -410,13 +434,20 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     if (live == 0)
         throw std::runtime_error("The ray model contains no rays; try a coarser resolution.");
 
-    // Full 2x headroom: the tail becomes free-list space, so later cuts can grow
-    // cells in place instead of forcing a rebuild (GPU capacity cannot grow
-    // mid-cut without recompiling the live draw node).
-    const std::size_t minCapacity = live * 2;
-    _set.ensureCapacity(minCapacity);
+    // Reuse the compiled arrays when they already hold the packed prefix.
+    // Growing (or the first alloc) rebinds BufferInfos and needs compile.
+    // 2x headroom is only reserved when we have to allocate anyway, so a
+    // later patch can grow cells without a new GPU buffer.
+    const std::size_t capBefore = _set.capacity();
+    const bool hadNode = _set.node() != nullptr;
+    if (capBefore < live)
+        _set.ensureCapacity(live * 2);
+    _gpuNeedsCompile = !hadNode || _set.capacity() != capBefore;
     _capacity = _set.capacity();
     _live = live;
+    _allocEnd = 0;
+    if (live > 0)
+        _allocEnd = static_cast<std::uint32_t>(live);
 
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
@@ -445,19 +476,14 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
         });
     }
 
-    // Drop endpoints that disappeared since the last pack; retained slack stays empty.
-    if (previousLive > live)
-    {
-        for (std::size_t i = live; i < previousLive && i < _capacity; ++i)
-            _set.clearSlot(i);
-    }
-
+    // Unused tail is not submitted. Do not walk it: the draw count is `live`.
     if (_capacity > live)
     {
         _freeList.push_back(FreeRange{static_cast<std::uint32_t>(live),
                                       static_cast<std::uint32_t>(_capacity - live)});
     }
 
+    _set.setDrawCount(live);
     _set.markDirty();
     return _set.node();
 }
@@ -466,10 +492,12 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
                                              const BoundingBox& modelAabb,
                                              int stride,
                                              const std::array<float, 3>& radii,
-                                             const SplatStyle& style)
+                                             const SplatStyle& style,
+                                             const BoundingBox& sectionAabb)
 {
     if (!layoutMatches(rayModel, stride)) return PatchResult::LayoutChanged;
     if (!modelAabb.valid()) return PatchResult::LayoutChanged;
+    _sectionAabb = sectionAabb;
 
     auto lock = rayModel.lockChains();
 
@@ -495,6 +523,10 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
         }
     }
 
+    // Allocated slots can sit past the last packed prefix. Draw through
+    // _allocEnd only: the unused tail is not submitted, even if leftover
+    // radius is still in memory. Freed holes below _allocEnd were cleared.
+    _set.setDrawCount(_allocEnd);
     _set.markDirty();
     return PatchResult::Ok;
 }

@@ -201,8 +201,11 @@ private:
 
     SplatStyle splatStyle() const;
 
-    // Full Ray-GS rebuild through the Gaussian cache, then attach.
+    // Full Ray-GS rebuild through the Gaussian cache, then attach
+    // only when the GPU node is new or its arrays grew.
     void rebuildSplatCache();
+    void presentSplatCache();
+    bool splatOnScreen() const;
 
     // One --profile line for a completed cut. drawPath names how the display
     // was refreshed: "patch" (splat AABB update), "rebuild" or "no-draw".

@@ -25,6 +25,13 @@ public:
 
     bool valid() const { return _valid; }
 
+    bool contains(const Point3d& p) const
+    {
+        if (!_valid) return false;
+        return p[0] >= _min[0] && p[0] <= _max[0] && p[1] >= _min[1] && p[1] <= _max[1] &&
+               p[2] >= _min[2] && p[2] <= _max[2];
+    }
+
     const Point3d& min() const { return _min; }
     const Point3d& max() const { return _max; }
 

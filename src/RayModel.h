@@ -16,6 +16,7 @@
 #include "BoundingBox.h"
 #include "Ray.h"
 #include "RayGrid.h"
+#include "RayHit.h"
 
 namespace app
 {
@@ -58,6 +59,9 @@ public:
     std::size_t rayCount() const; // total remaining intervals across grids
     std::size_t intervalCount() const { return rayCount(); }
 
+    // Hit pairing leftovers from the last fromBRep / booleanInPlace.
+    const PairingStats& pairingStats() const { return _pairingStats; }
+
     static constexpr int maxStride = 1024;
     int strideForRayBudget(std::size_t maxRays) const;
     std::size_t rayCountAtStride(int stride) const;
@@ -77,6 +81,7 @@ private:
     std::array<std::optional<RayGrid>, 3> _grids;
     BoundingBox _bounds;
     Point3d _resolution{0.0, 0.0, 0.0};
+    PairingStats _pairingStats;
 
     mutable std::recursive_mutex _chainMutex;
 };

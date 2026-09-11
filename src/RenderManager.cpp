@@ -421,9 +421,29 @@ void RenderManager::rebuildSplatCache()
     if (!_rayModel) return;
 
     const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
-    auto drawable =
-        _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle());
-    attach(applyFit(drawable, _rayModel->bounds()), true);
+    _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle());
+    presentSplatCache();
+}
+
+bool RenderManager::splatOnScreen() const
+{
+    if (!_modelNode || !_splatCache.node()) return false;
+    if (_modelNode == _splatCache.node()) return true;
+    const auto* xform = dynamic_cast<const vsg::MatrixTransform*>(_modelNode.get());
+    if (!xform || xform->children.empty()) return false;
+    return xform->children.front() == _splatCache.node();
+}
+
+void RenderManager::presentSplatCache()
+{
+    if (!_splatCache.node() || !_rayModel) return;
+    if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
+    {
+        attach(applyFit(_splatCache.node(), _rayModel->bounds()), true);
+        return;
+    }
+    _splatCache.markDirty();
+    if (_viewer) _viewer->request();
 }
 
 vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel) const
@@ -477,6 +497,12 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
                     start[v] = v0;
                     end[v] = v0;
 
+                    const double cellDiag = std::sqrt(
+                        static_cast<double>(grid->spacingU) * static_cast<double>(grid->spacingU) +
+                        static_cast<double>(grid->spacingV) * static_cast<double>(grid->spacingV));
+                    const float spanRadius =
+                        splatRadiusForSpan(radius, end[axis] - start[axis], cellDiag, stride);
+
                     auto normalOrAxis = [axis](const Normal3f& n, bool enter) {
                         const float len2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
                         if (len2 < 1.0e-12f)
@@ -492,11 +518,11 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
                     splats.push_back({vsg::vec3(static_cast<float>(start[0]),
                                                 static_cast<float>(start[1]),
                                                 static_cast<float>(start[2])),
-                                      normalOrAxis(span.beginNormal, true), splatColor, radius});
+                                      normalOrAxis(span.beginNormal, true), splatColor, spanRadius});
                     splats.push_back({vsg::vec3(static_cast<float>(end[0]),
                                                 static_cast<float>(end[1]),
                                                 static_cast<float>(end[2])),
-                                      normalOrAxis(span.endNormal, false), splatColor, radius});
+                                      normalOrAxis(span.endNormal, false), splatColor, spanRadius});
                 }
             }
         }
@@ -544,6 +570,13 @@ void RenderManager::setRayModel(RayModel model)
 
     touchRayModel(resolution);
     _sourceRayModel = &_rayModels.at(resolution);
+    if (_profiling)
+    {
+        const PairingStats& s = _sourceRayModel->pairingStats();
+        std::printf("cast pairing  odd-rays %lld  unmatched enter %lld leave %lld  slivers %lld\n",
+                    s.oddHitRays, s.unmatchedEnter, s.unmatchedLeave, s.sliversDropped);
+        std::fflush(stdout);
+    }
     applyBooleanToRayModel();
 }
 
@@ -596,7 +629,9 @@ void RenderManager::clearRayModels()
     _rayModels.clear();
     _rayModelOrder.clear();
     _cachedRays = 0;
-    _splatCache.clear();
+    // Drop the VSG splat subgraph and GPU arrays so the next model cannot
+    // inherit compiled slots from this one.
+    _splatCache.release();
 }
 
 void RenderManager::setViewMode(ViewMode mode)
@@ -1190,7 +1225,7 @@ void RenderManager::applyBooleanToRayModel()
             if (wasInspecting) restoreAabb = _inspectionPrevAabb;
             // Patch when the previous display was already original stock
             // (plus at most the last preview hole). Accumulated cuts need a
-            // full rebuild so old holes do not linger in the splat cache.
+            // packed refill so old holes do not linger in the splat cache.
             haveDirtyRegion = currentDirty.valid() && (wasInspecting || showingSource);
             _inspectionPrevAabb = currentDirty;
         }
@@ -1240,18 +1275,20 @@ void RenderManager::applyBooleanToRayModel()
         const auto patchStart = ProfileClock::now();
         const auto radii = splatRadii(*_rayModel, stride);
         const SplatStyle style = splatStyle();
+        const BoundingBox& sectionAabb = dirtyModelAabb;
         PatchResult patched = PatchResult::Ok;
         if (restoreAabb.valid())
         {
-            patched = _splatCache.updateRegion(*_rayModel, restoreAabb, stride, radii, style);
+            patched = _splatCache.updateRegion(*_rayModel, restoreAabb, stride, radii, style,
+                                               sectionAabb);
             if (patched == PatchResult::Ok && dirtyModelAabb.valid())
-                patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
-                                                   radii, style);
+                patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii,
+                                                   style, sectionAabb);
         }
         else
         {
-            patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride,
-                                               radii, style);
+            patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii, style,
+                                               sectionAabb);
         }
         if (patched == PatchResult::Ok)
         {
@@ -1259,7 +1296,6 @@ void RenderManager::applyBooleanToRayModel()
             if (_viewer) _viewer->request();
             return;
         }
-        // updateRegion bailed part way through; the rebuild below repacks it.
         if (_profiling)
             std::printf("  splat patch failed (%s) after %.2f ms\n",
                         toString(patched), millisSince(patchStart));
@@ -1268,7 +1304,17 @@ void RenderManager::applyBooleanToRayModel()
     if (usesRayModel(_viewMode))
     {
         const auto rebuildStart = ProfileClock::now();
-        rebuild();
+        if (_viewMode == ViewMode::RayGS)
+        {
+            const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+            _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
+                                dirtyModelAabb);
+            presentSplatCache();
+        }
+        else
+        {
+            rebuild();
+        }
         logCutProfile(booleanMs, "rebuild", millisSince(rebuildStart), dirtyModelAabb);
     }
     else
@@ -1307,6 +1353,12 @@ void RenderManager::logCutProfile(double booleanMs, const char* drawPath, double
                 _cutIndex, booleanMs + drawMs, booleanMs, drawPath, drawMs,
                 windowCells, sweepTris,
                 liveIntervals, poolRatio, splatLive, splatCap, splatFill * 100.0);
+    if (_rayModel)
+    {
+        const PairingStats& s = _rayModel->pairingStats();
+        std::printf("  pairing  odd-rays %lld  unmatched enter %lld leave %lld  slivers %lld\n",
+                    s.oddHitRays, s.unmatchedEnter, s.unmatchedLeave, s.sliversDropped);
+    }
     std::fflush(stdout);
 }
 

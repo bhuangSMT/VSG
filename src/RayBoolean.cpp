@@ -16,18 +16,13 @@
 #include "BoundingBox.h"
 #include "BVH.h"
 #include "RayGrid.h"
+#include "RayHit.h"
 #include "TriangleMesh.h"
 
 namespace app
 {
 namespace
 {
-
-struct Hit
-{
-    double along = 0.0;
-    Normal3f normal{0.0f, 0.0f, 0.0f};
-};
 
 struct WorldSweep
 {
@@ -47,22 +42,10 @@ Normal3f toNormal3f(const vsg::dvec3& n)
                     static_cast<float>(n.z / len)};
 }
 
-void sortAndMerge(std::vector<Hit>& hits, double tolerance)
-{
-    std::sort(hits.begin(), hits.end(),
-              [](const Hit& lhs, const Hit& rhs) { return lhs.along < rhs.along; });
-
-    auto last = std::unique(hits.begin(), hits.end(),
-                            [tolerance](const Hit& lhs, const Hit& rhs) {
-                                return std::abs(rhs.along - lhs.along) <= tolerance;
-                            });
-    hits.erase(last, hits.end());
-}
-
 void collectHits(const WorldSweep& sweep,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
-                 std::vector<Hit>& hits)
+                 std::vector<RayHit>& hits)
 {
     hits.clear();
     if (sweep.bvh.empty()) return;
@@ -92,7 +75,7 @@ void collectHits(const WorldSweep& sweep,
         const double hiU = std::max({au, bu, cu});
         const double loV = std::min({av, bv, cv});
         const double hiV = std::max({av, bv, cv});
-        if (u0w < loU || u0w > hiU || v0w < loV || v0w > hiV) return;
+        if (!pointInUvBounds(u0w, v0w, loU, hiU, loV, hiV)) return;
 
         const double denom = (bv - cv) * (au - cu) + (cu - bu) * (av - cv);
         const double areaScale = (hiU - loU) * (hiV - loV);
@@ -101,7 +84,7 @@ void collectHits(const WorldSweep& sweep,
         const double w0 = ((bv - cv) * (u0w - cu) + (cu - bu) * (v0w - cv)) / denom;
         const double w1 = ((cv - av) * (u0w - cu) + (au - cu) * (v0w - cv)) / denom;
         const double w2 = 1.0 - w0 - w1;
-        if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) return;
+        if (!barycentricInside(w0, w1, w2)) return;
 
         const double alongWorld = w0 * a[axis] + w1 * b[axis] + w2 * c[axis];
 
@@ -118,28 +101,8 @@ void collectHits(const WorldSweep& sweep,
         const vsg::dvec4 nModel4 =
             sweep.worldToModel * vsg::dvec4(nWorld.x, nWorld.y, nWorld.z, 0.0);
 
-        hits.push_back(Hit{modelHit[axis], toNormal3f(vsg::dvec3(nModel4.x, nModel4.y, nModel4.z))});
+        hits.push_back(RayHit{modelHit[axis], toNormal3f(vsg::dvec3(nModel4.x, nModel4.y, nModel4.z))});
     });
-}
-
-std::vector<Interval> removalTicksFromHits(std::vector<Hit>& hits,
-                                           const RayGrid& grid,
-                                           double mergeTol)
-{
-    sortAndMerge(hits, mergeTol);
-
-    std::vector<Interval> intervals;
-    for (std::size_t i = 0; i + 1 < hits.size(); i += 2)
-    {
-        Interval iv;
-        iv.begin = grid.toTick(hits[i].along);
-        iv.end = grid.toTick(hits[i + 1].along);
-        iv.beginNormal = hits[i].normal;
-        iv.endNormal = hits[i + 1].normal;
-        iv.setFromBoolean(true);
-        if (iv.end > iv.begin) intervals.push_back(iv);
-    }
-    return intervals;
 }
 
 std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
@@ -230,15 +193,17 @@ struct PendingUpdate
 
 struct CellScratch
 {
-    std::vector<Hit> hits;
+    std::vector<RayHit> hits;
     std::vector<Interval> current;
     std::vector<PendingUpdate> pending;
+    PairingStats pairing;
 };
 
 void processAxisGrid(RayGrid& grid,
                      const WorldSweep& sweep,
                      BooleanOp op,
-                     double mergeTol)
+                     double mergeTol,
+                     PairingStats& pairing)
 {
     if (grid.empty() || !sweep.worldBounds.valid()) return;
 
@@ -276,8 +241,9 @@ void processAxisGrid(RayGrid& grid,
                 collectHits(sweep, axis, u, v, u0, v0, local.hits);
                 if (local.hits.size() < 2) continue;
 
-                const std::vector<Interval> sweepSolid =
-                    removalTicksFromHits(local.hits, grid, mergeTol);
+                std::vector<Interval> sweepSolid;
+                intervalsFromHits(local.hits, grid, axis, mergeTol, true, sweepSolid,
+                                  &local.pairing);
                 if (sweepSolid.empty()) continue;
 
                 local.current.clear();
@@ -307,6 +273,7 @@ void processAxisGrid(RayGrid& grid,
     {
         pending.insert(pending.end(), std::make_move_iterator(local.pending.begin()),
                        std::make_move_iterator(local.pending.end()));
+        pairing += local.pairing;
     }
     std::sort(pending.begin(), pending.end(),
               [](const PendingUpdate& lhs, const PendingUpdate& rhs) {
@@ -448,12 +415,14 @@ void applyBooleanInPlace(RayModel& model,
 
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
+    model._pairingStats = {};
+
     // Axes share nothing, but nested TBB (axis × cell) raced the interval
     // pool. Walk axes in order; each axis still parallelizes its dirty window.
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
         if (RayGrid* g = model.grid(axis))
-            processAxisGrid(*g, worldSweep, op, mergeTol);
+            processAxisGrid(*g, worldSweep, op, mergeTol, model._pairingStats);
     }
 }
 

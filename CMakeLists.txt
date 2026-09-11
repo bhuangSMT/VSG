@@ -78,6 +78,7 @@ set(VSG_QT_CUBE_SOURCES
     src/GaussianSplatCache.cpp
     src/ModelPick.cpp
     src/Parameter.cpp
+    src/RayHit.cpp
     src/RayModel.cpp
     src/RayBoolean.cpp
     src/RenderManager.cpp
@@ -117,6 +118,7 @@ add_executable(profile_hotspots
     src/BoundingBox.cpp
     src/GaussianSplat.cpp
     src/GaussianSplatCache.cpp
+    src/RayHit.cpp
     src/RayModel.cpp
     src/RayBoolean.cpp
     src/SweptVolume.cpp

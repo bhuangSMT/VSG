@@ -9,10 +9,13 @@
 #include <utility>
 #include <vector>
 
+#include <tbb/combinable.h>
+
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
 #include "BRep.h"
+#include "RayHit.h"
 
 namespace app
 {
@@ -145,17 +148,11 @@ std::vector<CastFace> buildCastFaces(const BRep& brep)
     return faces;
 }
 
-struct Hit
-{
-    double along = 0.0;
-    Normal3f normal{0.0f, 0.0f, 0.0f};
-};
-
 void collectHits(const std::vector<CastFace>& faces,
                  const BVH& bvh,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
-                 std::vector<Hit>& hits)
+                 std::vector<RayHit>& hits)
 {
     hits.clear();
 
@@ -166,14 +163,14 @@ void collectHits(const std::vector<CastFace>& faces,
 
         const CastFace::AxisProj& p = face.proj[axis];
         if (!p.usable) return;
-        if (u0 < p.loU || u0 > p.hiU || v0 < p.loV || v0 > p.hiV) return;
+        if (!pointInUvBounds(u0, v0, p.loU, p.hiU, p.loV, p.hiV)) return;
 
         const double w0 = p.w0u * u0 + p.w0v * v0 + p.w0c;
         const double w1 = p.w1u * u0 + p.w1v * v0 + p.w1c;
         const double w2 = 1.0 - w0 - w1;
-        if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) return;
+        if (!barycentricInside(w0, w1, w2)) return;
 
-        Hit hit;
+        RayHit hit;
         hit.along = w0 * face.a[axis] + w1 * face.b[axis] + w2 * face.c[axis];
         hit.normal = face.normal;
         hits.push_back(hit);
@@ -186,18 +183,6 @@ void collectHits(const std::vector<CastFace>& faces,
     }
 
     bvh.query(u, v, u0, v0, test);
-}
-
-void sortAndMerge(std::vector<Hit>& hits, double tolerance)
-{
-    std::sort(hits.begin(), hits.end(),
-              [](const Hit& lhs, const Hit& rhs) { return lhs.along < rhs.along; });
-
-    auto last = std::unique(hits.begin(), hits.end(),
-                            [tolerance](const Hit& lhs, const Hit& rhs) {
-                                return std::abs(rhs.along - lhs.along) <= tolerance;
-                            });
-    hits.erase(last, hits.end());
 }
 
 Point3d finestWithin(const BoundingBox& bounds, const Point3d& requested)
@@ -312,14 +297,16 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
         const auto castCountSz = static_cast<std::size_t>(castCount);
 
         std::vector<std::vector<Interval>> slotIntervals(castCountSz);
+        tbb::combinable<PairingStats> pairing;
 
         tbb::parallel_for(
             tbb::blocked_range<int>(0, castCount),
             [&](const tbb::blocked_range<int>& range) {
-                std::vector<Hit> hits;
+                std::vector<RayHit> hits;
                 hits.reserve(8);
                 std::vector<Interval> local;
                 local.reserve(4);
+                PairingStats& localStats = pairing.local();
                 for (int cast = range.begin(); cast != range.end(); ++cast)
                 {
                     const std::uint32_t iu =
@@ -332,18 +319,7 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
                     collectHits(castFaces, bvh, axis, u, v, u0, v0, hits);
                     if (hits.size() < 2) continue;
 
-                    sortAndMerge(hits, tolerance);
-
-                    local.clear();
-                    for (std::size_t h = 0; h + 1 < hits.size(); h += 2)
-                    {
-                        Interval ivSpan;
-                        ivSpan.begin = grid.toTick(hits[h].along);
-                        ivSpan.end = grid.toTick(hits[h + 1].along);
-                        ivSpan.beginNormal = hits[h].normal;
-                        ivSpan.endNormal = hits[h + 1].normal;
-                        if (ivSpan.end > ivSpan.begin) local.push_back(ivSpan);
-                    }
+                    intervalsFromHits(hits, grid, axis, tolerance, false, local, &localStats);
                     if (!local.empty())
                     {
                         slotIntervals[static_cast<std::size_t>(cast)] = std::move(local);
@@ -352,6 +328,8 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
                     }
                 }
             });
+
+        pairing.combine_each([&](const PairingStats& s) { model._pairingStats += s; });
 
         std::size_t packed = 0;
         for (std::size_t i = 0; i < castCountSz; ++i)
@@ -378,7 +356,8 @@ RayModel RayModel::fromBRep(const BRep& brep, const Point3d& resolution)
 RayModel::RayModel(RayModel&& other) noexcept :
     _grids(std::move(other._grids)),
     _bounds(other._bounds),
-    _resolution(other._resolution)
+    _resolution(other._resolution),
+    _pairingStats(other._pairingStats)
 {
 }
 
@@ -389,6 +368,7 @@ RayModel& RayModel::operator=(RayModel&& other) noexcept
     _grids = std::move(other._grids);
     _bounds = other._bounds;
     _resolution = other._resolution;
+    _pairingStats = other._pairingStats;
     return *this;
 }
 

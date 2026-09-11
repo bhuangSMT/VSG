@@ -45,19 +45,22 @@ public:
     // Soft per-cell ceiling (not reserved storage). Larger counts force rebuild.
     static constexpr int maxEndpointsPerCell = 64;
 
-    void clear();   // Invalidate layout; keep GPU buffers for a warm rebuild.
-    void release(); // Free GPU buffers (cold next rebuild). Used for teardown/profile.
+    void clear();   // Zero every GPU slot and drop the layout; keep buffers.
+    void release(); // Destroy the VSG splat node and GPU arrays (new model / teardown).
     bool empty() const { return _stride == 0; }
 
     std::size_t capacity() const { return _capacity; }
     std::size_t liveEndpoints() const { return _live; }
 
-    // Full rebuild from the displayed RayModel. Returns the drawable (unfitted).
-    // Throws if the model has no intervals.
+    // Packed refill from the displayed RayModel. Reuses the compiled GPU
+    // arrays when they already hold enough slots. Issues only the packed live
+    // endpoints. Throws if the model has no intervals.
+    // sectionAabb: endpoints inside this box use a smaller radius (cut face).
     vsg::ref_ptr<vsg::Node> rebuild(const RayModel& rayModel,
                                     int stride,
                                     const std::array<float, 3>& radii,
-                                    const SplatStyle& style);
+                                    const SplatStyle& style,
+                                    const BoundingBox& sectionAabb = {});
 
     // Regenerate only cells overlapping modelAabb. Anything but PatchResult::Ok
     // leaves the region partly updated, so the caller has to rebuild.
@@ -65,10 +68,13 @@ public:
                              const BoundingBox& modelAabb,
                              int stride,
                              const std::array<float, 3>& radii,
-                             const SplatStyle& style);
+                             const SplatStyle& style,
+                             const BoundingBox& sectionAabb = {});
 
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
     void markDirty() { _set.markDirty(); }
+    // True when rebuild allocated or grew GPU arrays; the viewer must compile.
+    bool gpuNeedsCompile() const { return _gpuNeedsCompile; }
 
 private:
     struct AxisLayout
@@ -133,6 +139,9 @@ private:
     int _stride = 0;
     std::size_t _capacity = 0;
     std::size_t _live = 0;
+    std::uint32_t _allocEnd = 0; // one past the last allocated slot
+    bool _gpuNeedsCompile = false;
+    BoundingBox _sectionAabb;
 };
 
 } // namespace app
