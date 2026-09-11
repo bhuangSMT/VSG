@@ -332,7 +332,6 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
                 for (std::uint32_t s = 0; s < write.intervalCount; ++s)
                 {
                     const Interval& iv = write.intervals[s];
-                    const vsg::vec4& color = iv.fromBoolean() ? _toolColor : axisColor;
 
                     Point3d start{0.0, 0.0, 0.0};
                     Point3d end{0.0, 0.0, 0.0};
@@ -346,12 +345,12 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
                     (*positions)[point] = vsg::vec3(static_cast<float>(start[0]),
                                                     static_cast<float>(start[1]),
                                                     static_cast<float>(start[2]));
-                    (*colors)[point] = color;
+                    (*colors)[point] = iv.cutBegin() ? _toolColor : axisColor;
                     ++point;
                     (*positions)[point] = vsg::vec3(static_cast<float>(end[0]),
                                                     static_cast<float>(end[1]),
                                                     static_cast<float>(end[2]));
-                    (*colors)[point] = color;
+                    (*colors)[point] = iv.cutEnd() ? _toolColor : axisColor;
                     ++point;
                 }
             }
@@ -418,10 +417,15 @@ SplatStyle RenderManager::splatStyle() const
 
 void RenderManager::rebuildSplatCache()
 {
-    if (!_rayModel) return;
+    if (!_rayModel || _rayModel->rayCount() == 0) return;
 
     const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
-    _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle());
+    const BoundingBox section =
+        Parameter::instance().booleanOp() == BooleanOp::Inspection ? _inspectionPrevAabb
+                                                                  : BoundingBox{};
+    _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
+                        section);
+    syncInspectionSectionGrid(section);
     presentSplatCache();
 }
 
@@ -440,10 +444,24 @@ void RenderManager::presentSplatCache()
     if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
     {
         attach(applyFit(_splatCache.node(), _rayModel->bounds()), true);
+        _splatCache.noteCompiled();
         return;
     }
     _splatCache.markDirty();
     if (_viewer) _viewer->request();
+}
+
+void RenderManager::syncInspectionSectionGrid(const BoundingBox& sectionAabb)
+{
+    if (_viewMode != ViewMode::RayGS || !_rayModel ||
+        Parameter::instance().booleanOp() != BooleanOp::Inspection || !sectionAabb.valid())
+    {
+        _splatCache.clearSectionGrid();
+        return;
+    }
+
+    const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+    _splatCache.updateSectionGrid(*_rayModel, stride, sectionAabb, splatStyle().stockColor);
 }
 
 vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel) const
@@ -514,15 +532,16 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
                         return vsg::vec3(n[0], n[1], n[2]);
                     };
 
-                    const vsg::vec4& splatColor = span.fromBoolean() ? toolColor : color;
                     splats.push_back({vsg::vec3(static_cast<float>(start[0]),
                                                 static_cast<float>(start[1]),
                                                 static_cast<float>(start[2])),
-                                      normalOrAxis(span.beginNormal, true), splatColor, spanRadius});
+                                      normalOrAxis(span.beginNormal, true),
+                                      span.cutBegin() ? toolColor : color, spanRadius});
                     splats.push_back({vsg::vec3(static_cast<float>(end[0]),
                                                 static_cast<float>(end[1]),
                                                 static_cast<float>(end[2])),
-                                      normalOrAxis(span.endNormal, false), splatColor, spanRadius});
+                                      normalOrAxis(span.endNormal, false),
+                                      span.cutEnd() ? toolColor : color, spanRadius});
                 }
             }
         }
@@ -1175,6 +1194,7 @@ void RenderManager::applyBooleanToRayModel()
     BoundingBox restoreAabb;
     bool haveDirtyRegion = false;
     double booleanMs = 0.0;
+    double cloneMs = 0.0;
     bool raysMutated = false;
 
     // Tool motion calls this on every sweep step, so the branches below that
@@ -1204,7 +1224,9 @@ void RenderManager::applyBooleanToRayModel()
             // Fresh stock every move: clone the cached original, then subtract
             // the cutter at this pose. Do not touch _booleanRayModel.
             _rayModel = nullptr;
+            const auto cloneStart = ProfileClock::now();
             _inspectionRayModel = _sourceRayModel->clone();
+            cloneMs = millisSince(cloneStart);
 
             const BoundingBox bounds = _inspectionRayModel->bounds();
             const vsg::dmat4 modelToWorld = fitMatrix(bounds);
@@ -1275,7 +1297,8 @@ void RenderManager::applyBooleanToRayModel()
         const auto patchStart = ProfileClock::now();
         const auto radii = splatRadii(*_rayModel, stride);
         const SplatStyle style = splatStyle();
-        const BoundingBox& sectionAabb = dirtyModelAabb;
+        const BoundingBox sectionAabb =
+            op == BooleanOp::Inspection ? dirtyModelAabb : BoundingBox{};
         PatchResult patched = PatchResult::Ok;
         if (restoreAabb.valid())
         {
@@ -1292,8 +1315,15 @@ void RenderManager::applyBooleanToRayModel()
         }
         if (patched == PatchResult::Ok)
         {
-            logCutProfile(booleanMs, "patch", millisSince(patchStart), dirtyModelAabb);
-            if (_viewer) _viewer->request();
+            const double splatMs = millisSince(patchStart);
+            const auto sectionStart = ProfileClock::now();
+            syncInspectionSectionGrid(dirtyModelAabb);
+            const double sectionMs = millisSince(sectionStart);
+            logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
+            if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
+                presentSplatCache();
+            else if (_viewer)
+                _viewer->request();
             return;
         }
         if (_profiling)
@@ -1303,29 +1333,48 @@ void RenderManager::applyBooleanToRayModel()
 
     if (usesRayModel(_viewMode))
     {
+        if (!_rayModel || _rayModel->rayCount() == 0)
+        {
+            _splatCache.clear();
+            syncInspectionSectionGrid({});
+            if (_current) attach(createNode(*_current), true);
+            else if (_viewer) _viewer->request();
+            logCutProfile(booleanMs, "no-draw", 0.0, dirtyModelAabb, cloneMs);
+            return;
+        }
+
         const auto rebuildStart = ProfileClock::now();
         if (_viewMode == ViewMode::RayGS)
         {
             const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+            const BoundingBox sectionAabb =
+                op == BooleanOp::Inspection ? dirtyModelAabb : BoundingBox{};
             _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
-                                dirtyModelAabb);
+                                sectionAabb);
+            const double splatMs = millisSince(rebuildStart);
+            const auto sectionStart = ProfileClock::now();
+            syncInspectionSectionGrid(sectionAabb);
+            const double sectionMs = millisSince(sectionStart);
             presentSplatCache();
+            logCutProfile(booleanMs, "rebuild", splatMs, dirtyModelAabb, cloneMs, sectionMs);
         }
         else
         {
             rebuild();
+            logCutProfile(booleanMs, "rebuild", millisSince(rebuildStart), dirtyModelAabb,
+                          cloneMs);
         }
-        logCutProfile(booleanMs, "rebuild", millisSince(rebuildStart), dirtyModelAabb);
     }
     else
     {
-        logCutProfile(booleanMs, "no-draw", 0.0, dirtyModelAabb);
+        logCutProfile(booleanMs, "no-draw", 0.0, dirtyModelAabb, cloneMs);
         if (_viewer) _viewer->request();
     }
 }
 
 void RenderManager::logCutProfile(double booleanMs, const char* drawPath, double drawMs,
-                                  const BoundingBox& dirtyModelAabb)
+                                  const BoundingBox& dirtyModelAabb, double cloneMs,
+                                  double sectionMs)
 {
     if (!_profiling) return;
 
@@ -1347,12 +1396,12 @@ void RenderManager::logCutProfile(double booleanMs, const char* drawPath, double
         _rayModel ? dirtyWindowCells(*_rayModel, dirtyModelAabb) : 0;
     const std::size_t sweepTris = _cutSweep ? _cutSweep->mesh().triangles.size() : 0;
 
-    std::printf("cut %-4lld total %7.2f ms  boolean %7.2f ms  %-7s %6.2f ms"
-                "  window %9zu cells  sweep %6zu tris"
+    std::printf("cut %-4lld total %7.2f ms  clone %6.2f ms  boolean %7.2f ms  %-7s %6.2f ms"
+                "  section %6.2f ms  window %9zu cells  sweep %6zu tris"
                 "  intervals %8zu  pool x%.2f  splat %8zu/%-8zu %3.0f%%\n",
-                _cutIndex, booleanMs + drawMs, booleanMs, drawPath, drawMs,
-                windowCells, sweepTris,
-                liveIntervals, poolRatio, splatLive, splatCap, splatFill * 100.0);
+                _cutIndex, cloneMs + booleanMs + drawMs + sectionMs, cloneMs, booleanMs,
+                drawPath, drawMs, sectionMs, windowCells, sweepTris, liveIntervals, poolRatio,
+                splatLive, splatCap, splatFill * 100.0);
     if (_rayModel)
     {
         const PairingStats& s = _rayModel->pairingStats();

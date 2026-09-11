@@ -26,15 +26,30 @@ struct Interval
     std::int32_t end = 0;
     Normal3f beginNormal{0.0f, 0.0f, 0.0f};
     Normal3f endNormal{0.0f, 0.0f, 0.0f};
-    std::uint8_t flags = 0; // bit0 = fromBoolean
+    std::uint8_t flags = 0; // bit0 = fromBoolean, bit1/2 = cut-face begin/end
 
     static constexpr std::uint8_t flagFromBoolean = 1;
+    static constexpr std::uint8_t flagCutBegin = 2;
+    static constexpr std::uint8_t flagCutEnd = 4;
 
     bool fromBoolean() const { return (flags & flagFromBoolean) != 0; }
     void setFromBoolean(bool on)
     {
         if (on) flags = static_cast<std::uint8_t>(flags | flagFromBoolean);
         else flags = static_cast<std::uint8_t>(flags & ~flagFromBoolean);
+    }
+
+    bool cutBegin() const { return (flags & flagCutBegin) != 0; }
+    bool cutEnd() const { return (flags & flagCutEnd) != 0; }
+    void setCutBegin(bool on)
+    {
+        if (on) flags = static_cast<std::uint8_t>(flags | flagCutBegin);
+        else flags = static_cast<std::uint8_t>(flags & ~flagCutBegin);
+    }
+    void setCutEnd(bool on)
+    {
+        if (on) flags = static_cast<std::uint8_t>(flags | flagCutEnd);
+        else flags = static_cast<std::uint8_t>(flags & ~flagCutEnd);
     }
 };
 

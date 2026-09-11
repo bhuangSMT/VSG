@@ -318,6 +318,7 @@ void GaussianSplatSet::bindDrawArrays()
         colorGroup->addChild(_draw);
         _root->addChild(colorGroup);
     }
+    attachOverlay();
 }
 
 void GaussianSplatSet::ensureCapacity(std::size_t needed)
@@ -460,6 +461,254 @@ void GaussianSplatSet::applyDrawCount()
     if (!_draw) return;
     const auto n = (_drawCount < _capacity) ? _drawCount : _capacity;
     _draw->indexCount = static_cast<std::uint32_t>(n * 6);
+}
+
+void GaussianSplatSet::setOverlay(vsg::ref_ptr<vsg::Node> overlay)
+{
+    _overlay = overlay;
+    attachOverlay();
+}
+
+void GaussianSplatSet::attachOverlay()
+{
+    if (!_root || !_overlay) return;
+    for (auto& child : _root->children)
+    {
+        if (child == _overlay) return;
+    }
+    _root->addChild(_overlay);
+}
+
+namespace
+{
+
+const char* const sectionVertex = R"(
+layout(push_constant) uniform PushConstants
+{
+    mat4 projection;
+    mat4 modelView;
+} pc;
+
+layout(location = 0) in vec3 inPos;
+layout(location = 1) in vec4 inColor;
+layout(location = 2) in vec3 inNormal;
+layout(location = 0) out vec4 color;
+layout(location = 1) out vec3 normalEye;
+
+void main()
+{
+    gl_Position = pc.projection * pc.modelView * vec4(inPos, 1.0);
+    color = inColor;
+    normalEye = mat3(pc.modelView) * inNormal;
+}
+)";
+
+const char* const sectionFragment = R"(
+layout(location = 0) in vec4 color;
+layout(location = 1) in vec3 normalEye;
+layout(location = 0) out vec4 outColor;
+
+void main()
+{
+    const vec3 viewDir = vec3(0.0, 0.0, 1.0);
+    const vec3 lightDir = normalize(vec3(-0.35, 0.45, 0.82));
+
+    vec3 normal = normalEye;
+    float nLen = length(normal);
+    if (nLen < 1e-6) normal = viewDir;
+    else normal /= nLen;
+    if (dot(normal, viewDir) < 0.0) normal = -normal;
+
+    float diffuse = max(dot(normal, lightDir), 0.0);
+    vec3 halfway = normalize(lightDir + viewDir);
+    float specular = pow(max(dot(normal, halfway), 0.0), 70.0);
+
+    vec3 lit = color.rgb * (0.12 + 0.55 * diffuse)
+             + color.rgb * (1.40 * specular);
+    outColor = vec4(lit, color.a);
+}
+)";
+
+vsg::ref_ptr<vsg::GraphicsPipeline> createSectionLinePipeline()
+{
+    auto vertexShader = vsg::ShaderStage::create(VK_SHADER_STAGE_VERTEX_BIT, "main",
+                                                 shaderSource(sectionVertex, false));
+    auto fragmentShader = vsg::ShaderStage::create(VK_SHADER_STAGE_FRAGMENT_BIT, "main",
+                                                   shaderSource(sectionFragment, false));
+
+    vsg::PushConstantRanges pushConstantRanges{{VK_SHADER_STAGE_VERTEX_BIT, 0, 128}};
+    auto pipelineLayout = vsg::PipelineLayout::create(vsg::DescriptorSetLayouts{}, pushConstantRanges);
+
+    vsg::VertexInputState::Bindings vertexBindings{
+        VkVertexInputBindingDescription{0, 12, VK_VERTEX_INPUT_RATE_VERTEX},
+        VkVertexInputBindingDescription{1, 16, VK_VERTEX_INPUT_RATE_VERTEX},
+        VkVertexInputBindingDescription{2, 12, VK_VERTEX_INPUT_RATE_VERTEX}};
+    vsg::VertexInputState::Attributes vertexAttributes{
+        VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+        VkVertexInputAttributeDescription{1, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0},
+        VkVertexInputAttributeDescription{2, 2, VK_FORMAT_R32G32B32_SFLOAT, 0}};
+
+    auto inputAssembly = vsg::InputAssemblyState::create();
+    inputAssembly->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    auto rasterizationState = vsg::RasterizationState::create();
+    rasterizationState->cullMode = VK_CULL_MODE_NONE;
+
+    auto depthStencilState = vsg::DepthStencilState::create();
+    depthStencilState->depthTestEnable = VK_TRUE;
+    depthStencilState->depthWriteEnable = VK_TRUE;
+
+    vsg::GraphicsPipelineStates pipelineStates{
+        vsg::VertexInputState::create(vertexBindings, vertexAttributes),
+        inputAssembly,
+        rasterizationState,
+        vsg::ColorBlendState::create(),
+        depthStencilState};
+
+    return vsg::GraphicsPipeline::create(pipelineLayout,
+                                         vsg::ShaderStages{vertexShader, fragmentShader},
+                                         pipelineStates);
+}
+
+} // namespace
+
+void SectionLineSet::ensurePipeline()
+{
+    if (!_pipeline) _pipeline = createSectionLinePipeline();
+}
+
+void SectionLineSet::applyDrawCount()
+{
+    if (!_draw) return;
+    const auto n = (_drawCount < _capacity) ? _drawCount : _capacity;
+    _draw->indexCount = static_cast<std::uint32_t>(n * 3);
+}
+
+void SectionLineSet::bindDraw()
+{
+    if (!_draw)
+        _draw = vsg::VertexIndexDraw::create();
+
+    _draw->assignArrays(vsg::DataList{_positions, _colors, _normals});
+    _draw->assignIndices(_indices);
+    applyDrawCount();
+    _draw->instanceCount = 1;
+
+    if (!_root)
+    {
+        ensurePipeline();
+        _root = vsg::StateGroup::create();
+        _root->add(vsg::BindGraphicsPipeline::create(_pipeline));
+        _root->addChild(_draw);
+        _needsCompile = true;
+    }
+}
+
+void SectionLineSet::ensureCapacity(std::size_t needed)
+{
+    if (needed == 0) return;
+    if (needed <= _capacity && _root) return;
+
+    ensurePipeline();
+
+    const std::size_t oldCap = _capacity;
+    std::size_t newCap = needed;
+    if (oldCap > 0)
+        newCap = std::max(needed, oldCap + oldCap / 2);
+
+    const auto vertexCount = newCap * 3;
+    auto positions = vsg::vec3Array::create(vertexCount);
+    auto colors = vsg::vec4Array::create(vertexCount);
+    auto normals = vsg::vec3Array::create(vertexCount);
+    auto indices = vsg::uintArray::create(vertexCount);
+
+    positions->properties.dataVariance = vsg::DYNAMIC_DATA;
+    colors->properties.dataVariance = vsg::DYNAMIC_DATA;
+    normals->properties.dataVariance = vsg::DYNAMIC_DATA;
+
+    if (oldCap > 0 && _positions && _colors && _normals && _indices)
+    {
+        const auto oldVerts = oldCap * 3;
+        std::copy_n(_positions->begin(), oldVerts, positions->begin());
+        std::copy_n(_colors->begin(), oldVerts, colors->begin());
+        std::copy_n(_normals->begin(), oldVerts, normals->begin());
+        std::copy_n(_indices->begin(), oldVerts, indices->begin());
+    }
+
+    for (std::size_t i = oldCap * 3; i < vertexCount; ++i)
+    {
+        (*positions)[i] = vsg::vec3(0.0f, 0.0f, 0.0f);
+        (*colors)[i] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+        (*normals)[i] = vsg::vec3(0.0f, 0.0f, 1.0f);
+        (*indices)[i] = static_cast<std::uint32_t>(i);
+    }
+
+    _positions = positions;
+    _colors = colors;
+    _normals = normals;
+    _indices = indices;
+    _capacity = newCap;
+    if (_drawCount > _capacity) _drawCount = _capacity;
+
+    const bool hadRoot = _root != nullptr;
+    bindDraw();
+    if (hadRoot)
+        _needsCompile = true;
+}
+
+void SectionLineSet::setTriangle(std::size_t index, const vsg::vec3& a, const vsg::vec3& b,
+                                 const vsg::vec3& c, const vsg::vec3& na, const vsg::vec3& nb,
+                                 const vsg::vec3& nc, const vsg::vec4& color)
+{
+    if (!_positions || !_normals || index >= _capacity) return;
+    const auto base = index * 3;
+    (*_positions)[base] = a;
+    (*_positions)[base + 1] = b;
+    (*_positions)[base + 2] = c;
+    (*_colors)[base] = color;
+    (*_colors)[base + 1] = color;
+    (*_colors)[base + 2] = color;
+
+    vsg::vec3 face = vsg::cross(b - a, c - a);
+    const float faceLen2 = face.x * face.x + face.y * face.y + face.z * face.z;
+    if (faceLen2 > 1.0e-20f) face = face / std::sqrt(faceLen2);
+    else face = vsg::vec3(0.0f, 0.0f, 1.0f);
+
+    auto orFace = [&](const vsg::vec3& n) {
+        const float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
+        if (len2 < 1.0e-12f) return face;
+        return n;
+    };
+    (*_normals)[base] = orFace(na);
+    (*_normals)[base + 1] = orFace(nb);
+    (*_normals)[base + 2] = orFace(nc);
+}
+
+void SectionLineSet::setDrawCount(std::size_t triangleCount)
+{
+    _drawCount = triangleCount;
+    if (_drawCount > _capacity) _drawCount = _capacity;
+    applyDrawCount();
+}
+
+void SectionLineSet::markDirty()
+{
+    if (_positions) _positions->dirty();
+    if (_colors) _colors->dirty();
+    if (_normals) _normals->dirty();
+}
+
+void SectionLineSet::release()
+{
+    _capacity = 0;
+    _drawCount = 0;
+    _needsCompile = false;
+    _positions = nullptr;
+    _colors = nullptr;
+    _normals = nullptr;
+    _indices = nullptr;
+    _draw = nullptr;
+    _root = nullptr;
 }
 
 vsg::ref_ptr<vsg::Node> createGaussianSplatNode(const std::vector<Splat>& splats)

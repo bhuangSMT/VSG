@@ -125,6 +125,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
                 Interval left = piece;
                 left.end = cut.begin;
                 left.endNormal = cut.beginNormal;
+                left.setCutEnd(true);
                 if (left.end > left.begin) next.push_back(left);
             }
             if (cut.end < piece.end)
@@ -133,6 +134,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
                 right.begin = cut.end;
                 right.beginNormal = cut.endNormal;
                 right.setFromBoolean(true);
+                right.setCutBegin(true);
                 if (right.end > right.begin) next.push_back(right);
             }
         }
@@ -163,6 +165,7 @@ std::vector<Interval> unionTicks(const std::vector<Interval>& solid,
             {
                 cur.end = nxt.end;
                 cur.endNormal = nxt.endNormal;
+                cur.setCutEnd(nxt.cutEnd());
             }
             if (nxt.fromBoolean()) cur.setFromBoolean(true);
         }

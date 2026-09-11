@@ -55,7 +55,6 @@ public:
     // Packed refill from the displayed RayModel. Reuses the compiled GPU
     // arrays when they already hold enough slots. Issues only the packed live
     // endpoints. Throws if the model has no intervals.
-    // sectionAabb: endpoints inside this box use a smaller radius (cut face).
     vsg::ref_ptr<vsg::Node> rebuild(const RayModel& rayModel,
                                     int stride,
                                     const std::array<float, 3>& radii,
@@ -71,10 +70,17 @@ public:
                              const SplatStyle& style,
                              const BoundingBox& sectionAabb = {});
 
+    // Inspection: fill boolean cut-face ends in sectionAabb as a UV triangle
+    // mesh and parent it under the splat Group. Empty/invalid box hides it.
+    void updateSectionGrid(const RayModel& rayModel, int stride, const BoundingBox& sectionAabb,
+                           const vsg::vec4& color);
+    void clearSectionGrid();
+
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
-    void markDirty() { _set.markDirty(); }
+    void markDirty();
     // True when rebuild allocated or grew GPU arrays; the viewer must compile.
-    bool gpuNeedsCompile() const { return _gpuNeedsCompile; }
+    bool gpuNeedsCompile() const { return _gpuNeedsCompile || _section.needsCompile(); }
+    void noteCompiled();
 
 private:
     struct AxisLayout
@@ -142,6 +148,7 @@ private:
     std::uint32_t _allocEnd = 0; // one past the last allocated slot
     bool _gpuNeedsCompile = false;
     BoundingBox _sectionAabb;
+    SectionLineSet _section;
 };
 
 } // namespace app

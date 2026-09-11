@@ -403,7 +403,7 @@ try
         QKeySequence(Qt::CTRL | Qt::Key_U).toString(QKeySequence::NativeText);
     const QString inspectKeys =
         QKeySequence(Qt::CTRL | Qt::Key_I).toString(QKeySequence::NativeText);
-    booleanCombo->addItem(QString("None (%1)").arg(noneKeys),
+    booleanCombo->addItem(QString("Probe (%1)").arg(noneKeys),
                           static_cast<int>(app::BooleanOp::None));
     booleanCombo->addItem(QString("Subtraction (%1)").arg(subtractKeys),
                           static_cast<int>(app::BooleanOp::Subtraction));
@@ -413,7 +413,7 @@ try
                           static_cast<int>(app::BooleanOp::Inspection));
     booleanCombo->setCurrentIndex(0);
     booleanCombo->setToolTip(
-        QString("None: %1\nSubtraction: %2\nUnion: %3\nInspection: %4")
+        QString("Probe: %1\nSubtraction: %2\nUnion: %3\nInspection: %4")
             .arg(noneKeys, subtractKeys, unionKeys, inspectKeys));
     grid->addWidget(booleanCombo, row++, 0);
 

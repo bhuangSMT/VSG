@@ -64,7 +64,12 @@ void intervalsFromHits(std::vector<RayHit>& hits,
         iv.end = grid.toTick(hits[h + 1].along);
         iv.beginNormal = hits[h].normal;
         iv.endNormal = hits[h + 1].normal;
-        if (fromBoolean) iv.setFromBoolean(true);
+        if (fromBoolean)
+        {
+            iv.setFromBoolean(true);
+            iv.setCutBegin(true);
+            iv.setCutEnd(true);
+        }
 
         // 1-tick spans are pairing noise: two almost-coincident endpoints
         // draw as orphan Gaussians. Keep only spans that cover 2+ ticks.

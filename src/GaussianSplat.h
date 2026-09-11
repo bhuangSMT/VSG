@@ -67,6 +67,9 @@ public:
     // are not submitted, so a leftover radius on the GPU cannot appear.
     void setDrawCount(std::size_t splatCount);
 
+    // Section triangle mesh (Inspection cut face) parented under the same Group.
+    void setOverlay(vsg::ref_ptr<vsg::Node> overlay);
+
     std::size_t capacity() const { return _capacity; }
     vsg::ref_ptr<vsg::Node> node() const { return _root; }
     bool empty() const { return !_root || _capacity == 0; }
@@ -77,6 +80,7 @@ private:
     void zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat);
     void bindDrawArrays();
     void applyDrawCount();
+    void attachOverlay();
 
     std::size_t _capacity = 0;
     std::size_t _drawCount = 0;
@@ -89,6 +93,43 @@ private:
     vsg::ref_ptr<vsg::Group> _root;
     vsg::ref_ptr<vsg::GraphicsPipeline> _depthPipeline;
     vsg::ref_ptr<vsg::GraphicsPipeline> _colorPipeline;
+    vsg::ref_ptr<vsg::Node> _overlay;
+};
+
+// Mutable TRIANGLE_LIST overlay. Inspection fills the cut face from UV quads;
+// the node is a child of GaussianSplatSet. Arrays are DYNAMIC_DATA so
+// mouse-move only dirty()s after the first compile.
+class SectionLineSet
+{
+public:
+    void ensureCapacity(std::size_t triangleCount);
+    void setTriangle(std::size_t index, const vsg::vec3& a, const vsg::vec3& b, const vsg::vec3& c,
+                     const vsg::vec3& na, const vsg::vec3& nb, const vsg::vec3& nc,
+                     const vsg::vec4& color);
+    void setDrawCount(std::size_t triangleCount);
+    void markDirty();
+    void release();
+
+    std::size_t capacity() const { return _capacity; }
+    vsg::ref_ptr<vsg::Node> node() const { return _root; }
+    bool needsCompile() const { return _needsCompile; }
+    void noteCompiled() { _needsCompile = false; }
+
+private:
+    void ensurePipeline();
+    void bindDraw();
+    void applyDrawCount();
+
+    std::size_t _capacity = 0;
+    std::size_t _drawCount = 0;
+    bool _needsCompile = false;
+    vsg::ref_ptr<vsg::vec3Array> _positions;
+    vsg::ref_ptr<vsg::vec4Array> _colors;
+    vsg::ref_ptr<vsg::vec3Array> _normals;
+    vsg::ref_ptr<vsg::uintArray> _indices;
+    vsg::ref_ptr<vsg::VertexIndexDraw> _draw;
+    vsg::ref_ptr<vsg::StateGroup> _root;
+    vsg::ref_ptr<vsg::GraphicsPipeline> _pipeline;
 };
 
 // Builds the subgraph that draws splats.

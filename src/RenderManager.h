@@ -206,11 +206,14 @@ private:
     void rebuildSplatCache();
     void presentSplatCache();
     bool splatOnScreen() const;
+    void syncInspectionSectionGrid(const BoundingBox& sectionAabb);
 
     // One --profile line for a completed cut. drawPath names how the display
     // was refreshed: "patch" (splat AABB update), "rebuild" or "no-draw".
+    // cloneMs is Inspection's full-stock copy; sectionMs is the cut-face mesh.
     void logCutProfile(double booleanMs, const char* drawPath, double drawMs,
-                       const BoundingBox& dirtyModelAabb);
+                       const BoundingBox& dirtyModelAabb, double cloneMs = 0.0,
+                       double sectionMs = 0.0);
 
     // Compile a subgraph against the running viewer, then attach it.
     // replaceExisting swaps the model node only; the tool transform is kept.
