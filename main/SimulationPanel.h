@@ -29,7 +29,7 @@ class SimulationPanel : public QWidget
     Q_OBJECT
 
 public:
-    static constexpr int maxRows = 500;
+    static constexpr int maxRows = 5000;
     static constexpr int sliderMax = 100;
     static constexpr int maxWaitMs = 2000;
 
