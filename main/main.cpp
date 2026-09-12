@@ -162,6 +162,7 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
     // Cube clicks must win over orbit and the tool before those handlers run.
     viewer->addEventHandler(controlCube);
     viewer->addEventHandler(trackball);
+    viewer->addEventHandler(app::ControlCubeLateSync::create(controlCube));
 
     auto renderGraph = vsg::createRenderGraphForView(*window, camera, vsg_scene);
     if (controlCube->depthClear())

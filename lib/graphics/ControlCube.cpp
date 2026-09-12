@@ -543,7 +543,6 @@ bool ControlCube::contains(int32_t x, int32_t y) const
 void ControlCube::apply(vsg::FrameEvent&)
 {
     updateInset();
-    syncFromMain();
 }
 
 void ControlCube::apply(vsg::ButtonPressEvent& press)
@@ -619,30 +618,14 @@ void ControlCube::syncFromMain()
     auto* mainLookAt = dynamic_cast<vsg::LookAt*>(_mainCamera->viewMatrix.get());
     if (!mainLookAt) return;
 
-    vsg::dvec3 look = mainLookAt->center - mainLookAt->eye;
-    const double lookLen = vsg::length(look);
-    if (lookLen <= 1.0e-12) return;
-    look /= lookLen;
+    vsg::dvec3 forward = mainLookAt->center - mainLookAt->eye;
+    const double forwardLen = vsg::length(forward);
+    if (forwardLen <= 1.0e-12) return;
+    forward /= forwardLen;
 
     _cubeLookAt->center = vsg::dvec3(0.0, 0.0, 0.0);
-    _cubeLookAt->eye = -look * cubeEyeDistance;
-
-    vsg::dvec3 up = mainLookAt->up;
-    vsg::dvec3 side = vsg::cross(look, up);
-    const double sideLen = vsg::length(side);
-    if (sideLen <= 1.0e-12)
-    {
-        side = (std::abs(look.z) < 0.9) ? vsg::cross(look, vsg::dvec3(0.0, 0.0, 1.0))
-                                        : vsg::cross(look, vsg::dvec3(1.0, 0.0, 0.0));
-        const double len = vsg::length(side);
-        if (len <= 1.0e-12) return;
-        side /= len;
-    }
-    else
-    {
-        side /= sideLen;
-    }
-    _cubeLookAt->up = vsg::normalize(vsg::cross(side, look));
+    _cubeLookAt->eye = -forward * cubeEyeDistance;
+    _cubeLookAt->up = mainLookAt->up;
 }
 
 void ControlCube::updateInset()
@@ -682,26 +665,33 @@ void ControlCube::updateInset()
 
 bool ControlCube::unproject(int32_t x, int32_t y, vsg::dvec3& origin, vsg::dvec3& direction) const
 {
-    if (!_cubeCamera || !_cubeCamera->projectionMatrix || !_cubeCamera->viewMatrix)
-        return false;
+    if (!_cubeLookAt || !_cubeCamera) return false;
 
     const VkViewport vp = _cubeCamera->getViewport();
     if (vp.width <= 0.0f || vp.height <= 0.0f) return false;
 
-    const vsg::dvec3 ndcNear(
-        ((static_cast<double>(x) - static_cast<double>(vp.x)) / static_cast<double>(vp.width)) * 2.0 - 1.0,
-        ((static_cast<double>(y) - static_cast<double>(vp.y)) / static_cast<double>(vp.height)) * 2.0 - 1.0,
-        static_cast<double>(vp.minDepth) * 2.0 - 1.0);
-    const vsg::dvec3 ndcFar(ndcNear.x, ndcNear.y, static_cast<double>(vp.maxDepth) * 2.0 - 1.0);
+    // Build the ray in the cube LookAt basis. VSG ortho is reverse-Z, so a
+    // clip-space unproject can start behind the cube and hit the far face.
+    vsg::dvec3 forward = _cubeLookAt->center - _cubeLookAt->eye;
+    const double forwardLen = vsg::length(forward);
+    if (forwardLen <= 1.0e-12) return false;
+    forward /= forwardLen;
 
-    const vsg::dmat4 inv = vsg::inverse(_cubeCamera->projectionMatrix->transform() *
-                                        _cubeCamera->viewMatrix->transform());
-    origin = inv * ndcNear;
-    const vsg::dvec3 farPoint = inv * ndcFar;
-    direction = farPoint - origin;
-    const double dirLen = vsg::length(direction);
-    if (dirLen <= 0.0) return false;
-    direction /= dirLen;
+    vsg::dvec3 side = vsg::cross(forward, _cubeLookAt->up);
+    const double sideLen = vsg::length(side);
+    if (sideLen <= 1.0e-12) return false;
+    side /= sideLen;
+    const vsg::dvec3 up = vsg::normalize(vsg::cross(side, forward));
+
+    const double sx =
+        ((static_cast<double>(x) - static_cast<double>(vp.x)) / static_cast<double>(vp.width)) * 2.0 -
+        1.0;
+    const double sy =
+        ((static_cast<double>(y) - static_cast<double>(vp.y)) / static_cast<double>(vp.height)) * 2.0 -
+        1.0;
+
+    origin = _cubeLookAt->eye + side * (sx * cubeOrthoHalf) + up * (-sy * cubeOrthoHalf);
+    direction = forward;
     return true;
 }
 
@@ -741,6 +731,7 @@ void ControlCube::orbitDrag(int32_t x, int32_t y)
     {
         const double angle = std::asin(std::min(xpLen, 1.0));
         _trackball->rotate(angle, xp / xpLen);
+        syncFromMain();
     }
     _prevTbc = newTbc;
 }

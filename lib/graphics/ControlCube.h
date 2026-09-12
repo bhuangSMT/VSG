@@ -39,8 +39,10 @@ public:
     void apply(vsg::MoveEvent& move) override;
     void apply(vsg::ScrollWheelEvent& scroll) override;
 
-private:
+    // Copy the main LookAt rotation after Trackball has applied this frame.
     void syncFromMain();
+
+private:
     void updateInset();
     bool unproject(int32_t x, int32_t y, vsg::dvec3& origin, vsg::dvec3& direction) const;
     vsg::dvec3 insetTbc(int32_t x, int32_t y) const;
@@ -75,6 +77,22 @@ private:
     vsg::dvec3 _prevTbc{0.0, 0.0, 1.0};
 };
 
+// Runs after Trackball so the cube sees throw, snap, and Reset View this frame.
+class ControlCubeLateSync : public vsg::Inherit<vsg::Visitor, ControlCubeLateSync>
+{
+public:
+    explicit ControlCubeLateSync(vsg::ref_ptr<ControlCube> cube) : _cube(std::move(cube)) {}
+
+    void apply(vsg::FrameEvent&) override
+    {
+        if (_cube) _cube->syncFromMain();
+    }
+
+private:
+    vsg::ref_ptr<ControlCube> _cube;
+};
+
 } // namespace app
 
 EVSG_type_name(app::ControlCube);
+EVSG_type_name(app::ControlCubeLateSync);
