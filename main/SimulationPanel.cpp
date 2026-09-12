@@ -64,7 +64,7 @@ bool movedEnough(const ToolSample& a, const ToolSample& b)
 
 SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
 {
-    setFixedWidth(300);
+    setMinimumWidth(300);
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(10, 10, 10, 10);

@@ -1,8 +1,7 @@
 // vsg_qt_cube
 //
-// Creates a Qt main window (QMainWindow) with a left-hand control panel
-// (one widget per row) beside a VulkanSceneGraph rendering surface embedded
-// via vsgQt. Geometry is held as a BRep and drawn by the RenderManager: the
+// Creates a Qt main window (QMainWindow) with dockable Controls and Simulation
+// panels around a VulkanSceneGraph rendering surface embedded via vsgQt. Geometry is held as a BRep and drawn by the RenderManager: the
 // scene starts with a unit cube, and STL or 3MF files can be imported at
 // runtime via the panel's import buttons. The panel's view mode selector switches
 // between facet and wireframe rendering of that BRep.
@@ -15,7 +14,8 @@
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QWidget>
-#include <QtWidgets/QHBoxLayout>
+#include <QtWidgets/QDockWidget>
+#include <QtWidgets/QMenuBar>
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QPushButton>
@@ -262,7 +262,11 @@ try
     theme.setColor(QPalette::HighlightedText, textColor);
     application.setPalette(theme);
     application.setStyleSheet(QStringLiteral(
-        "QMainWindow, QDialog, #central, #sidePanel, #simPanel { background-color: #19223b; color: #e8eef4; }"
+        "QMainWindow, QDialog, QDockWidget, QMenuBar, #central, #sidePanel, #simPanel {"
+        "  background-color: #19223b; color: #e8eef4;"
+        "}"
+        "QMenuBar::item:selected { background-color: #2a3a5c; }"
+        "QDockWidget::title { background: #243352; padding: 4px 8px; }"
         "QLabel, QCheckBox { background-color: transparent; color: #e8eef4; }"
         "QLineEdit, QAbstractSpinBox, QComboBox, QComboBox QAbstractItemView,"
         "QTableWidget, QTableView, QHeaderView::section, QMenu {"
@@ -392,8 +396,8 @@ try
     auto panel = new QWidget();
     panel->setObjectName("sidePanel");
     panel->setAutoFillBackground(true);
-    panel->setFixedWidth(220);
-    panel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Minimum);
+    panel->setMinimumWidth(220);
+    panel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
 
     auto column = new QVBoxLayout(panel);
     column->setContentsMargins(10, 10, 10, 10);
@@ -558,7 +562,7 @@ try
     panelScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     panelScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
     panelScroll->setFrameShape(QFrame::NoFrame);
-    panelScroll->setFixedWidth(236);
+    panelScroll->setMinimumWidth(236);
 
     // --- Ray resolution helpers --------------------------------------------
     auto readResolution = [resolutionSpins]() {
@@ -627,25 +631,42 @@ try
         writeToolLength(length);
     };
 
-    // --- Compose left panel + render surface + Simulation panel ------------
+    // --- Dockable left Controls and right Simulation, Vulkan in the center --
     auto simPanel = new app::SimulationPanel();
     simPanel->setObjectName("simPanel");
     simPanel->setAutoFillBackground(true);
-    simPanel->hide();
 
-    auto central = new QWidget();
-    central->setObjectName("central");
-    central->setAutoFillBackground(true);
-    auto hbox = new QHBoxLayout(central);
-    hbox->setContentsMargins(0, 0, 0, 0);
-    hbox->setSpacing(0);
-    hbox->addWidget(panelScroll);
-    hbox->addWidget(renderWidget, 1);
-    hbox->addWidget(simPanel);
+    const auto dockFeatures = QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable
+                            | QDockWidget::DockWidgetClosable;
 
-    mainWindow->setCentralWidget(central);
+    auto controlsDock = new QDockWidget("Controls", mainWindow);
+    controlsDock->setObjectName("controlsDock");
+    controlsDock->setWidget(panelScroll);
+    controlsDock->setAllowedAreas(Qt::AllDockWidgetAreas);
+    controlsDock->setFeatures(dockFeatures);
+    controlsDock->setMinimumWidth(236);
+
+    auto simDock = new QDockWidget("Simulation", mainWindow);
+    simDock->setObjectName("simDock");
+    simDock->setWidget(simPanel);
+    simDock->setAllowedAreas(Qt::AllDockWidgetAreas);
+    simDock->setFeatures(dockFeatures);
+    simDock->setMinimumWidth(300);
+
+    mainWindow->setDockNestingEnabled(true);
+    mainWindow->addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
+    mainWindow->addDockWidget(Qt::RightDockWidgetArea, simDock);
+    simDock->hide();
+
+    auto* viewMenu = mainWindow->menuBar()->addMenu("View");
+    viewMenu->addAction(controlsDock->toggleViewAction());
+    viewMenu->addAction(simDock->toggleViewAction());
+
+    renderWidget->setObjectName("central");
+    renderWidget->setAutoFillBackground(true);
+    mainWindow->setCentralWidget(renderWidget);
     mainWindow->setGeometry(windowTraits->x, windowTraits->y,
-                            panelScroll->width() + windowTraits->width, windowTraits->height);
+                            windowTraits->width + 236, windowTraits->height);
     mainWindow->show();
     application.processEvents();
 
@@ -793,13 +814,13 @@ try
     const int rayModeIndex = viewModeCombo->findData(static_cast<int>(app::ViewMode::Ray));
 
     QObject::connect(viewModeCombo, &QComboBox::currentIndexChanged,
-                     [mainWindow, renderManager, viewModeCombo, buildRayModel, simPanel](int index) {
+                     [mainWindow, renderManager, viewModeCombo, buildRayModel, simDock](int index) {
                          const auto mode =
                              static_cast<app::ViewMode>(viewModeCombo->itemData(index).toInt());
 
                          app::Parameter& store = app::Parameter::instance();
                          store.setViewMode(mode);
-                         simPanel->setVisible(app::usesRayModel(store.viewMode()));
+                         simDock->setVisible(app::usesRayModel(store.viewMode()));
 
                          try
                          {
