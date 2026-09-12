@@ -67,8 +67,8 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
     setFixedWidth(300);
 
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(6);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
 
     auto* title = new QLabel("Simulation");
     QFont titleFont = title->font();
@@ -90,7 +90,7 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
     _tableHost = new QWidget();
     auto* tableLayout = new QVBoxLayout(_tableHost);
     tableLayout->setContentsMargins(0, 0, 0, 0);
-    tableLayout->setSpacing(6);
+    tableLayout->setSpacing(10);
 
     _table = new QTableWidget(0, 6);
     _table->setHorizontalHeaderLabels({"X", "Y", "Z", "A", "B", "C"});
@@ -107,8 +107,8 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
 
     auto* buttonRow = new QHBoxLayout();
     buttonRow->setContentsMargins(0, 0, 0, 0);
-    buttonRow->setSpacing(6);
-    _rerunButton = new QPushButton("Rerun");
+    buttonRow->setSpacing(10);
+    _rerunButton = new QPushButton("Re run");
     _resetButton = new QPushButton("Reset");
     buttonRow->addWidget(_rerunButton);
     buttonRow->addWidget(_resetButton);
@@ -333,7 +333,7 @@ void SimulationPanel::applyRow(int row)
 void SimulationPanel::updateRerunButton()
 {
     if (_rerunButton)
-        _rerunButton->setText(_playing ? QStringLiteral("Pause") : QStringLiteral("Rerun"));
+        _rerunButton->setText(_playing ? QStringLiteral("Pause") : QStringLiteral("Re run"));
 }
 
 void SimulationPanel::stopPlayback()

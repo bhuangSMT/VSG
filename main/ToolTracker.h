@@ -14,6 +14,7 @@
 
 #include <QtGui/QCursor>
 
+#include "ControlCube.h"
 #include "Parameter.h"
 #include "RenderManager.h"
 #include "SimulationPanel.h"
@@ -25,20 +26,24 @@ class ToolTracker : public vsg::Inherit<vsg::Visitor, ToolTracker>
 {
 public:
     ToolTracker(std::shared_ptr<RenderManager> renderManager, vsg::ref_ptr<vsg::Camera> camera,
-                SimulationPanel* simulationPanel = nullptr) :
+                SimulationPanel* simulationPanel = nullptr,
+                ControlCube* controlCube = nullptr) :
         _renderManager(std::move(renderManager)),
         _camera(camera),
-        _simulationPanel(simulationPanel)
+        _simulationPanel(simulationPanel),
+        _controlCube(controlCube)
     {
     }
 
     void apply(vsg::MoveEvent& move) override
     {
+        if (move.handled || inControlCube(move.x, move.y)) return;
         update(move.x, move.y);
     }
 
     void apply(vsg::ButtonPressEvent& press) override
     {
+        if (press.handled || inControlCube(press.x, press.y)) return;
         if (press.button == 3)
         {
             _rightPressed = true;
@@ -51,6 +56,11 @@ public:
 
     void apply(vsg::ButtonReleaseEvent& release) override
     {
+        if (release.handled || inControlCube(release.x, release.y))
+        {
+            _rightPressed = false;
+            return;
+        }
         if (release.button != 3 || !_rightPressed) return;
         _rightPressed = false;
         const int32_t dx = release.x - _rightPressX;
@@ -121,9 +131,15 @@ private:
                               axis * vsg::dot(axis, n) * (1.0 - cosA));
     }
 
+    bool inControlCube(int32_t x, int32_t y) const
+    {
+        return _controlCube && _controlCube->contains(x, y);
+    }
+
     std::shared_ptr<RenderManager> _renderManager;
     vsg::ref_ptr<vsg::Camera> _camera;
     SimulationPanel* _simulationPanel = nullptr;
+    ControlCube* _controlCube = nullptr;
     bool _rightPressed = false;
     int32_t _rightPressX = 0;
     int32_t _rightPressY = 0;

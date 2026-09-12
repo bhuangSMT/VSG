@@ -1,7 +1,7 @@
 // vsg_qt_cube
 //
 // Creates a Qt main window (QMainWindow) with a left-hand control panel
-// (vertical QGridLayout) beside a VulkanSceneGraph rendering surface embedded
+// (one widget per row) beside a VulkanSceneGraph rendering surface embedded
 // via vsgQt. Geometry is held as a BRep and drawn by the RenderManager: the
 // scene starts with a unit cube, and STL or 3MF files can be imported at
 // runtime via the panel's import buttons. The panel's view mode selector switches
@@ -16,7 +16,7 @@
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QHBoxLayout>
-#include <QtWidgets/QGridLayout>
+#include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QCheckBox>
@@ -25,10 +25,14 @@
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QMessageBox>
+#include <QtWidgets/QScrollArea>
+#include <QtGui/QColor>
 #include <QtGui/QCursor>
 #include <QtGui/QFont>
 #include <QtGui/QKeySequence>
 #include <QtGui/QMouseEvent>
+#include <QtGui/QPalette>
+#include <QtGui/QWindow>
 #include <QtGui/QShortcut>
 #include <QtGui/QStandardItemModel>
 
@@ -37,11 +41,13 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <iostream>
 #include <memory>
 
 #include "BRep.h"
 #include "BoundingBox.h"
+#include "ControlCube.h"
 #include "Parameter.h"
 #include "RayModel.h"
 #include "RenderManager.h"
@@ -113,8 +119,10 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
                                               vsg::ref_ptr<vsgQt::Viewer> viewer,
                                               vsg::ref_ptr<vsg::WindowTraits> traits,
                                               vsg::ref_ptr<vsg::Node> vsg_scene,
+                                              vsg::ref_ptr<vsg::Options> options,
                                               vsg::ref_ptr<vsg::Camera>& out_camera,
-                                              vsg::ref_ptr<vsg::LookAt>& out_lookAt)
+                                              vsg::ref_ptr<vsg::LookAt>& out_lookAt,
+                                              vsg::ref_ptr<app::ControlCube>& out_cube)
 {
     window->initializeWindow();
 
@@ -147,14 +155,26 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
 
     auto trackball = vsg::Trackball::create(camera);
     trackball->addWindow(*window);
+
+    auto controlCube = app::ControlCube::create(camera, trackball, options,
+                                                window->windowAdapter, window);
+    // Cube clicks must win over orbit and the tool before those handlers run.
+    viewer->addEventHandler(controlCube);
     viewer->addEventHandler(trackball);
 
-    auto commandGraph = vsg::createCommandGraphForView(*window, camera, vsg_scene);
+    auto renderGraph = vsg::createRenderGraphForView(*window, camera, vsg_scene);
+    if (controlCube->depthClear())
+        renderGraph->addChild(controlCube->depthClear());
+    renderGraph->addChild(controlCube->view());
+
+    auto commandGraph = vsg::CommandGraph::create(*window);
+    commandGraph->addChild(renderGraph);
     viewer->addRecordAndSubmitTaskAndPresentation({commandGraph});
 
     // Snapshot the starting viewpoint for the panel's "Reset View" action.
     out_camera = camera;
     out_lookAt = vsg::LookAt::create(*lookAt);
+    out_cube = controlCube;
 
     return trackball;
 }
@@ -165,8 +185,10 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
 class ViewportContextMenuFilter : public QObject
 {
 public:
-    explicit ViewportContextMenuFilter(app::SimulationPanel* panel, QObject* parent = nullptr) :
-        QObject(parent), _panel(panel)
+    explicit ViewportContextMenuFilter(app::SimulationPanel* panel,
+                                       app::ControlCube* cube,
+                                       QObject* parent = nullptr) :
+        QObject(parent), _panel(panel), _cube(cube)
     {
     }
 
@@ -180,7 +202,7 @@ protected:
             const auto* mouse = static_cast<const QMouseEvent*>(event);
             if (mouse->button() == Qt::RightButton)
             {
-                _rightPressed = true;
+                _rightPressed = !inControlCube(watched, mouse->pos());
                 _pressPos = mouse->pos();
             }
         }
@@ -191,7 +213,7 @@ protected:
             {
                 _rightPressed = false;
                 const QPoint delta = mouse->pos() - _pressPos;
-                if (delta.manhattanLength() <= 6)
+                if (delta.manhattanLength() <= 6 && !inControlCube(watched, mouse->pos()))
                     _panel->popupExitCollectionMenu(QCursor::pos());
             }
         }
@@ -199,7 +221,18 @@ protected:
     }
 
 private:
+    bool inControlCube(QObject* watched, const QPoint& pos) const
+    {
+        if (!_cube) return false;
+        const auto* win = qobject_cast<const QWindow*>(watched);
+        const qreal dpr = win ? win->devicePixelRatio() : 1.0;
+        const int32_t x = static_cast<int32_t>(std::lround(static_cast<qreal>(pos.x()) * dpr));
+        const int32_t y = static_cast<int32_t>(std::lround(static_cast<qreal>(pos.y()) * dpr));
+        return _cube->contains(x, y);
+    }
+
     app::SimulationPanel* _panel = nullptr;
+    app::ControlCube* _cube = nullptr;
     QPoint _pressPos;
     bool _rightPressed = false;
 };
@@ -210,6 +243,41 @@ int main(int argc, char* argv[])
 try
 {
     QApplication application(argc, argv);
+
+    const QColor themeColor(0x19, 0x22, 0x3b);
+    const QColor textColor(0xe8, 0xee, 0xf4);
+    QPalette theme = application.palette();
+    theme.setColor(QPalette::Window, themeColor);
+    theme.setColor(QPalette::WindowText, textColor);
+    theme.setColor(QPalette::Base, QColor(0x24, 0x33, 0x52));
+    theme.setColor(QPalette::AlternateBase, QColor(0x1e, 0x2a, 0x46));
+    theme.setColor(QPalette::Text, textColor);
+    theme.setColor(QPalette::Button, QColor(0x2a, 0x3a, 0x5c));
+    theme.setColor(QPalette::ButtonText, textColor);
+    theme.setColor(QPalette::Light, QColor(0x3a, 0x4c, 0x72));
+    theme.setColor(QPalette::Midlight, QColor(0x2e, 0x3e, 0x60));
+    theme.setColor(QPalette::Mid, QColor(0x14, 0x1b, 0x30));
+    theme.setColor(QPalette::Dark, QColor(0x10, 0x16, 0x28));
+    theme.setColor(QPalette::Highlight, QColor(0x3d, 0x5a, 0x8c));
+    theme.setColor(QPalette::HighlightedText, textColor);
+    application.setPalette(theme);
+    application.setStyleSheet(QStringLiteral(
+        "QMainWindow, QDialog, #central, #sidePanel, #simPanel { background-color: #19223b; color: #e8eef4; }"
+        "QLabel, QCheckBox { background-color: transparent; color: #e8eef4; }"
+        "QLineEdit, QAbstractSpinBox, QComboBox, QComboBox QAbstractItemView,"
+        "QTableWidget, QTableView, QHeaderView::section, QMenu {"
+        "  background-color: #243352; color: #e8eef4;"
+        "}"
+        "QPushButton, QComboBox, QAbstractSpinBox, QLineEdit { padding: 2px 8px; }"
+        "QHeaderView::section { padding: 4px 6px; }"
+        "QTableWidget::item, QTableView::item { padding: 3px 4px; }"
+        "QPushButton { background-color: #2a3a5c; color: #e8eef4; }"
+        "QPushButton:hover { background-color: #3a4c72; }"
+        "QScrollBar:vertical { background: #19223b; width: 12px; margin: 0; }"
+        "QScrollBar::handle:vertical { background: #4a5c82; min-height: 32px; border-radius: 5px; }"
+        "QScrollBar::handle:vertical:hover { background: #5c7098; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"));
 
     // Bring the settings store up with the application, before anything that
     // reads or writes it exists.
@@ -320,51 +388,66 @@ try
     auto renderWidget = QWidget::createWindowContainer(window, mainWindow);
     renderWidget->setMinimumSize(320, 240);
 
-    // --- Left-hand control panel with a vertical grid layout ---------------
+    // --- Left-hand control panel: one widget per row -----------------------
     auto panel = new QWidget();
+    panel->setObjectName("sidePanel");
+    panel->setAutoFillBackground(true);
     panel->setFixedWidth(220);
+    panel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Minimum);
 
-    auto grid = new QGridLayout(panel);
-    grid->setContentsMargins(8, 8, 8, 8);
-    grid->setSpacing(6);
-    grid->setAlignment(Qt::AlignTop);
+    auto column = new QVBoxLayout(panel);
+    column->setContentsMargins(10, 10, 10, 10);
+    column->setSpacing(10);
 
-    int row = 0;
+    auto addWidget = [&](QWidget* widget) {
+        widget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        column->addWidget(widget);
+    };
 
-    // Import button at the very top of the panel.
+    auto makeDivider = []() {
+        auto* line = new QFrame();
+        line->setFrameShape(QFrame::HLine);
+        line->setFrameShadow(QFrame::Sunken);
+        line->setFixedHeight(2);
+        line->setStyleSheet("QFrame { color: #9a9a9a; }");
+        return line;
+    };
+
+    auto addDivider = [&]() {
+        column->addSpacing(20);
+        addWidget(makeDivider());
+    };
+
+    QFont titleFont = QApplication::font();
+    titleFont.setBold(true);
+
+    addDivider();
+    auto stockTitle = new QLabel("Stock:");
+    stockTitle->setFont(titleFont);
+    addWidget(stockTitle);
+
     auto importStlButton = new QPushButton("Import STL…");
-    grid->addWidget(importStlButton, row++, 0);
-
+    addWidget(importStlButton);
+    column->addSpacing(10);
     auto import3mfButton = new QPushButton("Import 3MF…");
-    grid->addWidget(import3mfButton, row++, 0);
+    addWidget(import3mfButton);
 
     auto title = new QLabel("Scene Controls");
-    QFont titleFont = title->font();
-    titleFont.setBold(true);
     title->setFont(titleFont);
-    grid->addWidget(title, row++, 0);
+    addWidget(title);
 
     auto resetButton = new QPushButton("Reset View");
-    grid->addWidget(resetButton, row++, 0);
+    addWidget(resetButton);
 
-    grid->addWidget(new QLabel("View Mode"), row++, 0);
-
+    addWidget(new QLabel("View Mode"));
     auto viewModeCombo = new QComboBox();
     viewModeCombo->addItem("Facet", static_cast<int>(app::ViewMode::Facet));
     viewModeCombo->addItem("Wireframe", static_cast<int>(app::ViewMode::Wireframe));
     viewModeCombo->addItem("Ray", static_cast<int>(app::ViewMode::Ray));
     viewModeCombo->addItem("Simulation", static_cast<int>(app::ViewMode::RayGS));
-    grid->addWidget(viewModeCombo, row++, 0);
+    addWidget(viewModeCombo);
 
-    // Ray tessellation resolution: the spacing of the cast grid along each
-    // axis. Seeded from the model's size; edit and press Apply to recast.
-    grid->addWidget(new QLabel("Ray Resolution"), row++, 0);
-
-    auto resolutionPanel = new QWidget();
-    auto resolutionGrid = new QGridLayout(resolutionPanel);
-    resolutionGrid->setContentsMargins(0, 0, 0, 0);
-    resolutionGrid->setSpacing(4);
-
+    addWidget(new QLabel("Ray Resolution"));
     std::array<QDoubleSpinBox*, 3> resolutionSpins{nullptr, nullptr, nullptr};
     const std::array<const char*, 3> axisNames{"X", "Y", "Z"};
     for (std::size_t i = 0; i < 3; ++i)
@@ -373,40 +456,23 @@ try
         spin->setDecimals(6);
         spin->setRange(1.0e-6, 1.0e9);
         spin->setValue(0.000625);
-
-        const int gridRow = static_cast<int>(i);
-        resolutionGrid->addWidget(new QLabel(axisNames[i]), gridRow, 0);
-        resolutionGrid->addWidget(spin, gridRow, 1);
+        spin->setPrefix(QString("%1 ").arg(axisNames[i]));
+        addWidget(spin);
         resolutionSpins[i] = spin;
     }
-    resolutionGrid->setColumnStretch(1, 1);
-    grid->addWidget(resolutionPanel, row++, 0);
 
     auto applyResolutionButton = new QPushButton("Apply");
-    grid->addWidget(applyResolutionButton, row++, 0);
+    addWidget(applyResolutionButton);
 
     auto continuousCheck = new QCheckBox("Continuous update");
     continuousCheck->setChecked(true);
-    grid->addWidget(continuousCheck, row++, 0);
+    addWidget(continuousCheck);
 
-    // Horizontal rules between panel sections. Default HLine is ~2px; five
-    // times that keeps the break readable in the narrow sidebar.
-    auto makeDivider = []() {
-        auto* line = new QFrame();
-        line->setFrameShape(QFrame::HLine);
-        line->setFrameShadow(QFrame::Sunken);
-        line->setFixedHeight(10);
-        line->setStyleSheet("QFrame { color: #9a9a9a; margin-top: 4px; margin-bottom: 4px; }");
-        return line;
-    };
+    addDivider();
 
-    grid->addWidget(makeDivider(), row++, 0);
-
-    auto stockTitle = new QLabel("Stock:");
-    stockTitle->setFont(titleFont);
-    grid->addWidget(stockTitle, row++, 0);
-
-    grid->addWidget(new QLabel("Tool"), row++, 0);
+    auto toolTitle = new QLabel("Tool:");
+    toolTitle->setFont(titleFont);
+    addWidget(toolTitle);
 
     auto toolCombo = new QComboBox();
     toolCombo->addItem("None", static_cast<int>(app::ToolType::None));
@@ -414,38 +480,38 @@ try
     toolCombo->addItem("Flat nose", static_cast<int>(app::ToolType::FlatNose));
     toolCombo->addItem("Ball nose", static_cast<int>(app::ToolType::BallNose));
     toolCombo->addItem("Sphere", static_cast<int>(app::ToolType::Sphere));
-    grid->addWidget(toolCombo, row++, 0);
+    addWidget(toolCombo);
 
-    grid->addWidget(new QLabel("Radius"), row++, 0);
-
+    addWidget(new QLabel("Radius:"));
     auto radiusSpin = new QDoubleSpinBox();
     radiusSpin->setDecimals(6);
     radiusSpin->setRange(1.0e-9, 1.0e9);
     radiusSpin->setValue(app::Parameter::instance().toolRadius());
-    grid->addWidget(radiusSpin, row++, 0);
+    addWidget(radiusSpin);
 
-    grid->addWidget(new QLabel("Length"), row++, 0);
-
+    addWidget(new QLabel("Length:"));
     auto lengthSpin = new QDoubleSpinBox();
     lengthSpin->setDecimals(6);
     lengthSpin->setRange(1.0e-9, 1.0e9);
     lengthSpin->setValue(app::Parameter::instance().toolLength());
-    grid->addWidget(lengthSpin, row++, 0);
+    addWidget(lengthSpin);
 
     auto sweptVolumeCheck = new QCheckBox("Show swept volume");
     sweptVolumeCheck->setChecked(app::Parameter::instance().sweptVolume());
-    grid->addWidget(sweptVolumeCheck, row++, 0);
+    addWidget(sweptVolumeCheck);
 
     auto lastSweptOnlyCheck = new QCheckBox("Show last swept volume only");
     lastSweptOnlyCheck->setChecked(app::Parameter::instance().showLastSweptVolumeOnly());
-    grid->addWidget(lastSweptOnlyCheck, row++, 0);
+    addWidget(lastSweptOnlyCheck);
 
     auto clearSweptButton = new QPushButton("Clear swept volume");
-    grid->addWidget(clearSweptButton, row++, 0);
+    addWidget(clearSweptButton);
 
-    grid->addWidget(makeDivider(), row++, 0);
+    addDivider();
 
-    grid->addWidget(new QLabel("Operation"), row++, 0);
+    auto operationTitle = new QLabel("Operation:");
+    operationTitle->setFont(titleFont);
+    addWidget(operationTitle);
 
     auto booleanCombo = new QComboBox();
     const QString noneKeys =
@@ -474,13 +540,25 @@ try
         QString("None: %1 (exit data collection)\nProbe: %2 (record poses, no boolean)\n"
                 "Subtraction: %3\nUnion: %4\nInspection: %5")
             .arg(noneKeys, probeKeys, subtractKeys, unionKeys, inspectKeys));
-    grid->addWidget(booleanCombo, row++, 0);
+    addWidget(booleanCombo);
+
+    addDivider();
+    column->addSpacing(20);
 
     auto quitButton = new QPushButton("Quit");
-    grid->addWidget(quitButton, row++, 0);
+    addWidget(quitButton);
 
-    // Push the controls to the top by absorbing the remaining vertical space.
-    grid->setRowStretch(row, 1);
+    column->addStretch(1);
+
+    auto panelScroll = new QScrollArea();
+    panelScroll->setObjectName("sidePanel");
+    panelScroll->setAutoFillBackground(true);
+    panelScroll->setWidget(panel);
+    panelScroll->setWidgetResizable(true);
+    panelScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    panelScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+    panelScroll->setFrameShape(QFrame::NoFrame);
+    panelScroll->setFixedWidth(236);
 
     // --- Ray resolution helpers --------------------------------------------
     auto readResolution = [resolutionSpins]() {
@@ -551,19 +629,23 @@ try
 
     // --- Compose left panel + render surface + Simulation panel ------------
     auto simPanel = new app::SimulationPanel();
+    simPanel->setObjectName("simPanel");
+    simPanel->setAutoFillBackground(true);
     simPanel->hide();
 
     auto central = new QWidget();
+    central->setObjectName("central");
+    central->setAutoFillBackground(true);
     auto hbox = new QHBoxLayout(central);
     hbox->setContentsMargins(0, 0, 0, 0);
     hbox->setSpacing(0);
-    hbox->addWidget(panel);
+    hbox->addWidget(panelScroll);
     hbox->addWidget(renderWidget, 1);
     hbox->addWidget(simPanel);
 
     mainWindow->setCentralWidget(central);
     mainWindow->setGeometry(windowTraits->x, windowTraits->y,
-                            panel->width() + windowTraits->width, windowTraits->height);
+                            panelScroll->width() + windowTraits->width, windowTraits->height);
     mainWindow->show();
     application.processEvents();
 
@@ -585,7 +667,9 @@ try
 
     vsg::ref_ptr<vsg::Camera> camera;
     vsg::ref_ptr<vsg::LookAt> initialLookAt;
-    auto trackball = initializeViewer(window, viewer, windowTraits, vsg_scene, camera, initialLookAt);
+    vsg::ref_ptr<app::ControlCube> controlCube;
+    auto trackball = initializeViewer(window, viewer, windowTraits, vsg_scene, options,
+                                      camera, initialLookAt, controlCube);
 
     // Wire up the panel controls.
     QObject::connect(quitButton, &QPushButton::clicked, &application, &QApplication::quit);
@@ -684,7 +768,7 @@ try
                      [booleanCombo, simPanel](const QPoint& pos) {
                          simPanel->popupExitCollectionMenu(booleanCombo->mapToGlobal(pos));
                      });
-    window->installEventFilter(new ViewportContextMenuFilter(simPanel, window));
+    window->installEventFilter(new ViewportContextMenuFilter(simPanel, controlCube, window));
     // Cast rays through whatever BRep is on display, at the resolution held in
     // the store, and hand the result to the RenderManager. Resolutions already
     // cast through this BRep are still held there, so switching between view
@@ -828,7 +912,7 @@ try
 
     // Tool tracking has to see moves before (or at least as well as) the
     // trackball; it never marks events handled, so orbit/zoom keep working.
-    viewer->addEventHandler(app::ToolTracker::create(renderManager, camera, simPanel));
+    viewer->addEventHandler(app::ToolTracker::create(renderManager, camera, simPanel, controlCube));
     viewer->addEventHandler(vsg::CloseHandler::create(viewer));
     viewer->compile();
 
