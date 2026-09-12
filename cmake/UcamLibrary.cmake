@@ -20,4 +20,8 @@ function(ucam_add_library target export_name)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
             $<INSTALL_INTERFACE:include>
     )
+
+    if(WIN32)
+        target_compile_definitions(${target} PRIVATE NOMINMAX)
+    endif()
 endfunction()

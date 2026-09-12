@@ -69,7 +69,7 @@ set(QT_PACKAGE_NAME Qt6 CACHE STRING "Qt package name, i.e. Qt5 or Qt6.")
 #
 # These are resolved via CMAKE_PREFIX_PATH. Run scripts/bootstrap.sh (macOS)
 # or scripts/bootstrap.ps1 (Windows) first, which installs Vulkan + Qt and
-# builds VulkanSceneGraph + vsgQt into ./.deps.
+# builds VulkanSceneGraph, vsgQt, oneTBB, and zlib into ./.deps.
 # ---------------------------------------------------------------------------
 find_package(Vulkan REQUIRED)
 find_package(vsg 1.1.13 REQUIRED)
@@ -185,6 +185,22 @@ if(WIN32)
         )
     endif()
 
+    set(_runtime_dll_copy)
+    if(TARGET TBB::tbb)
+        list(APPEND _runtime_dll_copy
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:TBB::tbb>
+                $<TARGET_FILE_DIR:vsg_qt_cube>
+        )
+    endif()
+    if(TARGET ZLIB::ZLIB)
+        list(APPEND _runtime_dll_copy
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ZLIB::ZLIB>
+                $<TARGET_FILE_DIR:vsg_qt_cube>
+        )
+    endif()
+
     add_custom_command(TARGET vsg_qt_cube POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:vsg::vsg>
@@ -193,6 +209,7 @@ if(WIN32)
             $<TARGET_FILE:vsgQt::vsgQt>
             $<TARGET_FILE_DIR:vsg_qt_cube>
         ${_ucam_dll_copy}
+        ${_runtime_dll_copy}
         COMMENT "Copying VSG DLLs next to vsg_qt_cube"
     )
 

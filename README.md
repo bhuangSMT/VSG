@@ -40,7 +40,7 @@ UCAM/
 ├── main/profile_hotspots.cpp   # headless timing of cast / sweep / boolean / splat
 ├── scripts/
 │   ├── bootstrap.sh            # macOS: brew + build VSG/vsgQt into ./.deps
-│   ├── bootstrap.ps1           # Windows: Vulkan SDK + Qt6 + build VSG/vsgQt into ./.deps
+│   ├── bootstrap.ps1           # Windows: Vulkan SDK + Qt6 + VSG/vsgQt/TBB/zlib into ./.deps
 │   ├── run.sh                  # macOS: run with MoltenVK ICD / dylib paths
 │   └── run.ps1                 # Windows: run the exe (PATH + Qt plugins)
 └── README.md
@@ -447,8 +447,8 @@ Prerequisites:
 - [CMake](https://cmake.org/) and [Git](https://git-scm.com/)
 - [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) (sets `VULKAN_SDK`)
 - Qt 6 MSVC 64-bit — used from `C:\Qt\...` if present, otherwise `bootstrap.ps1` fetches it with [aqtinstall](https://github.com/miurahr/aqtinstall) (requires Python)
-- [oneTBB](https://github.com/uxlfoundation/oneTBB) — `bootstrap.ps1` does not fetch it yet, so install it and add its prefix to `CMAKE_PREFIX_PATH`
-- zlib — needed by the 3MF importer; if CMake cannot find one, install it (vcpkg's `zlib` works) and add its prefix to `CMAKE_PREFIX_PATH`
+
+`bootstrap.ps1` also builds [oneTBB](https://github.com/uxlfoundation/oneTBB) and [zlib](https://github.com/madler/zlib) into `.deps`.
 
 ```powershell
 .\scripts\bootstrap.ps1
@@ -463,13 +463,16 @@ cmake --build build --config Release --parallel
 `bootstrap.ps1` prints the exact `CMAKE_PREFIX_PATH` to use after it finishes.
 `bootstrap.cmd` / `run.cmd` are cmd.exe wrappers around the same scripts.
 
-On Windows the CMake build copies `vsg.dll` / `vsgQt.dll` next to the exe and
-runs `windeployqt` so the Qt `qwindows` platform plugin is available.
+On Windows the CMake build copies `vsg.dll` / `vsgQt.dll`, TBB, zlib, and the
+ucam DLLs next to the exe and runs `windeployqt` so the Qt `qwindows` platform
+plugin is available.
 
 ## Pinned versions
 
 - VulkanSceneGraph `v1.1.16`
 - vsgQt `v0.5.0` (built against Qt6)
+- oneTBB `v2022.1.0` (Windows bootstrap)
+- zlib `v1.3.1` (Windows bootstrap)
 
 ## macOS note
 

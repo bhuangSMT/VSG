@@ -7,6 +7,7 @@
 #   - CMake, Git, a Visual Studio C++ toolchain
 #   - Vulkan SDK (VULKAN_SDK or C:\VulkanSDK\*)
 #   - Qt6 (official install, or fetched via aqtinstall into .deps/qt)
+#   - oneTBB and zlib (cloned and installed into .deps)
 
 [CmdletBinding()]
 param(
@@ -18,6 +19,8 @@ $ErrorActionPreference = "Stop"
 
 $VSG_TAG = "v1.1.16"
 $VSGQT_TAG = "v0.5.0"
+$TBB_TAG = "v2022.1.0"
+$ZLIB_TAG = "v1.3.1"
 $QT_VERSION = "6.8.3"
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -208,6 +211,26 @@ $cmakeCommon = @(
     "-DBUILD_SHARED_LIBS=ON",
     "-DCMAKE_PREFIX_PATH=$($env:CMAKE_PREFIX_PATH)"
 )
+
+$tbbSrc = Join-Path $Src "oneTBB"
+if (-not (Test-Path (Join-Path $tbbSrc ".git"))) {
+    Write-Host "==> Cloning oneTBB $TBB_TAG"
+    git clone --depth 1 --branch $TBB_TAG https://github.com/uxlfoundation/oneTBB.git $tbbSrc
+    if ($LASTEXITCODE -ne 0) { throw "git clone oneTBB failed" }
+}
+Write-Host "==> Building oneTBB $TBB_TAG"
+Invoke-CMakeConfigure -Source $tbbSrc -Build (Join-Path $tbbSrc "build") -Arguments ($cmakeCommon + @("-DTBB_TEST=OFF"))
+Invoke-CMakeInstall -Build (Join-Path $tbbSrc "build")
+
+$zlibSrc = Join-Path $Src "zlib"
+if (-not (Test-Path (Join-Path $zlibSrc ".git"))) {
+    Write-Host "==> Cloning zlib $ZLIB_TAG"
+    git clone --depth 1 --branch $ZLIB_TAG https://github.com/madler/zlib.git $zlibSrc
+    if ($LASTEXITCODE -ne 0) { throw "git clone zlib failed" }
+}
+Write-Host "==> Building zlib $ZLIB_TAG"
+Invoke-CMakeConfigure -Source $zlibSrc -Build (Join-Path $zlibSrc "build") -Arguments $cmakeCommon
+Invoke-CMakeInstall -Build (Join-Path $zlibSrc "build")
 
 $vsgSrc = Join-Path $Src "VulkanSceneGraph"
 if (-not (Test-Path (Join-Path $vsgSrc ".git"))) {
