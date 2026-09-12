@@ -71,33 +71,33 @@ public:
                              const SplatStyle& style,
                              bool skipCutSplats = false);
 
-    // Inspection preview: replace the GPU overlay with UV quads in sectionAabb
-    // using the same collect as the cut-face overlay (no 3D AABB clip, halo stitch).
-    // Does not touch the accumulated cut-face triangle list.
+    // Inspection preview: draw UV quads in sectionAabb on a separate overlay.
+    // Does not overwrite the GPU-resident Subtraction/Union cut-face mesh.
     void updateSectionGrid(const RayModel& rayModel, int stride, const BoundingBox& sectionAabb,
                            const vsg::vec4& color);
-    // Hide the GPU overlay; keep any stored cut-face triangles.
+    // Hide the Inspection overlay; keep GPU cut faces and show them again.
     void clearSectionGrid();
 
-    // Cut face (Subtraction and Union): drop tris in the dirty UV window, remesh
-    // a larger overlapping halo of cut-tagged ends on those rays, and upload.
+    // Cut face (Subtraction and Union): remesh the dirty UV window (same halo
+    // for delete and stitch) and write only those GPU slots.
     void patchCutFace(const RayModel& rayModel, int stride,
                       const BoundingBox& dirtyModelAabb, const vsg::vec4& color);
-    // Cut-face splat-rebuild fallback: remesh every cut-tagged end at stride.
+    // Pack every cut-tagged end at stride into GPU slots (new model / fallback).
     void rebuildCutFace(const RayModel& rayModel, int stride, const vsg::vec4& color);
-    // Re-upload stored cut-face tris when stride/resolution still match;
+    // Show the GPU cut-face mesh when stride/resolution still match;
     // otherwise remesh every cut-tagged end at the new display stride.
     void restoreCutFace(const RayModel& rayModel, int stride, const vsg::vec4& color);
-    // Re-upload stored cut-face tris (leave Inspection without a remesh).
     void showCutFace();
-    // Drop stored cut-face tris and hide the overlay.
     void clearCutFace();
-    bool hasCutFace() const { return !_cutFaceTris.empty(); }
+    bool hasCutFace() const { return _cutFaceLive > 0; }
 
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
     void markDirty();
     // True when rebuild allocated or grew GPU arrays; the viewer must compile.
-    bool gpuNeedsCompile() const { return _gpuNeedsCompile || _section.needsCompile(); }
+    bool gpuNeedsCompile() const
+    {
+        return _gpuNeedsCompile || _section.needsCompile() || _inspectionSection.needsCompile();
+    }
     void noteCompiled();
 
 private:
@@ -166,9 +166,28 @@ private:
         std::uint8_t axis = 0;
     };
 
-    void uploadSectionTris(const std::vector<OverlayTri>& tris, const vsg::vec4& color);
+    struct CutFaceLayout
+    {
+        bool present = false;
+        std::uint32_t sampledW = 0;
+        std::uint32_t sampledH = 0;
+    };
+
+    static constexpr int maxCutFaceTrisPerCell = 64;
+
+    void uploadSectionTris(SectionLineSet& dest, const std::vector<OverlayTri>& tris,
+                           const vsg::vec4& color);
     void appendCutFaceTris(const RayModel& rayModel, int stride, const BoundingBox& box,
                            std::vector<OverlayTri>& out, bool clipToAabb, int haloCells) const;
+    bool cutFaceLayoutMatches(const RayModel& rayModel, int stride) const;
+    void ensureCutFaceLayout(const RayModel& rayModel, int stride);
+    CellRef& cutFaceRef(std::size_t axis, std::uint32_t su, std::uint32_t sv);
+    void addCutFaceFreeRange(std::uint32_t first, std::uint32_t length);
+    bool allocCutFaceBlock(std::uint32_t length, std::uint32_t* outFirst);
+    void freeCutFaceCell(CellRef& ref);
+    bool writeCutFaceCell(std::size_t axis, std::uint32_t su, std::uint32_t sv,
+                          const std::vector<OverlayTri>& tris);
+    void presentCutFace();
 
     GaussianSplatSet _set;
     std::array<AxisLayout, 3> _axes{};
@@ -184,8 +203,13 @@ private:
     int _cutFaceStride = 0;
     Point3d _cutFaceResolution{0.0, 0.0, 0.0};
     vsg::vec4 _cutFaceColor{0.95f, 0.35f, 0.10f, 1.0f};
-    std::vector<OverlayTri> _cutFaceTris;
+    std::array<CutFaceLayout, 3> _cutFaceLayout{};
+    std::array<std::vector<CellRef>, 3> _cutFaceRefs{};
+    std::vector<FreeRange> _cutFaceFree;
+    std::uint32_t _cutFaceAllocEnd = 0;
+    std::size_t _cutFaceLive = 0;
     SectionLineSet _section;
+    SectionLineSet _inspectionSection;
 };
 
 } // namespace app

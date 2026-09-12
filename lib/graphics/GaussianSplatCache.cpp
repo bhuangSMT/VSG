@@ -215,6 +215,8 @@ struct CollectedTri
 {
     std::array<SectionVert, 3> verts;
     std::uint8_t axis = 0;
+    std::uint32_t su = 0;
+    std::uint32_t sv = 0;
 };
 
 double vecComponent(const vsg::vec3& p, std::size_t axis)
@@ -322,6 +324,7 @@ void collectSectionTris(const RayModel& rayModel, int stride, const BoundingBox&
         const float maxEdge = edgeScale * static_cast<float>(std::sqrt(du * du + dv * dv));
 
         std::vector<std::array<SectionVert, 3>> quads;
+        const auto axisByte = static_cast<std::uint8_t>(axis);
         for (std::uint32_t sv = w.sv0; sv < w.sv1; ++sv)
         {
             for (std::uint32_t su = w.su0; su < w.su1; ++su)
@@ -331,15 +334,13 @@ void collectSectionTris(const RayModel& rayModel, int stride, const BoundingBox&
                 const auto east = flat + 1;
                 const auto north = flat + sampledW;
                 const auto northEast = north + 1;
+                const auto before = quads.size();
                 emitSectionQuad(cells[flat], cells[east], cells[north], cells[northEast],
                                 maxEdge, quads);
+                for (auto q = before; q < quads.size(); ++q)
+                    tris.push_back({quads[q], axisByte, su, sv});
             }
         }
-
-        const auto axisByte = static_cast<std::uint8_t>(axis);
-        tris.reserve(tris.size() + quads.size());
-        for (const auto& q : quads)
-            tris.push_back({q, axisByte});
     }
 }
 
@@ -397,10 +398,15 @@ void GaussianSplatCache::release()
     _allocEnd = 0;
     _gpuNeedsCompile = true;
     _skipCutSplats = false;
-    _cutFaceTris.clear();
     _cutFaceStride = 0;
     _cutFaceResolution = Point3d{0.0, 0.0, 0.0};
+    _cutFaceLayout = {};
+    for (auto& refs : _cutFaceRefs) refs.clear();
+    _cutFaceFree.clear();
+    _cutFaceAllocEnd = 0;
+    _cutFaceLive = 0;
     _section.release();
+    _inspectionSection.release();
 }
 
 bool GaussianSplatCache::layoutMatches(const RayModel& rayModel, int stride) const
@@ -816,8 +822,7 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
 
     _set.setDrawCount(live);
     _set.markDirty();
-    if (_section.node())
-        _set.setOverlay(_section.node());
+    presentCutFace();
     return _set.node();
 }
 
@@ -869,50 +874,68 @@ void GaussianSplatCache::markDirty()
 {
     _set.markDirty();
     _section.markDirty();
+    _inspectionSection.markDirty();
 }
 
 void GaussianSplatCache::noteCompiled()
 {
     _gpuNeedsCompile = false;
     _section.noteCompiled();
+    _inspectionSection.noteCompiled();
 }
 
 void GaussianSplatCache::clearSectionGrid()
 {
-    _section.setDrawCount(0);
-    _section.markDirty();
+    _inspectionSection.setDrawCount(0);
+    _inspectionSection.markDirty();
+    presentCutFace();
 }
 
 void GaussianSplatCache::clearCutFace()
 {
-    _cutFaceTris.clear();
     _cutFaceStride = 0;
     _cutFaceResolution = Point3d{0.0, 0.0, 0.0};
-    clearSectionGrid();
+    _cutFaceLayout = {};
+    for (auto& refs : _cutFaceRefs) refs.clear();
+    _cutFaceFree.clear();
+    _cutFaceAllocEnd = 0;
+    _cutFaceLive = 0;
+    _section.setDrawCount(0);
+    _section.markDirty();
 }
 
-void GaussianSplatCache::uploadSectionTris(const std::vector<OverlayTri>& tris,
+void GaussianSplatCache::presentCutFace()
+{
+    if (_cutFaceLive > 0 && _section.node())
+        _set.setOverlay(_section.node());
+    else
+        _set.setOverlay(nullptr);
+}
+
+void GaussianSplatCache::uploadSectionTris(SectionLineSet& dest, const std::vector<OverlayTri>& tris,
                                            const vsg::vec4& color)
 {
     if (tris.empty())
     {
-        clearSectionGrid();
+        dest.setDrawCount(0);
+        dest.markDirty();
+        presentCutFace();
         return;
     }
 
-    _section.ensureCapacity(tris.size());
+    dest.ensureCapacity(tris.size());
     for (std::size_t i = 0; i < tris.size(); ++i)
-        _section.setTriangle(i, tris[i].v[0].pos, tris[i].v[1].pos, tris[i].v[2].pos,
-                             tris[i].v[0].normal, tris[i].v[1].normal, tris[i].v[2].normal, color);
-    _section.setDrawCount(tris.size());
-    _section.markDirty();
-    _set.setOverlay(_section.node());
+        dest.setTriangle(i, tris[i].v[0].pos, tris[i].v[1].pos, tris[i].v[2].pos,
+                         tris[i].v[0].normal, tris[i].v[1].normal, tris[i].v[2].normal, color);
+    dest.setDrawCount(tris.size());
+    dest.markDirty();
+    _set.setOverlay(dest.node());
 }
 
 void GaussianSplatCache::appendCutFaceTris(const RayModel& rayModel, int stride,
-                                            const BoundingBox& box,
-                                            std::vector<OverlayTri>& out, bool clipToAabb,
-                                            int haloCells) const
+                                           const BoundingBox& box,
+                                           std::vector<OverlayTri>& out, bool clipToAabb,
+                                           int haloCells) const
 {
     std::vector<CollectedTri> collected;
     collectSectionTris(rayModel, stride, box, clipToAabb, haloCells, collected);
@@ -928,6 +951,151 @@ void GaussianSplatCache::appendCutFaceTris(const RayModel& rayModel, int stride,
     }
 }
 
+bool GaussianSplatCache::cutFaceLayoutMatches(const RayModel& rayModel, int stride) const
+{
+    if (stride < 1 || stride != _cutFaceStride) return false;
+    if (rayModel.resolution() != _cutFaceResolution) return false;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* grid = rayModel.grid(axis);
+        const CutFaceLayout& layout = _cutFaceLayout[axis];
+        if (!grid || grid->empty())
+        {
+            if (layout.present) return false;
+            continue;
+        }
+        if (!layout.present) return false;
+        if (layout.sampledW != sampledCount(grid->width, stride) ||
+            layout.sampledH != sampledCount(grid->height, stride))
+            return false;
+        const auto expected =
+            static_cast<std::size_t>(layout.sampledW) * static_cast<std::size_t>(layout.sampledH);
+        if (_cutFaceRefs[axis].size() != expected) return false;
+    }
+    return true;
+}
+
+void GaussianSplatCache::ensureCutFaceLayout(const RayModel& rayModel, int stride)
+{
+    _cutFaceStride = stride;
+    _cutFaceResolution = rayModel.resolution();
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* grid = rayModel.grid(axis);
+        CutFaceLayout& layout = _cutFaceLayout[axis];
+        if (!grid || grid->empty())
+        {
+            layout = {};
+            _cutFaceRefs[axis].clear();
+            continue;
+        }
+        layout.present = true;
+        layout.sampledW = sampledCount(grid->width, stride);
+        layout.sampledH = sampledCount(grid->height, stride);
+        const auto n =
+            static_cast<std::size_t>(layout.sampledW) * static_cast<std::size_t>(layout.sampledH);
+        _cutFaceRefs[axis].assign(n, CellRef{});
+    }
+}
+
+GaussianSplatCache::CellRef& GaussianSplatCache::cutFaceRef(std::size_t axis, std::uint32_t su,
+                                                            std::uint32_t sv)
+{
+    const CutFaceLayout& layout = _cutFaceLayout[axis];
+    const auto flat =
+        static_cast<std::size_t>(sv) * layout.sampledW + static_cast<std::size_t>(su);
+    return _cutFaceRefs[axis][flat];
+}
+
+void GaussianSplatCache::addCutFaceFreeRange(std::uint32_t first, std::uint32_t length)
+{
+    if (length == 0) return;
+    FreeRange range{first, length};
+    auto it = std::lower_bound(
+        _cutFaceFree.begin(), _cutFaceFree.end(), range,
+        [](const FreeRange& a, const FreeRange& b) { return a.first < b.first; });
+    it = _cutFaceFree.insert(it, range);
+    if (it + 1 != _cutFaceFree.end() && it->first + it->length == (it + 1)->first)
+    {
+        it->length += (it + 1)->length;
+        _cutFaceFree.erase(it + 1);
+    }
+    if (it != _cutFaceFree.begin())
+    {
+        auto prev = it - 1;
+        if (prev->first + prev->length == it->first)
+        {
+            prev->length += it->length;
+            _cutFaceFree.erase(it);
+        }
+    }
+}
+
+bool GaussianSplatCache::allocCutFaceBlock(std::uint32_t length, std::uint32_t* outFirst)
+{
+    if (length == 0 || !outFirst) return false;
+
+    for (auto it = _cutFaceFree.begin(); it != _cutFaceFree.end(); ++it)
+    {
+        if (it->length < length) continue;
+        const std::uint32_t first = it->first;
+        if (it->length == length) _cutFaceFree.erase(it);
+        else
+        {
+            it->first += length;
+            it->length -= length;
+        }
+        *outFirst = first;
+        return true;
+    }
+
+    _section.ensureCapacity(static_cast<std::size_t>(_cutFaceAllocEnd) + length);
+    if (static_cast<std::size_t>(_cutFaceAllocEnd) + length > _section.capacity()) return false;
+    *outFirst = _cutFaceAllocEnd;
+    _cutFaceAllocEnd += length;
+    return true;
+}
+
+void GaussianSplatCache::freeCutFaceCell(CellRef& ref)
+{
+    if (ref.first == CellRef::kInvalid || ref.block == 0)
+    {
+        ref = {};
+        return;
+    }
+    for (std::uint32_t i = 0; i < ref.block; ++i)
+        _section.clearTriangle(static_cast<std::size_t>(ref.first + i));
+    addCutFaceFreeRange(ref.first, ref.block);
+    if (_cutFaceLive >= ref.count) _cutFaceLive -= ref.count;
+    else _cutFaceLive = 0;
+    ref = {};
+}
+
+bool GaussianSplatCache::writeCutFaceCell(std::size_t axis, std::uint32_t su, std::uint32_t sv,
+                                          const std::vector<OverlayTri>& tris)
+{
+    CellRef& ref = cutFaceRef(axis, su, sv);
+    freeCutFaceCell(ref);
+    if (tris.empty()) return true;
+    if (tris.size() > static_cast<std::size_t>(maxCutFaceTrisPerCell)) return false;
+
+    const auto n = static_cast<std::uint32_t>(tris.size());
+    std::uint32_t first = 0;
+    if (!allocCutFaceBlock(n, &first)) return false;
+    ref.first = first;
+    ref.block = static_cast<std::uint16_t>(n);
+    ref.count = static_cast<std::uint16_t>(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+    {
+        const OverlayTri& tri = tris[i];
+        _section.setTriangle(static_cast<std::size_t>(first + i), tri.v[0].pos, tri.v[1].pos,
+                             tri.v[2].pos, tri.v[0].normal, tri.v[1].normal, tri.v[2].normal,
+                             _cutFaceColor);
+    }
+    _cutFaceLive += n;
+    return true;
+}
+
 void GaussianSplatCache::updateSectionGrid(const RayModel& rayModel, int stride,
                                            const BoundingBox& sectionAabb,
                                            const vsg::vec4& color)
@@ -941,18 +1109,86 @@ void GaussianSplatCache::updateSectionGrid(const RayModel& rayModel, int stride,
     auto lock = rayModel.lockChains();
     std::vector<OverlayTri> tris;
     appendCutFaceTris(rayModel, stride, sectionAabb, tris, false, kCutFaceHaloCells);
-    uploadSectionTris(tris, color);
+    uploadSectionTris(_inspectionSection, tris, color);
+}
+
+void GaussianSplatCache::rebuildCutFace(const RayModel& rayModel, int stride,
+                                        const vsg::vec4& color)
+{
+    _cutFaceColor = color;
+    if (stride < 1)
+    {
+        clearCutFace();
+        presentCutFace();
+        return;
+    }
+
+    auto lock = rayModel.lockChains();
+    _cutFaceFree.clear();
+    _cutFaceAllocEnd = 0;
+    _cutFaceLive = 0;
+    ensureCutFaceLayout(rayModel, stride);
+
+    std::vector<CollectedTri> collected;
+    collectSectionTris(rayModel, stride, BoundingBox{}, false, 0, collected);
+
+    std::array<std::vector<std::vector<OverlayTri>>, 3> buckets;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        if (!_cutFaceLayout[axis].present) continue;
+        buckets[axis].resize(_cutFaceRefs[axis].size());
+    }
+
+    for (const CollectedTri& t : collected)
+    {
+        if (t.axis > 2 || !_cutFaceLayout[t.axis].present) continue;
+        const CutFaceLayout& layout = _cutFaceLayout[t.axis];
+        if (t.su >= layout.sampledW || t.sv >= layout.sampledH) continue;
+        const auto flat =
+            static_cast<std::size_t>(t.sv) * layout.sampledW + static_cast<std::size_t>(t.su);
+        OverlayTri tri;
+        tri.v[0] = {t.verts[0].pos, t.verts[0].normal};
+        tri.v[1] = {t.verts[1].pos, t.verts[1].normal};
+        tri.v[2] = {t.verts[2].pos, t.verts[2].normal};
+        tri.axis = t.axis;
+        buckets[t.axis][flat].push_back(tri);
+    }
+
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        if (!_cutFaceLayout[axis].present) continue;
+        const CutFaceLayout& layout = _cutFaceLayout[axis];
+        for (std::uint32_t sv = 0; sv < layout.sampledH; ++sv)
+        {
+            for (std::uint32_t su = 0; su < layout.sampledW; ++su)
+            {
+                const auto flat =
+                    static_cast<std::size_t>(sv) * layout.sampledW + static_cast<std::size_t>(su);
+                if (buckets[axis][flat].empty()) continue;
+                if (!writeCutFaceCell(axis, su, sv, buckets[axis][flat]))
+                {
+                    // Rare: a single cell exceeded the soft cap. Keep what we have.
+                    break;
+                }
+            }
+        }
+    }
+
+    _section.setDrawCount(_cutFaceAllocEnd);
+    _section.markDirty();
+    presentCutFace();
 }
 
 void GaussianSplatCache::patchCutFace(const RayModel& rayModel, int stride,
-                                              const BoundingBox& dirtyModelAabb,
-                                              const vsg::vec4& color)
+                                      const BoundingBox& dirtyModelAabb, const vsg::vec4& color)
 {
     if (!dirtyModelAabb.valid() || stride < 1) return;
-
     _cutFaceColor = color;
-    _cutFaceStride = stride;
-    _cutFaceResolution = rayModel.resolution();
+    if (!cutFaceLayoutMatches(rayModel, stride))
+    {
+        rebuildCutFace(rayModel, stride, color);
+        return;
+    }
 
     auto lock = rayModel.lockChains();
     std::array<SampledWindow, 3> windows{};
@@ -960,60 +1196,82 @@ void GaussianSplatCache::patchCutFace(const RayModel& rayModel, int stride,
     {
         const RayGrid* grid = rayModel.grid(axis);
         if (!grid || grid->empty()) continue;
-        windows[axis] = makeSampledWindow(*grid, dirtyModelAabb, stride, 0);
+        windows[axis] = makeSampledWindow(*grid, dirtyModelAabb, stride, kCutFaceHaloCells);
+        if (!windows[axis].valid) continue;
+        const SampledWindow& w = windows[axis];
+        for (std::uint32_t sv = w.sv0; sv < w.sv1; ++sv)
+        {
+            for (std::uint32_t su = w.su0; su < w.su1; ++su)
+                freeCutFaceCell(cutFaceRef(axis, su, sv));
+        }
     }
 
-    _cutFaceTris.erase(std::remove_if(_cutFaceTris.begin(), _cutFaceTris.end(),
-                                       [&](const OverlayTri& tri)
-                                       {
-                                           if (tri.axis > 2) return false;
-                                           const RayGrid* grid = rayModel.grid(tri.axis);
-                                           if (!grid) return false;
-                                           const SampledWindow& w = windows[tri.axis];
-                                           for (const OverlayVert& vert : tri.v)
-                                           {
-                                               if (sampledWindowContains(w, vert.pos, tri.axis,
-                                                                         *grid, stride))
-                                                   return true;
-                                           }
-                                           return false;
-                                       }),
-                        _cutFaceTris.end());
+    std::vector<CollectedTri> collected;
+    collectSectionTris(rayModel, stride, dirtyModelAabb, false, kCutFaceHaloCells, collected);
 
-    appendCutFaceTris(rayModel, stride, dirtyModelAabb, _cutFaceTris, false,
-                       kCutFaceHaloCells);
-    uploadSectionTris(_cutFaceTris, _cutFaceColor);
-}
-
-void GaussianSplatCache::rebuildCutFace(const RayModel& rayModel, int stride,
-                                                const vsg::vec4& color)
-{
-    _cutFaceColor = color;
-    _cutFaceStride = stride;
-    _cutFaceResolution = rayModel.resolution();
-    _cutFaceTris.clear();
-    if (stride < 1)
+    std::array<std::vector<std::vector<OverlayTri>>, 3> buckets;
+    for (std::size_t axis = 0; axis < 3; ++axis)
     {
-        clearSectionGrid();
-        return;
+        if (!windows[axis].valid || !_cutFaceLayout[axis].present) continue;
+        const SampledWindow& w = windows[axis];
+        const auto sampledW = w.su1 - w.su0;
+        const auto sampledH = w.sv1 - w.sv0;
+        if (sampledW == 0 || sampledH == 0) continue;
+        buckets[axis].resize(static_cast<std::size_t>(sampledW) * static_cast<std::size_t>(sampledH));
     }
 
-    auto lock = rayModel.lockChains();
-    appendCutFaceTris(rayModel, stride, BoundingBox{}, _cutFaceTris, false, 0);
-    uploadSectionTris(_cutFaceTris, _cutFaceColor);
+    for (const CollectedTri& t : collected)
+    {
+        if (t.axis > 2 || !windows[t.axis].valid) continue;
+        const SampledWindow& w = windows[t.axis];
+        if (t.su < w.su0 || t.su >= w.su1 || t.sv < w.sv0 || t.sv >= w.sv1) continue;
+        const auto sampledW = w.su1 - w.su0;
+        const auto flat = static_cast<std::size_t>(t.sv - w.sv0) * sampledW +
+                          static_cast<std::size_t>(t.su - w.su0);
+        OverlayTri tri;
+        tri.v[0] = {t.verts[0].pos, t.verts[0].normal};
+        tri.v[1] = {t.verts[1].pos, t.verts[1].normal};
+        tri.v[2] = {t.verts[2].pos, t.verts[2].normal};
+        tri.axis = t.axis;
+        buckets[t.axis][flat].push_back(tri);
+    }
+
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        if (!windows[axis].valid || buckets[axis].empty()) continue;
+        const SampledWindow& w = windows[axis];
+        const auto sampledW = w.su1 - w.su0;
+        for (std::uint32_t sv = w.sv0; sv < w.sv1; ++sv)
+        {
+            for (std::uint32_t su = w.su0; su < w.su1; ++su)
+            {
+                const auto flat = static_cast<std::size_t>(sv - w.sv0) * sampledW +
+                                  static_cast<std::size_t>(su - w.su0);
+                if (!writeCutFaceCell(axis, su, sv, buckets[axis][flat]))
+                {
+                    rebuildCutFace(rayModel, stride, color);
+                    return;
+                }
+            }
+        }
+    }
+
+    _section.setDrawCount(_cutFaceAllocEnd);
+    _section.flushDirty();
+    presentCutFace();
 }
 
 void GaussianSplatCache::showCutFace()
 {
-    uploadSectionTris(_cutFaceTris, _cutFaceColor);
+    presentCutFace();
 }
 
 void GaussianSplatCache::restoreCutFace(const RayModel& rayModel, int stride,
-                                                const vsg::vec4& color)
+                                        const vsg::vec4& color)
 {
-    if (stride == _cutFaceStride && rayModel.resolution() == _cutFaceResolution)
+    _cutFaceColor = color;
+    if (cutFaceLayoutMatches(rayModel, stride))
     {
-        _cutFaceColor = color;
         showCutFace();
         return;
     }

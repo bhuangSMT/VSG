@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include <vsg/all.h>
@@ -97,7 +98,7 @@ private:
 };
 
 // Mutable TRIANGLE_LIST overlay. Inspection replaces the draw in the current
-// cutter window; Subtraction/Union upload a persistent CPU cut-face list. The node
+// cutter window; Subtraction/Union patch a GPU-resident cut-face list. The node
 // is a child of GaussianSplatSet. Arrays are DYNAMIC_DATA so mouse-move only
 // dirty()s after the first compile.
 class SectionLineSet
@@ -107,7 +108,10 @@ public:
     void setTriangle(std::size_t index, const vsg::vec3& a, const vsg::vec3& b, const vsg::vec3& c,
                      const vsg::vec3& na, const vsg::vec3& nb, const vsg::vec3& nc,
                      const vsg::vec4& color);
+    void clearTriangle(std::size_t index);
     void setDrawCount(std::size_t triangleCount);
+    void noteDirtyTriangles(std::uint32_t first, std::uint32_t count);
+    void flushDirty();
     void markDirty();
     void release();
 
@@ -117,13 +121,21 @@ public:
     void noteCompiled() { _needsCompile = false; }
 
 private:
+    struct DirtySpan
+    {
+        std::uint32_t first = 0;
+        std::uint32_t count = 0;
+    };
+
     void ensurePipeline();
     void bindDraw();
     void applyDrawCount();
+    bool copyDirtySpan(const DirtySpan& span);
 
     std::size_t _capacity = 0;
     std::size_t _drawCount = 0;
     bool _needsCompile = false;
+    std::vector<DirtySpan> _dirtySpans;
     vsg::ref_ptr<vsg::vec3Array> _positions;
     vsg::ref_ptr<vsg::vec4Array> _colors;
     vsg::ref_ptr<vsg::vec3Array> _normals;

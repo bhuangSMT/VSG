@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -465,6 +466,11 @@ void GaussianSplatSet::applyDrawCount()
 
 void GaussianSplatSet::setOverlay(vsg::ref_ptr<vsg::Node> overlay)
 {
+    if (_root && _overlay && overlay != _overlay)
+    {
+        auto& kids = _root->children;
+        kids.erase(std::remove(kids.begin(), kids.end(), _overlay), kids.end());
+    }
     _overlay = overlay;
     attachOverlay();
 }
@@ -648,6 +654,7 @@ void SectionLineSet::ensureCapacity(std::size_t needed)
     _normals = normals;
     _indices = indices;
     _capacity = newCap;
+    _dirtySpans.clear();
     if (_drawCount > _capacity) _drawCount = _capacity;
 
     const bool hadRoot = _root != nullptr;
@@ -682,6 +689,20 @@ void SectionLineSet::setTriangle(std::size_t index, const vsg::vec3& a, const vs
     (*_normals)[base] = orFace(na);
     (*_normals)[base + 1] = orFace(nb);
     (*_normals)[base + 2] = orFace(nc);
+    noteDirtyTriangles(static_cast<std::uint32_t>(index), 1);
+}
+
+void SectionLineSet::clearTriangle(std::size_t index)
+{
+    if (!_positions || index >= _capacity) return;
+    const auto base = index * 3;
+    (*_positions)[base] = (*_positions)[base + 1] = (*_positions)[base + 2] =
+        vsg::vec3(0.0f, 0.0f, 0.0f);
+    (*_colors)[base] = (*_colors)[base + 1] = (*_colors)[base + 2] =
+        vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+    (*_normals)[base] = (*_normals)[base + 1] = (*_normals)[base + 2] =
+        vsg::vec3(0.0f, 0.0f, 1.0f);
+    noteDirtyTriangles(static_cast<std::uint32_t>(index), 1);
 }
 
 void SectionLineSet::setDrawCount(std::size_t triangleCount)
@@ -691,8 +712,109 @@ void SectionLineSet::setDrawCount(std::size_t triangleCount)
     applyDrawCount();
 }
 
+void SectionLineSet::noteDirtyTriangles(std::uint32_t first, std::uint32_t count)
+{
+    if (count == 0) return;
+
+    DirtySpan span{first, count};
+    auto it = std::lower_bound(
+        _dirtySpans.begin(), _dirtySpans.end(), span,
+        [](const DirtySpan& a, const DirtySpan& b) { return a.first < b.first; });
+    it = _dirtySpans.insert(it, span);
+
+    while (it + 1 != _dirtySpans.end() && it->first + it->count >= (it + 1)->first)
+    {
+        const auto nextEnd = (it + 1)->first + (it + 1)->count;
+        const auto thisEnd = it->first + it->count;
+        it->count = (nextEnd > thisEnd ? nextEnd : thisEnd) - it->first;
+        _dirtySpans.erase(it + 1);
+    }
+    if (it != _dirtySpans.begin())
+    {
+        auto prev = it - 1;
+        if (prev->first + prev->count >= it->first)
+        {
+            const auto thisEnd = it->first + it->count;
+            const auto prevEnd = prev->first + prev->count;
+            prev->count = (thisEnd > prevEnd ? thisEnd : prevEnd) - prev->first;
+            _dirtySpans.erase(it);
+        }
+    }
+}
+
+namespace
+{
+
+bool copyArrayRange(vsg::BufferInfo& info, std::uint32_t firstVert, std::uint32_t vertCount)
+{
+    if (!info.buffer || !info.data || vertCount == 0) return false;
+    if (info.buffer->sizeVulkanData() == 0) return false;
+
+    const auto stride = info.data->stride();
+    if (stride == 0) return false;
+
+    const auto bytes = vertCount * stride;
+    const auto byteOffset = firstVert * stride;
+    if (static_cast<VkDeviceSize>(byteOffset) + static_cast<VkDeviceSize>(bytes) > info.range)
+        return false;
+
+    const auto* src = static_cast<const std::uint8_t*>(info.data->dataPointer());
+    if (!src) return false;
+    src += byteOffset;
+
+    for (std::uint32_t deviceID = 0; deviceID < info.buffer->sizeVulkanData(); ++deviceID)
+    {
+        vsg::DeviceMemory* memory = info.buffer->getDeviceMemory(deviceID);
+        if (!memory) return false;
+        if ((memory->getMemoryPropertyFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
+            return false;
+
+        void* dst = nullptr;
+        const VkResult result =
+            memory->map(info.buffer->getMemoryOffset(deviceID) + info.offset + byteOffset,
+                        bytes, 0, &dst);
+        if (result != VK_SUCCESS || !dst) return false;
+        std::memcpy(dst, src, bytes);
+        memory->unmap();
+    }
+    return true;
+}
+
+} // namespace
+
+bool SectionLineSet::copyDirtySpan(const DirtySpan& span)
+{
+    if (!_draw || _draw->arrays.size() < 3) return false;
+    const auto firstVert = span.first * 3u;
+    const auto vertCount = span.count * 3u;
+    return copyArrayRange(*_draw->arrays[0], firstVert, vertCount) &&
+           copyArrayRange(*_draw->arrays[1], firstVert, vertCount) &&
+           copyArrayRange(*_draw->arrays[2], firstVert, vertCount);
+}
+
+void SectionLineSet::flushDirty()
+{
+    if (_dirtySpans.empty()) return;
+    if (_needsCompile || !_draw)
+    {
+        markDirty();
+        return;
+    }
+
+    for (const DirtySpan& span : _dirtySpans)
+    {
+        if (!copyDirtySpan(span))
+        {
+            markDirty();
+            return;
+        }
+    }
+    _dirtySpans.clear();
+}
+
 void SectionLineSet::markDirty()
 {
+    _dirtySpans.clear();
     if (_positions) _positions->dirty();
     if (_colors) _colors->dirty();
     if (_normals) _normals->dirty();
@@ -703,6 +825,7 @@ void SectionLineSet::release()
     _capacity = 0;
     _drawCount = 0;
     _needsCompile = false;
+    _dirtySpans.clear();
     _positions = nullptr;
     _colors = nullptr;
     _normals = nullptr;

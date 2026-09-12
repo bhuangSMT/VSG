@@ -240,7 +240,7 @@ private:
     void rebuildSplatCache();
     void presentSplatCache();
     bool splatOnScreen() const;
-    // Inspection: replace-in-window overlay. Does not touch stored cut-face tris.
+    // Inspection: replace-in-window overlay. Does not rewrite _section slots.
     void syncInspectionSectionGrid(const BoundingBox& sectionAabb);
 
     // One --profile line for a completed cut. drawPath names how the display

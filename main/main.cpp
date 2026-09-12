@@ -22,6 +22,7 @@
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QDoubleSpinBox>
+#include <QtWidgets/QStyleFactory>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QMessageBox>
@@ -237,6 +238,12 @@ private:
     bool _rightPressed = false;
 };
 
+void useLightSpinArrows(QAbstractSpinBox* spin)
+{
+    // macOS Cocoa keeps native black steppers unless the widget uses Fusion.
+    if (spin) spin->setStyle(QStyleFactory::create("Fusion"));
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -273,6 +280,21 @@ try
         "  background-color: #243352; color: #e8eef4;"
         "}"
         "QPushButton, QComboBox, QAbstractSpinBox, QLineEdit { padding: 2px 8px; }"
+        "QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {"
+        "  background: #243352; border: none; width: 16px;"
+        "}"
+        "QAbstractSpinBox::up-arrow {"
+        "  image: none; width: 0; height: 0;"
+        "  border-left: 4px solid transparent;"
+        "  border-right: 4px solid transparent;"
+        "  border-bottom: 5px solid #e8eef4;"
+        "}"
+        "QAbstractSpinBox::down-arrow {"
+        "  image: none; width: 0; height: 0;"
+        "  border-left: 4px solid transparent;"
+        "  border-right: 4px solid transparent;"
+        "  border-top: 5px solid #e8eef4;"
+        "}"
         "QHeaderView::section { padding: 4px 6px; }"
         "QTableWidget::item, QTableView::item { padding: 3px 4px; }"
         "QPushButton { background-color: #2a3a5c; color: #e8eef4; }"
@@ -457,6 +479,7 @@ try
     for (std::size_t i = 0; i < 3; ++i)
     {
         auto spin = new QDoubleSpinBox();
+        useLightSpinArrows(spin);
         spin->setDecimals(6);
         spin->setRange(1.0e-6, 1.0e9);
         spin->setValue(0.000625);
@@ -488,6 +511,7 @@ try
 
     addWidget(new QLabel("Radius:"));
     auto radiusSpin = new QDoubleSpinBox();
+    useLightSpinArrows(radiusSpin);
     radiusSpin->setDecimals(6);
     radiusSpin->setRange(1.0e-9, 1.0e9);
     radiusSpin->setValue(app::Parameter::instance().toolRadius());
@@ -495,6 +519,7 @@ try
 
     addWidget(new QLabel("Length:"));
     auto lengthSpin = new QDoubleSpinBox();
+    useLightSpinArrows(lengthSpin);
     lengthSpin->setDecimals(6);
     lengthSpin->setRange(1.0e-9, 1.0e9);
     lengthSpin->setValue(app::Parameter::instance().toolLength());
