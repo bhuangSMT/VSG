@@ -72,27 +72,27 @@ public:
                              bool skipCutSplats = false);
 
     // Inspection preview: replace the GPU overlay with UV quads in sectionAabb
-    // using the same collect as Subtract (no 3D AABB clip, halo stitch).
-    // Does not touch the accumulated Subtraction triangle list.
+    // using the same collect as the cut-face overlay (no 3D AABB clip, halo stitch).
+    // Does not touch the accumulated cut-face triangle list.
     void updateSectionGrid(const RayModel& rayModel, int stride, const BoundingBox& sectionAabb,
                            const vsg::vec4& color);
-    // Hide the GPU overlay; keep any stored Subtraction triangles.
+    // Hide the GPU overlay; keep any stored cut-face triangles.
     void clearSectionGrid();
 
-    // Subtraction: drop tris in the dirty UV window, remesh a larger overlapping
-    // halo of cut-tagged ends on those rays, and upload.
-    void patchSubtractSection(const RayModel& rayModel, int stride,
-                              const BoundingBox& dirtyModelAabb, const vsg::vec4& color);
-    // Subtraction splat-rebuild fallback: remesh every cut-tagged end at stride.
-    void rebuildSubtractSection(const RayModel& rayModel, int stride, const vsg::vec4& color);
-    // Re-upload stored Subtraction tris when stride/resolution still match;
+    // Cut face (Subtraction and Union): drop tris in the dirty UV window, remesh
+    // a larger overlapping halo of cut-tagged ends on those rays, and upload.
+    void patchCutFace(const RayModel& rayModel, int stride,
+                      const BoundingBox& dirtyModelAabb, const vsg::vec4& color);
+    // Cut-face splat-rebuild fallback: remesh every cut-tagged end at stride.
+    void rebuildCutFace(const RayModel& rayModel, int stride, const vsg::vec4& color);
+    // Re-upload stored cut-face tris when stride/resolution still match;
     // otherwise remesh every cut-tagged end at the new display stride.
-    void restoreSubtractSection(const RayModel& rayModel, int stride, const vsg::vec4& color);
-    // Re-upload stored Subtraction tris (leave Inspection without a remesh).
-    void showSubtractSection();
-    // Drop stored Subtraction tris and hide the overlay (Union / new model).
-    void clearSubtractSection();
-    bool hasSubtractSection() const { return !_subtractTris.empty(); }
+    void restoreCutFace(const RayModel& rayModel, int stride, const vsg::vec4& color);
+    // Re-upload stored cut-face tris (leave Inspection without a remesh).
+    void showCutFace();
+    // Drop stored cut-face tris and hide the overlay.
+    void clearCutFace();
+    bool hasCutFace() const { return !_cutFaceTris.empty(); }
 
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
     void markDirty();
@@ -167,8 +167,8 @@ private:
     };
 
     void uploadSectionTris(const std::vector<OverlayTri>& tris, const vsg::vec4& color);
-    void appendSubtractTris(const RayModel& rayModel, int stride, const BoundingBox& box,
-                            std::vector<OverlayTri>& out, bool clipToAabb, int haloCells) const;
+    void appendCutFaceTris(const RayModel& rayModel, int stride, const BoundingBox& box,
+                           std::vector<OverlayTri>& out, bool clipToAabb, int haloCells) const;
 
     GaussianSplatSet _set;
     std::array<AxisLayout, 3> _axes{};
@@ -181,10 +181,10 @@ private:
     std::uint32_t _allocEnd = 0; // one past the last allocated slot
     bool _gpuNeedsCompile = false;
     bool _skipCutSplats = false;
-    int _subtractStride = 0;
-    Point3d _subtractResolution{0.0, 0.0, 0.0};
-    vsg::vec4 _subtractColor{0.95f, 0.35f, 0.10f, 1.0f};
-    std::vector<OverlayTri> _subtractTris;
+    int _cutFaceStride = 0;
+    Point3d _cutFaceResolution{0.0, 0.0, 0.0};
+    vsg::vec4 _cutFaceColor{0.95f, 0.35f, 0.10f, 1.0f};
+    std::vector<OverlayTri> _cutFaceTris;
     SectionLineSet _section;
 };
 

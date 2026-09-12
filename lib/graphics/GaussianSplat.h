@@ -97,7 +97,7 @@ private:
 };
 
 // Mutable TRIANGLE_LIST overlay. Inspection replaces the draw in the current
-// cutter window; Subtraction uploads a persistent CPU triangle list. The node
+// cutter window; Subtraction/Union upload a persistent CPU cut-face list. The node
 // is a child of GaussianSplatSet. Arrays are DYNAMIC_DATA so mouse-move only
 // dirty()s after the first compile.
 class SectionLineSet

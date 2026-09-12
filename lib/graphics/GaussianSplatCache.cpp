@@ -116,9 +116,9 @@ void collectSectionPoints(const RayGrid& grid, std::size_t axis, std::uint32_t i
         start[v] = v0;
         end[v] = v0;
         // Inspection clips to the cutter AABB so leftover stock ends in that
-        // box do not fill it as a square. Subtraction walks a UV window and
-        // takes every tagged leftover on those rays (steep faces jump outside
-        // the 3D box between adjacent samples).
+        // box do not fill it as a square. The cut-face overlay walks a UV
+        // window and takes every tagged leftover on those rays (steep faces
+        // jump outside the 3D box between adjacent samples).
         if (span.cutBegin() && (!clipToAabb || !box.valid() || box.contains(start)))
         {
             out.push_back({start[axis],
@@ -224,9 +224,9 @@ double vecComponent(const vsg::vec3& p, std::size_t axis)
     return static_cast<double>(p.z);
 }
 
-constexpr int kSubtractHaloCells = 4;
+constexpr int kCutFaceHaloCells = 4;
 constexpr float kInspectionMaxEdgeScale = 2.5f;
-constexpr float kSubtractMaxEdgeScale = 8.0f;
+constexpr float kCutFaceMaxEdgeScale = 8.0f;
 
 void growGridWindowByStride(const RayGrid& grid, int stride, int haloCells,
                             std::uint32_t& iu0, std::uint32_t& iu1,
@@ -318,7 +318,7 @@ void collectSectionTris(const RayModel& rayModel, int stride, const BoundingBox&
 
         const double du = grid->spacingU * static_cast<double>(stride);
         const double dv = grid->spacingV * static_cast<double>(stride);
-        const float edgeScale = clipToAabb ? kInspectionMaxEdgeScale : kSubtractMaxEdgeScale;
+        const float edgeScale = clipToAabb ? kInspectionMaxEdgeScale : kCutFaceMaxEdgeScale;
         const float maxEdge = edgeScale * static_cast<float>(std::sqrt(du * du + dv * dv));
 
         std::vector<std::array<SectionVert, 3>> quads;
@@ -380,7 +380,7 @@ void GaussianSplatCache::clear()
     _skipCutSplats = false;
     _capacity = _set.capacity();
     _set.setDrawCount(0);
-    clearSubtractSection();
+    clearCutFace();
 }
 
 void GaussianSplatCache::release()
@@ -397,9 +397,9 @@ void GaussianSplatCache::release()
     _allocEnd = 0;
     _gpuNeedsCompile = true;
     _skipCutSplats = false;
-    _subtractTris.clear();
-    _subtractStride = 0;
-    _subtractResolution = Point3d{0.0, 0.0, 0.0};
+    _cutFaceTris.clear();
+    _cutFaceStride = 0;
+    _cutFaceResolution = Point3d{0.0, 0.0, 0.0};
     _section.release();
 }
 
@@ -842,7 +842,7 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
 
         std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
         if (!gridWindowFromModelAabb(*grid, modelAabb, iu0, iu1, iv0, iv1)) continue;
-        growGridWindowByStride(*grid, _stride, kSubtractHaloCells, iu0, iu1, iv0, iv1);
+        growGridWindowByStride(*grid, _stride, kCutFaceHaloCells, iu0, iu1, iv0, iv1);
 
         const float radius = radii[axis];
         for (std::uint32_t iv = iv0; iv <= iv1; ++iv)
@@ -883,11 +883,11 @@ void GaussianSplatCache::clearSectionGrid()
     _section.markDirty();
 }
 
-void GaussianSplatCache::clearSubtractSection()
+void GaussianSplatCache::clearCutFace()
 {
-    _subtractTris.clear();
-    _subtractStride = 0;
-    _subtractResolution = Point3d{0.0, 0.0, 0.0};
+    _cutFaceTris.clear();
+    _cutFaceStride = 0;
+    _cutFaceResolution = Point3d{0.0, 0.0, 0.0};
     clearSectionGrid();
 }
 
@@ -909,7 +909,7 @@ void GaussianSplatCache::uploadSectionTris(const std::vector<OverlayTri>& tris,
     _set.setOverlay(_section.node());
 }
 
-void GaussianSplatCache::appendSubtractTris(const RayModel& rayModel, int stride,
+void GaussianSplatCache::appendCutFaceTris(const RayModel& rayModel, int stride,
                                             const BoundingBox& box,
                                             std::vector<OverlayTri>& out, bool clipToAabb,
                                             int haloCells) const
@@ -940,19 +940,19 @@ void GaussianSplatCache::updateSectionGrid(const RayModel& rayModel, int stride,
 
     auto lock = rayModel.lockChains();
     std::vector<OverlayTri> tris;
-    appendSubtractTris(rayModel, stride, sectionAabb, tris, false, kSubtractHaloCells);
+    appendCutFaceTris(rayModel, stride, sectionAabb, tris, false, kCutFaceHaloCells);
     uploadSectionTris(tris, color);
 }
 
-void GaussianSplatCache::patchSubtractSection(const RayModel& rayModel, int stride,
+void GaussianSplatCache::patchCutFace(const RayModel& rayModel, int stride,
                                               const BoundingBox& dirtyModelAabb,
                                               const vsg::vec4& color)
 {
     if (!dirtyModelAabb.valid() || stride < 1) return;
 
-    _subtractColor = color;
-    _subtractStride = stride;
-    _subtractResolution = rayModel.resolution();
+    _cutFaceColor = color;
+    _cutFaceStride = stride;
+    _cutFaceResolution = rayModel.resolution();
 
     auto lock = rayModel.lockChains();
     std::array<SampledWindow, 3> windows{};
@@ -963,7 +963,7 @@ void GaussianSplatCache::patchSubtractSection(const RayModel& rayModel, int stri
         windows[axis] = makeSampledWindow(*grid, dirtyModelAabb, stride, 0);
     }
 
-    _subtractTris.erase(std::remove_if(_subtractTris.begin(), _subtractTris.end(),
+    _cutFaceTris.erase(std::remove_if(_cutFaceTris.begin(), _cutFaceTris.end(),
                                        [&](const OverlayTri& tri)
                                        {
                                            if (tri.axis > 2) return false;
@@ -978,20 +978,20 @@ void GaussianSplatCache::patchSubtractSection(const RayModel& rayModel, int stri
                                            }
                                            return false;
                                        }),
-                        _subtractTris.end());
+                        _cutFaceTris.end());
 
-    appendSubtractTris(rayModel, stride, dirtyModelAabb, _subtractTris, false,
-                       kSubtractHaloCells);
-    uploadSectionTris(_subtractTris, _subtractColor);
+    appendCutFaceTris(rayModel, stride, dirtyModelAabb, _cutFaceTris, false,
+                       kCutFaceHaloCells);
+    uploadSectionTris(_cutFaceTris, _cutFaceColor);
 }
 
-void GaussianSplatCache::rebuildSubtractSection(const RayModel& rayModel, int stride,
+void GaussianSplatCache::rebuildCutFace(const RayModel& rayModel, int stride,
                                                 const vsg::vec4& color)
 {
-    _subtractColor = color;
-    _subtractStride = stride;
-    _subtractResolution = rayModel.resolution();
-    _subtractTris.clear();
+    _cutFaceColor = color;
+    _cutFaceStride = stride;
+    _cutFaceResolution = rayModel.resolution();
+    _cutFaceTris.clear();
     if (stride < 1)
     {
         clearSectionGrid();
@@ -999,25 +999,25 @@ void GaussianSplatCache::rebuildSubtractSection(const RayModel& rayModel, int st
     }
 
     auto lock = rayModel.lockChains();
-    appendSubtractTris(rayModel, stride, BoundingBox{}, _subtractTris, false, 0);
-    uploadSectionTris(_subtractTris, _subtractColor);
+    appendCutFaceTris(rayModel, stride, BoundingBox{}, _cutFaceTris, false, 0);
+    uploadSectionTris(_cutFaceTris, _cutFaceColor);
 }
 
-void GaussianSplatCache::showSubtractSection()
+void GaussianSplatCache::showCutFace()
 {
-    uploadSectionTris(_subtractTris, _subtractColor);
+    uploadSectionTris(_cutFaceTris, _cutFaceColor);
 }
 
-void GaussianSplatCache::restoreSubtractSection(const RayModel& rayModel, int stride,
+void GaussianSplatCache::restoreCutFace(const RayModel& rayModel, int stride,
                                                 const vsg::vec4& color)
 {
-    if (stride == _subtractStride && rayModel.resolution() == _subtractResolution)
+    if (stride == _cutFaceStride && rayModel.resolution() == _cutFaceResolution)
     {
-        _subtractColor = color;
-        showSubtractSection();
+        _cutFaceColor = color;
+        showCutFace();
         return;
     }
-    rebuildSubtractSection(rayModel, stride, color);
+    rebuildCutFace(rayModel, stride, color);
 }
 
 } // namespace app

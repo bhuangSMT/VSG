@@ -528,7 +528,7 @@ void RenderManager::rebuildSplatCache()
     if (op == BooleanOp::Inspection)
         syncInspectionSectionGrid(_inspectionPrevAabb);
     else
-        _splatCache.restoreSubtractSection(*_rayModel, stride, splatStyle().toolColor);
+        _splatCache.restoreCutFace(*_rayModel, stride, splatStyle().toolColor);
     presentSplatCache();
 }
 
@@ -1055,7 +1055,7 @@ void RenderManager::resetBooleanStock()
     _inspectionPrevAabb = {};
     _inspectionBooleanPose.reset();
     _rayModel = _sourceRayModel;
-    _splatCache.clearSubtractSection();
+    _splatCache.clearCutFace();
     if (usesRayModel(_viewMode) && _rayModel && _rayModel->rayCount() > 0)
         rebuild();
     else if (_viewer)
@@ -1667,10 +1667,10 @@ void RenderManager::applyBooleanToRayModel()
             if (op == BooleanOp::Inspection)
                 syncInspectionSectionGrid(dirtyModelAabb);
             else if (accumulatesCutMesh(op))
-                _splatCache.patchSubtractSection(*_rayModel, stride, dirtyModelAabb,
+                _splatCache.patchCutFace(*_rayModel, stride, dirtyModelAabb,
                                                  splatStyle().toolColor);
             else
-                _splatCache.restoreSubtractSection(*_rayModel, stride, splatStyle().toolColor);
+                _splatCache.restoreCutFace(*_rayModel, stride, splatStyle().toolColor);
             const double sectionMs = millisSince(sectionStart);
             logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
             if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
@@ -1707,9 +1707,9 @@ void RenderManager::applyBooleanToRayModel()
             if (op == BooleanOp::Inspection)
                 syncInspectionSectionGrid(dirtyModelAabb);
             else if (accumulatesCutMesh(op))
-                _splatCache.rebuildSubtractSection(*_rayModel, stride, splatStyle().toolColor);
+                _splatCache.rebuildCutFace(*_rayModel, stride, splatStyle().toolColor);
             else
-                _splatCache.restoreSubtractSection(*_rayModel, stride, splatStyle().toolColor);
+                _splatCache.restoreCutFace(*_rayModel, stride, splatStyle().toolColor);
             const double sectionMs = millisSince(sectionStart);
             presentSplatCache();
             logCutProfile(booleanMs, "rebuild", splatMs, dirtyModelAabb, cloneMs, sectionMs);
