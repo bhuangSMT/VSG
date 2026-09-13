@@ -45,6 +45,7 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <optional>
 
 #include "BRep.h"
 #include "BoundingBox.h"
@@ -57,6 +58,7 @@
 #include "ThreeMfImporter.h"
 #include "ToolTracker.h"
 #include "ToolType.h"
+#include "UcamDebug.h"
 
 namespace
 {
@@ -355,21 +357,28 @@ try
     // rather than passed around separately.
     parameters.setRayDivisions(rayDivisions);
 
-    int startupViewModeIndex = 0;
+    const bool debugUi = app::ucamDebugEnabled();
+    std::optional<app::ViewMode> startupViewModeValue;
     if (!startupViewMode.empty())
     {
         if (startupViewMode == "facet")
-            startupViewModeIndex = 0;
+            startupViewModeValue = app::ViewMode::Facet;
         else if (startupViewMode == "wireframe")
-            startupViewModeIndex = 1;
+            startupViewModeValue = app::ViewMode::Wireframe;
         else if (startupViewMode == "ray")
-            startupViewModeIndex = 2;
+            startupViewModeValue = app::ViewMode::Ray;
         else if (startupViewMode == "ray-gs")
-            startupViewModeIndex = 3;
+            startupViewModeValue = app::ViewMode::RayGS;
         else
         {
             std::cerr << "unknown --view-mode '" << startupViewMode
                       << "', expected facet, wireframe, ray or ray-gs" << std::endl;
+            return 1;
+        }
+        if (*startupViewModeValue == app::ViewMode::Ray && !debugUi)
+        {
+            std::cerr << "--view-mode ray requires " << app::kUcamDebugEnv << '='
+                      << app::kUcamDebugKey << std::endl;
             return 1;
         }
     }
@@ -470,11 +479,21 @@ try
     auto viewModeCombo = new QComboBox();
     viewModeCombo->addItem("Facet", static_cast<int>(app::ViewMode::Facet));
     viewModeCombo->addItem("Wireframe", static_cast<int>(app::ViewMode::Wireframe));
-    viewModeCombo->addItem("Ray", static_cast<int>(app::ViewMode::Ray));
+    if (debugUi)
+        viewModeCombo->addItem("Ray", static_cast<int>(app::ViewMode::Ray));
     viewModeCombo->addItem("Simulation", static_cast<int>(app::ViewMode::RayGS));
     addWidget(viewModeCombo);
 
-    addWidget(new QLabel("Ray Resolution"));
+    int startupViewModeIndex = 0;
+    if (startupViewModeValue)
+    {
+        const int found =
+            viewModeCombo->findData(static_cast<int>(*startupViewModeValue));
+        if (found >= 0) startupViewModeIndex = found;
+    }
+
+    auto resolutionLabel = new QLabel("Ray Resolution");
+    addWidget(resolutionLabel);
     std::array<QDoubleSpinBox*, 3> resolutionSpins{nullptr, nullptr, nullptr};
     const std::array<const char*, 3> axisNames{"X", "Y", "Z"};
     for (std::size_t i = 0; i < 3; ++i)
@@ -491,6 +510,12 @@ try
 
     auto applyResolutionButton = new QPushButton("Apply");
     addWidget(applyResolutionButton);
+    if (!debugUi)
+    {
+        resolutionLabel->hide();
+        for (auto* spin : resolutionSpins) spin->hide();
+        applyResolutionButton->hide();
+    }
 
     auto continuousCheck = new QCheckBox("Continuous update");
     continuousCheck->setChecked(true);
@@ -837,7 +862,8 @@ try
         renderManager->setRayModel(app::RayModel::fromBRep(*brep, resolution));
     };
 
-    const int rayModeIndex = viewModeCombo->findData(static_cast<int>(app::ViewMode::Ray));
+    const int simulationModeIndex =
+        viewModeCombo->findData(static_cast<int>(app::ViewMode::RayGS));
 
     QObject::connect(viewModeCombo, &QComboBox::currentIndexChanged,
                      [mainWindow, renderManager, viewModeCombo, buildRayModel, simDock](int index) {
@@ -865,7 +891,7 @@ try
     // ray view is not already showing, switching to it does the recast, so the
     // work is never done twice.
     QObject::connect(applyResolutionButton, &QPushButton::clicked,
-                     [mainWindow, viewModeCombo, rayModeIndex, buildRayModel]() {
+                     [mainWindow, viewModeCombo, simulationModeIndex, buildRayModel]() {
                          try
                          {
                              // Already on Ray or Ray-GS: recast in place and
@@ -873,7 +899,7 @@ try
                              if (app::usesRayModel(app::Parameter::instance().viewMode()))
                                  buildRayModel();
                              else
-                                 viewModeCombo->setCurrentIndex(rayModeIndex);
+                                 viewModeCombo->setCurrentIndex(simulationModeIndex);
                          }
                          catch (const std::exception& e)
                          {

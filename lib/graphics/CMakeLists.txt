@@ -17,6 +17,7 @@ install(FILES
     Parameter.h
     RenderManager.h
     SimulationMode.h
+    UcamDebug.h
     ViewMode.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
