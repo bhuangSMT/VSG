@@ -18,6 +18,7 @@
 #include "Parameter.h"
 #include "RenderManager.h"
 #include "SimulationPanel.h"
+#include "WorldAxes.h"
 
 namespace app
 {
@@ -50,6 +51,22 @@ public:
             _rightPressX = press.x;
             _rightPressY = press.y;
             return;
+        }
+        if (press.button == 1 && _renderManager && _camera)
+        {
+            if (const auto part = _renderManager->pickWorldAxis(*_camera, press.x, press.y))
+            {
+                _renderManager->selectWorldAxis(*part);
+                if (_simulationPanel && _simulationPanel->isPickingHelixAxis())
+                    _simulationPanel->setHelixAxisFromPick(worldAxisIndex(*part));
+                press.handled = true;
+                return;
+            }
+            // Click empty space clears axis selection / cancels helix axis pick.
+            if (_simulationPanel && _simulationPanel->isPickingHelixAxis())
+                _simulationPanel->cancelHelixAxisPick();
+            if (_renderManager->selectedWorldAxis() != WorldAxisPart::None)
+                _renderManager->selectWorldAxis(WorldAxisPart::None);
         }
         update(press.x, press.y);
     }

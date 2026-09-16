@@ -53,6 +53,8 @@ float splatRadiusForSpan(float cellRadius, double modelLength, double cellDiag, 
 // Mutable GPU splat buffers. After a packed rebuild only `setDrawCount`
 // slots are issued; padding is not submitted. The shader also clips
 // radius <= 0 so a sparse updateRegion path can hide free-list holes.
+// updateRegion records dirty slot spans and flushDirty() maps those
+// ranges. rebuild / first compile still markDirty() the whole buffer.
 class GaussianSplatSet
 {
 public:
@@ -63,6 +65,10 @@ public:
 
     void set(std::size_t index, const Splat& splat);
     void clearSlot(std::size_t index);
+    // Slot spans for the sequential patch path. rebuild fills in parallel
+    // and must not call this; it markDirty()s the whole buffer instead.
+    void noteDirtySlots(std::uint32_t first, std::uint32_t count);
+    void flushDirty();
     void markDirty();
     // How many packed slots the draw issues. Unused tail / free-list holes
     // are not submitted, so a leftover radius on the GPU cannot appear.
@@ -74,17 +80,28 @@ public:
     std::size_t capacity() const { return _capacity; }
     vsg::ref_ptr<vsg::Node> node() const { return _root; }
     bool empty() const { return !_root || _capacity == 0; }
+    bool needsCompile() const { return _needsCompile; }
+    void noteCompiled() { _needsCompile = false; }
 
 private:
+    struct DirtySpan
+    {
+        std::uint32_t first = 0;
+        std::uint32_t count = 0;
+    };
+
     void ensurePipelines();
     void initSlotGeometry(std::size_t beginSplat, std::size_t endSplat);
     void zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat);
     void bindDrawArrays();
     void applyDrawCount();
     void attachOverlay();
+    bool copyDirtySpan(const DirtySpan& span);
 
     std::size_t _capacity = 0;
     std::size_t _drawCount = 0;
+    bool _needsCompile = false;
+    std::vector<DirtySpan> _dirtySpans;
     vsg::ref_ptr<vsg::vec4Array> _centerRadius;
     vsg::ref_ptr<vsg::vec2Array> _corners;
     vsg::ref_ptr<vsg::vec4Array> _colors;

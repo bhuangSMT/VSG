@@ -7,6 +7,7 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include <vsg/maths/vec3.h>
 
@@ -46,14 +47,32 @@ public:
     // Flat: stadium prism (Minkowski of the cylinder with tipA→tipB).
     // Bull: flat tip stadium + quarter-torus fillet loft + shank stadium prism.
     // Sphere: capsule about the centre path (cylinder + hemispheres).
-    // Ball nose: centre-path cylinder, tip + lower motion caps, then shank loft.
+    // Ball nose: lower motion capsule, vertical shank lofts, one stadium lid.
+    // Grinding wheel: loft the cutter triangle from A to B with two flat
+    // triangular caps (no revolved ends).
     // circleSegments is the azimuthal tessellation for rings / stadium ends.
     void appendSegment(ToolType type,
                        float radius,
                        float height,
                        const ToolPose& tipA,
                        const ToolPose& tipB,
-                       int circleSegments = 8);
+                       int circleSegments = 8,
+                       float vertexAngleDeg = 60.0f,
+                       float shankRadius = 0.0f,
+                       float shankLength = 0.0f);
+
+    // Append a polyline of tool poses as one swept solid: projections are
+    // connected station-to-station with caps only at the first and last pose
+    // (grinding wheel). Other tool types fall back to consecutive segments.
+    // Requires at least two poses.
+    void appendPath(ToolType type,
+                    float radius,
+                    float height,
+                    const std::vector<ToolPose>& poses,
+                    int circleSegments = 8,
+                    float vertexAngleDeg = 60.0f,
+                    float shankRadius = 0.0f,
+                    float shankLength = 0.0f);
 
     // Append triangles from another soup. rebuildHierarchy rebuilds the BVH
     // (needed when this volume is used for boolean). Display-only accumulation

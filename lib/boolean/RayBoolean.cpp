@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iterator>
+#include <stdexcept>
 #include <vector>
 
 #include <tbb/blocked_range.h>
@@ -166,6 +167,16 @@ std::vector<Interval> unionTicks(const std::vector<Interval>& solid,
                 cur.end = nxt.end;
                 cur.endNormal = nxt.endNormal;
                 cur.setCutEnd(nxt.cutEnd());
+            }
+            else if (nxt.end == cur.end && nxt.cutEnd())
+            {
+                cur.setCutEnd(true);
+                cur.endNormal = nxt.endNormal;
+            }
+            if (nxt.begin == cur.begin && nxt.cutBegin())
+            {
+                cur.setCutBegin(true);
+                cur.beginNormal = nxt.beginNormal;
             }
             if (nxt.fromBoolean()) cur.setFromBoolean(true);
         }
@@ -541,6 +552,109 @@ void RayModel::booleanInPlace(const SweptVolume& sweep,
                               const vsg::dmat4& modelToWorld)
 {
     applyBooleanInPlace(*this, sweep, op, modelToWorld);
+}
+
+void RayModel::shellInPlace(double thickness)
+{
+    if (!(thickness > 0.0))
+        throw std::invalid_argument("Shell thickness must be positive.");
+
+    auto lock = lockChains();
+
+    auto negate = [](const Normal3f& n) {
+        return Normal3f{-n[0], -n[1], -n[2]};
+    };
+    // Reversed outward normal for a new offset end. Falls back to the axis
+    // direction opposite the original enter/exit convention when the stored
+    // normal is degenerate (overlay / GS then still have a sheet direction).
+    auto reversedFrom = [&](const Normal3f& n, std::size_t axis, bool originalEnter) {
+        const float len2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+        if (len2 < 1.0e-12f)
+        {
+            Normal3f out{0.0f, 0.0f, 0.0f};
+            out[axis] = originalEnter ? 1.0f : -1.0f;
+            return out;
+        }
+        return negate(n);
+    };
+
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        RayGrid* g = grid(axis);
+        if (!g || g->empty() || !(g->unit > 0.0f)) continue;
+
+        const double ticks = thickness / static_cast<double>(g->unit);
+        std::int32_t offset = static_cast<std::int32_t>(std::llround(ticks));
+        if (offset < 1) offset = 1;
+
+        for (RaySlot& slot : g->cells)
+        {
+            if (slot.intervalCount == 0) continue;
+
+            const IntervalSpan span = g->pool.span(slot);
+            std::vector<Interval> walls;
+            walls.reserve(static_cast<std::size_t>(span.count) * 2);
+
+            for (const Interval* it = span.begin(); it != span.end(); ++it)
+            {
+                const std::int32_t begin = it->begin;
+                const std::int32_t end = it->end;
+                const std::int32_t innerEnd = begin + offset;
+                const std::int32_t innerBegin = end - offset;
+
+                // Overlapping walls from the same parent: drop both.
+                if (innerEnd > innerBegin) continue;
+
+                Interval entryWall;
+                entryWall.begin = begin;
+                entryWall.end = innerEnd;
+                entryWall.beginNormal = it->beginNormal;
+                // New offset end: reverse of the original entry normal.
+                entryWall.endNormal = reversedFrom(it->beginNormal, axis, true);
+                entryWall.flags = 0;
+                if (it->fromBoolean()) entryWall.setFromBoolean(true);
+                // Splat color follows cut flags (tool vs stock). Match the new
+                // offset end to the paired original entry.
+                if (it->cutBegin())
+                {
+                    entryWall.setCutBegin(true);
+                    entryWall.setCutEnd(true);
+                }
+
+                Interval exitWall;
+                exitWall.begin = innerBegin;
+                exitWall.end = end;
+                // New offset begin: reverse of the original exit normal.
+                exitWall.beginNormal = reversedFrom(it->endNormal, axis, false);
+                exitWall.endNormal = it->endNormal;
+                exitWall.flags = 0;
+                if (it->fromBoolean()) exitWall.setFromBoolean(true);
+                if (it->cutEnd())
+                {
+                    exitWall.setCutEnd(true);
+                    exitWall.setCutBegin(true);
+                }
+
+                if (entryWall.hasSolidLength()) walls.push_back(entryWall);
+                if (exitWall.hasSolidLength()) walls.push_back(exitWall);
+            }
+
+            if (walls.empty())
+            {
+                g->pool.wasted += slot.capacity();
+                slot.intervalCount = 0;
+                slot.intervalCapacity = 0;
+                slot.intervalOffset = 0;
+                continue;
+            }
+
+            if (!g->pool.tryReplaceInPlace(slot, walls.data(),
+                                           static_cast<std::uint32_t>(walls.size())))
+                g->pool.append(slot, walls);
+        }
+
+        g->pool.compact(g->cells);
+    }
 }
 
 } // namespace app

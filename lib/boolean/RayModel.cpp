@@ -15,6 +15,7 @@
 #include <tbb/parallel_for.h>
 
 #include "BRep.h"
+#include "RayBoolean.h"
 #include "RayHit.h"
 
 namespace app
@@ -424,6 +425,47 @@ std::size_t RayModel::rayCountAtStride(int stride) const
         if (const RayGrid* g = grid(axis)) total += g->intervalCountAtStride(stride);
     }
     return total;
+}
+
+std::size_t RayModel::rayCountInAabbAtStride(const BoundingBox& aabb, int stride) const
+{
+    if (!aabb.valid()) return rayCountAtStride(stride);
+    if (stride < 1) stride = 1;
+
+    auto lock = lockChains();
+    std::size_t total = 0;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* g = grid(axis);
+        if (!g || g->empty()) continue;
+
+        std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
+        if (!gridWindowFromModelAabb(*g, aabb, iu0, iu1, iv0, iv1)) continue;
+
+        for (std::uint32_t iv = iv0; iv <= iv1; ++iv)
+        {
+            if (static_cast<int>(iv) % stride != 0) continue;
+            for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
+            {
+                if (static_cast<int>(iu) % stride != 0) continue;
+                total += g->at(iu, iv).intervalCount;
+            }
+        }
+    }
+    return total;
+}
+
+int RayModel::strideForVisibleBudget(const BoundingBox& aabb, std::size_t maxRays) const
+{
+    if (maxRays == 0) return 1;
+
+    const std::size_t total = rayCountInAabbAtStride(aabb, 1);
+    if (total <= maxRays) return 1;
+
+    const double estimate = std::sqrt(static_cast<double>(total) / static_cast<double>(maxRays));
+    int stride = (estimate > 1.0) ? static_cast<int>(estimate) : 1;
+    while (stride < maxStride && rayCountInAabbAtStride(aabb, stride) > maxRays) ++stride;
+    return stride;
 }
 
 } // namespace app

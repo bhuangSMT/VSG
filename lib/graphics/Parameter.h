@@ -55,10 +55,21 @@ public:
     double toolRadius() const { return _toolRadius; }
     void setToolRadius(double radius) { _toolRadius = radius; }
 
-    // Shank / flute length in model space (above the tip geometry). Default is
+    // Cutting length in model space (above the tip geometry). Default is
     // 2.8 × toolRadius when a model is loaded.
     double toolLength() const { return _toolLength; }
     void setToolLength(double length) { _toolLength = length; }
+
+    // Display-only shank in model space. Zero hides the shank. Swept volume
+    // and boolean always use the cutter mesh, never this cylinder.
+    double toolShankRadius() const { return _toolShankRadius; }
+    void setToolShankRadius(double radius) { _toolShankRadius = radius; }
+    double toolShankLength() const { return _toolShankLength; }
+    void setToolShankLength(double length) { _toolShankLength = length; }
+
+    // Grinding wheel: isosceles-triangle vertex angle at the outer rim (degrees).
+    double toolVertexAngleDeg() const { return _toolVertexAngleDeg; }
+    void setToolVertexAngleDeg(double degrees) { _toolVertexAngleDeg = degrees; }
 
     // Whether the swept-volume mesh is drawn in the scene. Generation always
     // runs while a tool is active; this only gates the VSG node.
@@ -69,6 +80,11 @@ public:
     // latest segment is kept and drawn.
     bool showLastSweptVolumeOnly() const { return _showLastSweptVolumeOnly; }
     void setShowLastSweptVolumeOnly(bool enabled) { _showLastSweptVolumeOnly = enabled; }
+
+    // Ray-GS cut face: quad mesh overlay when true; cut-tagged splat dots only
+    // when false (default).
+    bool cutMeshDisplay() const { return _cutMeshDisplay; }
+    void setCutMeshDisplay(bool enabled) { _cutMeshDisplay = enabled; }
 
     // How the swept volume is combined with the current RayModel.
     // Inspection is a non-destructive preview against the original cast.
@@ -94,8 +110,12 @@ private:
     ToolType _toolType = ToolType::None;
     double _toolRadius = 0.05;
     double _toolLength = 0.05 * 2.8;
+    double _toolShankRadius = 0.0;
+    double _toolShankLength = 0.0;
+    double _toolVertexAngleDeg = 60.0;
     bool _sweptVolume = false;
     bool _showLastSweptVolumeOnly = true;
+    bool _cutMeshDisplay = false;
     BooleanOp _booleanOp = BooleanOp::None;
     SimulationMode _simulationMode = SimulationMode::Interactive;
     std::string _lastImportPath;

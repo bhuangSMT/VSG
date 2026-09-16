@@ -41,39 +41,163 @@ std::uint32_t sampledIndex(std::uint32_t i, int stride)
     return i / static_cast<std::uint32_t>(stride);
 }
 
-void skipSplatEnds(const Interval& span, double modelLength, float cellRadius,
-                   bool skipCutSplats, bool& skipStart, bool& skipEnd)
+// Interval length is in model space. The fitted splat radius is not — it has
+// been divided by applyFit(). A leftover shorter than two display-cell
+// diagonals puts its untagged stock end on the cut overlay.
+double leftoverHideLength(const RayGrid& grid, int stride)
+{
+    const int s = (stride > 0) ? stride : 1;
+    const double cellDiag = std::sqrt(static_cast<double>(grid.spacingU) *
+                                          static_cast<double>(grid.spacingU) +
+                                      static_cast<double>(grid.spacingV) *
+                                          static_cast<double>(grid.spacingV));
+    return 2.0 * cellDiag * static_cast<double>(s);
+}
+
+double bleedHideLength(const RayGrid& grid, int stride)
+{
+    const int s = (stride > 0) ? stride : 1;
+    const double cellDiag = std::sqrt(static_cast<double>(grid.spacingU) *
+                                          static_cast<double>(grid.spacingU) +
+                                      static_cast<double>(grid.spacingV) *
+                                          static_cast<double>(grid.spacingV));
+    return cellDiag * static_cast<double>(s);
+}
+
+void skipSplatEnds(const Interval& span, double modelLength, double hideShorterThan,
+                   double bleedHideLength, bool skipCutSplats, bool& skipStart, bool& skipEnd)
 {
     const bool cutStart = span.cutBegin();
     const bool cutEnd = span.cutEnd();
+    // Drop cut-tagged ends only when the cut-face overlay replaces them.
     skipStart = skipCutSplats && cutStart;
     skipEnd = skipCutSplats && cutEnd;
-    // Partner stock disc of a leftover shorter than two cell radii sits on
-    // the overlay. Hide both ends so the previous GPU slots can be freed.
-    if (skipCutSplats && (cutStart || cutEnd) &&
-        modelLength <= 2.0 * static_cast<double>(cellRadius))
+    // Short leftovers and bleed partners: still useful when cut dots are kept.
+    if ((cutStart || cutEnd) && hideShorterThan > 0.0 && modelLength <= hideShorterThan)
     {
         skipStart = true;
         skipEnd = true;
     }
+    // Untagged partner sitting on the overlay: hide it, keep a distant stock end.
+    if (bleedHideLength > 0.0 && modelLength <= bleedHideLength)
+    {
+        if (cutStart && !cutEnd) skipEnd = true;
+        if (cutEnd && !cutStart) skipStart = true;
+    }
+}
+
+bool onCoarseLattice(std::uint32_t iu, std::uint32_t iv, int coarseStride)
+{
+    if (coarseStride <= 1) return true;
+    return static_cast<int>(iu) % coarseStride == 0 && static_cast<int>(iv) % coarseStride == 0;
+}
+
+double dist2ToEye(const Point3d& p, const vsg::dvec3& eye)
+{
+    const double dx = p[0] - eye.x;
+    const double dy = p[1] - eye.y;
+    const double dz = p[2] - eye.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+bool modelPointInView(const vsg::dmat4& modelToClip, double x, double y, double z, float margin)
+{
+    const vsg::dvec4 clip = modelToClip * vsg::dvec4(x, y, z, 1.0);
+    if (clip.w <= 1.0e-12) return false;
+    const double invW = 1.0 / clip.w;
+    const double ndcX = clip.x * invW;
+    const double ndcY = clip.y * invW;
+    const double m = static_cast<double>(margin);
+    return ndcX >= -1.0 - m && ndcX <= 1.0 + m && ndcY >= -1.0 - m && ndcY <= 1.0 + m;
+}
+
+// Keep far-face ends on the coarse lattice only (no densify, no full cull).
+void applyViewEndPolicy(const Point3d& start, const Point3d& end, std::uint32_t iu,
+                        std::uint32_t iv, const SplatViewCull& cull, bool& skipStart,
+                        bool& skipEnd)
+{
+    if (!cull.enabled) return;
+    const bool startNear = dist2ToEye(start, cull.eyeModel) <= dist2ToEye(end, cull.eyeModel);
+    const bool coarse = onCoarseLattice(iu, iv, cull.coarseStride);
+    if (startNear)
+    {
+        if (!coarse) skipEnd = true;
+    }
+    else
+    {
+        if (!coarse) skipStart = true;
+    }
+}
+
+// Cell kept when either stock end along the cast is on screen.
+bool cellInViewCull(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv,
+                    const BoundingBox& stockBounds, const SplatViewCull& cull)
+{
+    if (!cull.enabled) return true;
+    if (!stockBounds.valid()) return true;
+
+    const std::size_t axis = grid.axis;
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    Point3d a{0.0, 0.0, 0.0};
+    Point3d b{0.0, 0.0, 0.0};
+    a[u] = b[u] = grid.sampleU(iu);
+    a[v] = b[v] = grid.sampleV(iv);
+    a[axis] = stockBounds.min()[axis];
+    b[axis] = stockBounds.max()[axis];
+    return modelPointInView(cull.modelToClip, a[0], a[1], a[2], cull.ndcMargin) ||
+           modelPointInView(cull.modelToClip, b[0], b[1], b[2], cull.ndcMargin);
+}
+
+bool endpointInViewCull(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv, double along,
+                        const SplatViewCull& cull)
+{
+    if (!cull.enabled) return true;
+    const std::size_t axis = grid.axis;
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    Point3d sample{0.0, 0.0, 0.0};
+    sample[u] = grid.sampleU(iu);
+    sample[v] = grid.sampleV(iv);
+    sample[axis] = along;
+    return modelPointInView(cull.modelToClip, sample[0], sample[1], sample[2], cull.ndcMargin);
 }
 
 std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv,
-                           float radius, bool skipCutSplats)
+                           int stride, bool skipCutSplats, const SplatViewCull& viewCull)
 {
     const RaySlot& slot = grid.at(iu, iv);
     if (slot.empty()) return 0;
 
+    const std::size_t axis = grid.axis;
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    const double u0 = grid.sampleU(iu);
+    const double v0 = grid.sampleV(iv);
+    const double hide = leftoverHideLength(grid, stride);
     std::uint32_t n = 0;
     for (const Interval& span : grid.pool.span(slot))
     {
         if (!span.hasSolidLength()) continue;
-        const double modelLength = grid.fromTick(span.end) - grid.fromTick(span.begin);
+        Point3d start{0.0, 0.0, 0.0};
+        Point3d end{0.0, 0.0, 0.0};
+        start[axis] = grid.fromTick(span.begin);
+        end[axis] = grid.fromTick(span.end);
+        start[u] = end[u] = u0;
+        start[v] = end[v] = v0;
+
+        const double modelLength = end[axis] - start[axis];
         bool skipStart = false;
         bool skipEnd = false;
-        skipSplatEnds(span, modelLength, radius, skipCutSplats, skipStart, skipEnd);
-        if (!skipStart) ++n;
-        if (!skipEnd) ++n;
+        skipSplatEnds(span, modelLength, hide, bleedHideLength(grid, stride), skipCutSplats,
+                      skipStart, skipEnd);
+        applyViewEndPolicy(start, end, iu, iv, viewCull, skipStart, skipEnd);
+        if (!skipStart &&
+            endpointInViewCull(grid, iu, iv, start[axis], viewCull))
+            ++n;
+        if (!skipEnd &&
+            endpointInViewCull(grid, iu, iv, end[axis], viewCull))
+            ++n;
     }
     return n;
 }
@@ -154,13 +278,16 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
         const vsg::vec3 d = a - b;
         return d.x * d.x + d.y * d.y + d.z * d.z;
     };
-    auto nearest = [&](const std::vector<SectionPoint>& pts,
-                       const vsg::vec3& src) -> const SectionPoint* {
+    // Same cut sheet (top with top, bottom with bottom). 3D-nearest alone
+    // stitches a shallow union's top to its bottom and leaves holes.
+    auto nearestOnSheet = [&](const std::vector<SectionPoint>& pts,
+                              const SectionPoint& src) -> const SectionPoint* {
         const SectionPoint* best = nullptr;
         float bestD = maxE2;
         for (const SectionPoint& p : pts)
         {
-            const float d2 = dist2(p.pos, src);
+            if (std::abs(p.along - src.along) > static_cast<double>(maxEdge)) continue;
+            const float d2 = dist2(p.pos, src.pos);
             if (d2 <= bestD)
             {
                 bestD = d2;
@@ -170,10 +297,23 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
         return best;
     };
 
+    auto emitOriented = [&](const vsg::vec3& a, const vsg::vec3& na,
+                            vsg::vec3 b, vsg::vec3 nb,
+                            vsg::vec3 c, vsg::vec3 nc,
+                            const vsg::vec3& hint) {
+        const vsg::vec3 fn = vsg::cross(b - a, c - a);
+        if (vsg::dot(fn, hint) < 0.0f)
+        {
+            std::swap(b, c);
+            std::swap(nb, nc);
+        }
+        tris.push_back({SectionVert{a, na}, SectionVert{b, nb}, SectionVert{c, nc}});
+    };
+
     for (const SectionPoint& h : here)
     {
-        const SectionPoint* e = nearest(east, h.pos);
-        const SectionPoint* n = nearest(north, h.pos);
+        const SectionPoint* e = nearestOnSheet(east, h);
+        const SectionPoint* n = nearestOnSheet(north, h);
         if (!e || !n || dist2(e->pos, n->pos) > maxE2) continue;
 
         const vsg::vec3 predict = e->pos + n->pos - h.pos;
@@ -181,6 +321,7 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
         float bestNe = maxE2;
         for (const SectionPoint& p : northEast)
         {
+            if (std::abs(p.along - h.along) > static_cast<double>(maxEdge)) continue;
             if (dist2(p.pos, e->pos) > maxE2 || dist2(p.pos, n->pos) > maxE2) continue;
             const float d2 = dist2(p.pos, predict);
             if (d2 <= bestNe)
@@ -189,16 +330,11 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
                 ne = &p;
             }
         }
+        if (!ne) continue;
 
-        tris.push_back({SectionVert{h.pos, h.normal},
-                        SectionVert{e->pos, e->normal},
-                        SectionVert{n->pos, n->normal}});
-        if (ne)
-        {
-            tris.push_back({SectionVert{e->pos, e->normal},
-                            SectionVert{ne->pos, ne->normal},
-                            SectionVert{n->pos, n->normal}});
-        }
+        const vsg::vec3 hint = h.normal;
+        emitOriented(h.pos, h.normal, e->pos, e->normal, n->pos, n->normal, hint);
+        emitOriented(e->pos, e->normal, ne->pos, ne->normal, n->pos, n->normal, hint);
     }
 }
 
@@ -459,6 +595,7 @@ void GaussianSplatCache::clearSlots(std::uint32_t first, std::uint32_t count)
 {
     for (std::uint32_t i = 0; i < count; ++i)
         _set.clearSlot(static_cast<std::size_t>(first + i));
+    _set.noteDirtySlots(first, count);
 }
 
 void GaussianSplatCache::addFreeRange(std::uint32_t first, std::uint32_t length)
@@ -577,7 +714,16 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
             const float spanRadius = splatRadiusForSpan(radius, modelLength, cellDiag, stride);
             bool skipStart = false;
             bool skipEnd = false;
-            skipSplatEnds(span, modelLength, radius, _skipCutSplats, skipStart, skipEnd);
+            skipSplatEnds(span, modelLength, leftoverHideLength(*grid, stride),
+                          bleedHideLength(*grid, stride), _skipCutSplats, skipStart, skipEnd);
+            applyViewEndPolicy(start, end, iu, iv, _viewCull, skipStart, skipEnd);
+
+            if (!skipStart &&
+                !endpointInViewCull(*grid, iu, iv, start[axis], _viewCull))
+                skipStart = true;
+            if (!skipEnd &&
+                !endpointInViewCull(*grid, iu, iv, end[axis], _viewCull))
+                skipEnd = true;
 
             if (!skipStart)
             {
@@ -636,7 +782,7 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
     if (su >= layout.sampledW || sv >= layout.sampledH) return PatchResult::Ok;
 
     CellRef& ref = cellRef(axis, su, sv);
-    const std::uint32_t needed = endpointNeed(*grid, iu, iv, radius, _skipCutSplats);
+    const std::uint32_t needed = endpointNeed(*grid, iu, iv, _stride, _skipCutSplats, _viewCull);
 
     if (needed > static_cast<std::uint32_t>(maxEndpointsPerCell))
         return PatchResult::CellTooDense;
@@ -653,6 +799,7 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
     {
         // Live accounting: block already counted in _live from alloc/rebuild.
         fillCell(rayModel, axis, iu, iv, radius, style, ref, true);
+        _set.noteDirtySlots(ref.first, ref.block);
         return PatchResult::Ok;
     }
 
@@ -686,6 +833,7 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
         ref = {};
         return PatchResult::OutOfSpace;
     }
+    _set.noteDirtySlots(ref.first, ref.block);
     return PatchResult::Ok;
 }
 
@@ -693,9 +841,11 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
                                                     int stride,
                                                     const std::array<float, 3>& radii,
                                                     const SplatStyle& style,
-                                                    bool skipCutSplats)
+                                                    bool skipCutSplats,
+                                                    const SplatViewCull& viewCull)
 {
     _skipCutSplats = skipCutSplats;
+    _viewCull = viewCull;
     auto lock = rayModel.lockChains();
 
     if (rayModel.rayCount() == 0)
@@ -714,6 +864,8 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     _resolution = rayModel.resolution();
     _stride = stride;
     _live = 0;
+
+    const BoundingBox stockBounds = rayModel.bounds();
 
     std::array<std::vector<std::uint32_t>, 3> needs{};
     std::array<std::vector<std::uint32_t>, 3> prefix{};
@@ -743,7 +895,12 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
             const auto sv = flat / layout.sampledW;
             const auto iu = static_cast<std::uint32_t>(su) * static_cast<std::uint32_t>(stride);
             const auto iv = static_cast<std::uint32_t>(sv) * static_cast<std::uint32_t>(stride);
-            auto n = endpointNeed(*grid, iu, iv, radii[axis], skipCutSplats);
+            if (!cellInViewCull(*grid, iu, iv, stockBounds, viewCull))
+            {
+                needs[axis][flat] = 0;
+                return;
+            }
+            auto n = endpointNeed(*grid, iu, iv, stride, skipCutSplats, viewCull);
             if (n > static_cast<std::uint32_t>(maxEndpointsPerCell))
                 n = static_cast<std::uint32_t>(maxEndpointsPerCell);
             needs[axis][flat] = n;
@@ -831,13 +988,16 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
                                              int stride,
                                              const std::array<float, 3>& radii,
                                              const SplatStyle& style,
-                                             bool skipCutSplats)
+                                             bool skipCutSplats,
+                                             const SplatViewCull& viewCull)
 {
     if (!layoutMatches(rayModel, stride)) return PatchResult::LayoutChanged;
     if (!modelAabb.valid()) return PatchResult::LayoutChanged;
     _skipCutSplats = skipCutSplats;
+    _viewCull = viewCull;
 
     auto lock = rayModel.lockChains();
+    const BoundingBox stockBounds = rayModel.bounds();
 
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
@@ -856,6 +1016,23 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
             for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
             {
                 if (static_cast<int>(iu) % _stride != 0) continue;
+                if (!cellInViewCull(*grid, iu, iv, stockBounds, viewCull))
+                {
+                    const auto su = iu / static_cast<std::uint32_t>(_stride);
+                    const auto sv = iv / static_cast<std::uint32_t>(_stride);
+                    if (su < _axes[axis].sampledW && sv < _axes[axis].sampledH)
+                    {
+                        CellRef& ref = cellRef(axis, su, sv);
+                        if (!ref.empty())
+                        {
+                            clearSlots(ref.first, ref.count);
+                            _set.noteDirtySlots(ref.first, ref.block);
+                            freeBlock(ref.first, ref.block);
+                            ref = {};
+                        }
+                    }
+                    continue;
+                }
                 const PatchResult cell = updateCell(rayModel, axis, iu, iv, radius, style);
                 if (cell != PatchResult::Ok) return cell;
             }
@@ -865,8 +1042,10 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
     // Allocated slots can sit past the last packed prefix. Draw through
     // _allocEnd only: the unused tail is not submitted, even if leftover
     // radius is still in memory. Freed holes below _allocEnd were cleared.
+    // CPU already rewrote only the dirty-window cells. Copy those slot
+    // ranges; do not dirty() the whole set.
     _set.setDrawCount(_allocEnd);
-    _set.markDirty();
+    _set.flushDirty();
     return PatchResult::Ok;
 }
 
@@ -880,6 +1059,7 @@ void GaussianSplatCache::markDirty()
 void GaussianSplatCache::noteCompiled()
 {
     _gpuNeedsCompile = false;
+    _set.noteCompiled();
     _section.noteCompiled();
     _inspectionSection.noteCompiled();
 }

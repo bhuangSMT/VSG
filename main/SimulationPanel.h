@@ -17,6 +17,7 @@ class QHideEvent;
 class QPushButton;
 class QSlider;
 class QTableWidget;
+class QTableWidgetItem;
 class QTimer;
 
 namespace app
@@ -31,7 +32,7 @@ class SimulationPanel : public QWidget
 public:
     static constexpr int maxRows = 5000;
     static constexpr int sliderMax = 100;
-    static constexpr int maxWaitMs = 2000;
+    static constexpr int maxRowsPerStep = 10;
 
     explicit SimulationPanel(QWidget* parent = nullptr);
 
@@ -46,6 +47,18 @@ public:
 
     void popupExitCollectionMenu(const QPoint& globalPos);
     void notifyBooleanOp(BooleanOp op);
+    void clearLibrarySelection();
+    // Match a Tool manager edit into the Simulation library table. Re-applies
+    // the cutter when that row is the current selection.
+    void updateLibraryEntry(int toolType, double radius, double cuttingLength,
+                            double shankLength, double shankRadius,
+                            double vertexAngleDeg = 0.0);
+
+    // Helix axis pick: Axis button in the Helix dialog arms this; ToolTracker
+    // completes/cancels it and the dialog reopens.
+    bool isPickingHelixAxis() const { return _pickingHelixAxis; }
+    void setHelixAxisFromPick(int axisIndex);
+    void cancelHelixAxisPick();
 
 signals:
     void noneOperationRequested();
@@ -53,6 +66,10 @@ signals:
     void subtractionOperationRequested();
     void unionOperationRequested();
     void inspectionOperationRequested();
+    void toolLibraryPreviewRequested(int toolType, double radius, double cuttingLength,
+                                     double shankLength, double shankRadius);
+    void toolLibraryApplied(int toolType, double radius, double cuttingLength, double shankLength,
+                            double shankRadius);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -65,6 +82,10 @@ private slots:
     void onReset();
     void onPlayStep();
     void onWaitSliderChanged(int value);
+    void onToolLibraryDoubleClicked(int row, int column);
+    void onToolLibrarySelectionChanged();
+    void onToolLibraryCellChanged(QTableWidgetItem* item);
+    void onHelixClicked();
 
 private:
     void applyFifoCap();
@@ -75,17 +96,29 @@ private:
     void pausePlayback();
     void finishPlayback();
     void updateRerunButton();
+    void beginHelixAxisPick();
+    void reopenHelixDialogIfNeeded();
     void applyRow(int row);
+    // Advance from fromRow to toRow (inclusive), building one multi-station
+    // swept volume through the table poses when toRow > fromRow.
+    void applyRowRange(int fromRow, int toRow);
     ToolSample sampleAt(int row) const;
     bool isNullRow(int row) const;
-    int waitMsFromSlider() const;
+    int rowsPerStepFromSlider() const;
+    void fillToolLibrary();
+    bool applySelectedLibraryTool();
+    bool prepareRerunTool();
 
     QComboBox* _modeCombo = nullptr;
+    QWidget* _clDataHost = nullptr;
+    QPushButton* _helixButton = nullptr;
+    QPushButton* _importAptButton = nullptr;
     QTableWidget* _table = nullptr;
     QWidget* _tableHost = nullptr;
     QPushButton* _rerunButton = nullptr;
     QPushButton* _resetButton = nullptr;
     QSlider* _waitSlider = nullptr;
+    QTableWidget* _toolTable = nullptr;
     QTimer* _playTimer = nullptr;
     ToolPoseLog _log;
     std::optional<ToolSample> _lastRecorded;
@@ -94,6 +127,13 @@ private:
     bool _playing = false;
     bool _paused = false;
     int _playRow = 0;
+    double _helixRadius = 1.0;
+    double _helixPitch = 1.0;
+    double _helixHeight = 10.0;
+    double _helixDt = 0.1;
+    int _helixAxis = 0; // 0=X, 1=Y, 2=Z
+    bool _pickingHelixAxis = false;
+    bool _reopenHelixDialog = false;
 };
 
 } // namespace app

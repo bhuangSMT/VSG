@@ -9,6 +9,8 @@
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
+#include <QTimer>
+
 #include "RenderManager.h"
 
 #include "BRep.h"
@@ -27,15 +29,37 @@ namespace
 
 using ProfileClock = std::chrono::steady_clock;
 
-bool skipCutSplatEnds(BooleanOp op, bool inspectionBoxValid)
-{
-    if (op == BooleanOp::Inspection) return inspectionBoxValid;
-    return true;
-}
-
 bool accumulatesCutMesh(BooleanOp op)
 {
     return op == BooleanOp::Subtraction || op == BooleanOp::Union;
+}
+
+bool cutMeshEnabled()
+{
+    return Parameter::instance().cutMeshDisplay();
+}
+
+bool skipCutSplatEnds(BooleanOp op, bool /*inspectionBoxValid*/)
+{
+    // Cut-tagged dots are the cut face when mesh display is off — never drop
+    // them (including after rerun finishes and switches to None).
+    if (!cutMeshEnabled()) return false;
+
+    // Mesh on: keep dots during Subtraction/Union/Inspection to fill gaps
+    // between quads; idle ops can skip dots and rely on the mesh alone.
+    if (accumulatesCutMesh(op) || op == BooleanOp::Inspection) return false;
+    return true;
+}
+
+BoundingBox intersectAabb(const BoundingBox& a, const BoundingBox& b)
+{
+    if (!a.valid() || !b.valid()) return {};
+    Point3d mn{std::max(a.min()[0], b.min()[0]), std::max(a.min()[1], b.min()[1]),
+               std::max(a.min()[2], b.min()[2])};
+    Point3d mx{std::min(a.max()[0], b.max()[0]), std::min(a.max()[1], b.max()[1]),
+               std::min(a.max()[2], b.max()[2])};
+    if (mn[0] > mx[0] || mn[1] > mx[1] || mn[2] > mx[2]) return {};
+    return BoundingBox(mn, mx);
 }
 
 BoundingBox expandAabb(const BoundingBox& box, double radius)
@@ -153,9 +177,87 @@ RenderManager::RenderManager(vsg::ref_ptr<vsgQt::Viewer> viewer,
     _options(options)
 {
     if (!_scene) throw std::runtime_error("RenderManager requires a valid scene root.");
+    showWorldAxes(true);
 }
 
-RenderManager::~RenderManager() = default;
+RenderManager::~RenderManager()
+{
+    if (_splatViewDebounce)
+    {
+        _splatViewDebounce->stop();
+        delete _splatViewDebounce;
+        _splatViewDebounce = nullptr;
+    }
+}
+
+void RenderManager::showWorldAxes(bool show)
+{
+    if (_axesNode)
+    {
+        auto& children = _scene->children;
+        children.erase(std::remove(children.begin(), children.end(), _axesNode), children.end());
+        _axesNode = nullptr;
+    }
+    if (!show)
+    {
+        if (_viewer) _viewer->request();
+        return;
+    }
+
+    _axesNode = vsg::Group::create();
+    const auto meshes = buildWorldAxesMeshes(_axesSpec, _axesSelected);
+    const int selectedAxis = worldAxisIndex(_axesSelected);
+    for (int i = 0; i < 6; ++i)
+    {
+        const int axis = i / 2;
+        const bool selected = selectedAxis == axis;
+        if (auto node = toolMeshNode(meshes[static_cast<std::size_t>(i)],
+                                     worldAxisColor(axis, selected)))
+            _axesNode->addChild(node);
+    }
+
+    if (_viewer && _viewer->compileManager)
+    {
+        auto compiled = _viewer->compileManager->compile(_axesNode);
+        if (compiled) vsg::updateViewer(*_viewer, compiled);
+    }
+    _scene->addChild(_axesNode);
+    if (_viewer) _viewer->request();
+}
+
+std::optional<WorldAxisPart> RenderManager::pickWorldAxis(const vsg::Camera& camera, int32_t x,
+                                                          int32_t y) const
+{
+    if (!_axesNode) return std::nullopt;
+
+    const auto viewport = camera.getViewport();
+    vsg::vec2 ndc(0.0f, 0.0f);
+    if (viewport.width > 0 && viewport.height > 0)
+    {
+        ndc.set((static_cast<float>(x) - viewport.x) / viewport.width,
+                (static_cast<float>(y) - viewport.y) / viewport.height);
+    }
+
+    const vsg::dmat4 projectionMatrix = camera.projectionMatrix->transform();
+    const vsg::dmat4 viewMatrix = camera.viewMatrix->transform();
+    const bool reverseDepth = projectionMatrix(2, 2) > 0.0;
+    const vsg::dvec3 ndcNear(ndc.x * 2.0 - 1.0, ndc.y * 2.0 - 1.0,
+                             reverseDepth ? viewport.maxDepth : viewport.minDepth);
+    const vsg::dvec3 ndcFar(ndc.x * 2.0 - 1.0, ndc.y * 2.0 - 1.0,
+                            reverseDepth ? viewport.minDepth : viewport.maxDepth);
+    const vsg::dmat4 invProjection = vsg::inverse(projectionMatrix);
+    const vsg::dmat4 eyeToWorld = vsg::inverse(viewMatrix);
+    const vsg::dvec3 worldNear = eyeToWorld * (invProjection * ndcNear);
+    const vsg::dvec3 worldFar = eyeToWorld * (invProjection * ndcFar);
+    return pickWorldAxes(_axesSpec, worldNear, worldFar - worldNear);
+}
+
+void RenderManager::selectWorldAxis(WorldAxisPart part)
+{
+    if (_axesSelected == part) return;
+    _axesSelected = part;
+    if (_axesNode) showWorldAxes(true);
+}
 
 vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array> positions,
                                                      vsg::ref_ptr<vsg::vec3Array> normals,
@@ -281,6 +383,16 @@ vsg::dmat4 RenderManager::fitMatrix(const BoundingBox& bounds) const
     const double s = (maxExtent > 0.0) ? 1.0 / maxExtent : 1.0;
 
     return vsg::scale(s, s, s) * vsg::translate(-c[0], -c[1], -c[2]);
+}
+
+vsg::dmat4 RenderManager::currentFitMatrix() const
+{
+    BoundingBox model;
+    if (_rayModel && _rayModel->bounds().valid())
+        model = _rayModel->bounds();
+    else if (_current)
+        model = BoundingBox::fromBRep(*_current);
+    return fitMatrix(model);
 }
 
 BoundingBox RenderManager::worldStockAabb() const
@@ -502,7 +614,7 @@ float RenderManager::splatRadius(const RayModel& rayModel, std::size_t axis) con
 
 std::array<float, 3> RenderManager::splatRadii(const RayModel& rayModel, int stride) const
 {
-    const float s = static_cast<float>(stride < 1 ? 1 : stride);
+    const float s = static_cast<float>(stride < 1 ? 1 : stride) * 1.15f;
     return {splatRadius(rayModel, 0) * s, splatRadius(rayModel, 1) * s,
             splatRadius(rayModel, 2) * s};
 }
@@ -521,15 +633,247 @@ void RenderManager::rebuildSplatCache()
     if (!_rayModel || _rayModel->rayCount() == 0) return;
 
     const BooleanOp op = Parameter::instance().booleanOp();
-    const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+    const SplatViewCull viewCull = splatViewCull();
+    const int stride = displayStride();
+    const int cutStride = coarseStride();
     const bool skipCutSplats = skipCutSplatEnds(op, _inspectionPrevAabb.valid());
     _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
-                        skipCutSplats);
+                        skipCutSplats, viewCull);
+    // Cut-face quads stay on the global budget stride so zoom densify does not
+    // remesh / drop the orange overlay.
     if (op == BooleanOp::Inspection)
         syncInspectionSectionGrid(_inspectionPrevAabb);
+    else if (cutMeshEnabled())
+        _splatCache.restoreCutFace(*_rayModel, cutStride, splatStyle().toolColor);
     else
-        _splatCache.restoreCutFace(*_rayModel, stride, splatStyle().toolColor);
+        _splatCache.clearCutFace();
     presentSplatCache();
+}
+
+void RenderManager::refreshCutMeshDisplay()
+{
+    if (_viewMode != ViewMode::RayGS) return;
+    rebuildSplatCache();
+}
+
+vsg::dmat4 RenderManager::modelToClipMatrix() const
+{
+    if (!_camera || !_camera->projectionMatrix || !_camera->viewMatrix || !_rayModel)
+        return {};
+
+    const BoundingBox stock = _rayModel->bounds();
+    if (!stock.valid()) return {};
+
+    const vsg::dmat4 modelToWorld = fitMatrix(stock);
+    const vsg::dmat4 projectionMatrix = _camera->projectionMatrix->transform();
+    const vsg::dmat4 viewMatrix = _camera->viewMatrix->transform();
+    return projectionMatrix * viewMatrix * modelToWorld;
+}
+
+int RenderManager::coarseStride() const
+{
+    if (!_rayModel) return 1;
+    return _rayModel->strideForRayBudget(maxRenderedRays);
+}
+
+SplatViewCull RenderManager::splatViewCull() const
+{
+    SplatViewCull cull;
+    if (!_camera || !_rayModel) return cull;
+
+    const BoundingBox stock = _rayModel->bounds();
+    if (!stock.valid()) return cull;
+
+    const vsg::dmat4 modelToWorld = fitMatrix(stock);
+    const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
+    vsg::dvec3 eyeWorld(0.0, 0.0, 0.0);
+    if (auto lookAt = _camera->viewMatrix.cast<vsg::LookAt>())
+        eyeWorld = lookAt->eye;
+    else
+        eyeWorld = vsg::inverse(_camera->viewMatrix->transform()) * vsg::dvec3(0.0, 0.0, 0.0);
+
+    cull.enabled = true;
+    cull.modelToClip = modelToClipMatrix();
+    cull.eyeModel = worldToModel * eyeWorld;
+    cull.coarseStride = coarseStride();
+    cull.ndcMargin = 0.08f;
+    return cull;
+}
+
+std::size_t RenderManager::rayCountVisibleAtStride(int stride) const
+{
+    if (!_rayModel) return 0;
+    if (stride < 1) stride = 1;
+
+    const SplatViewCull cull = splatViewCull();
+    if (!cull.enabled) return _rayModel->rayCountAtStride(stride);
+
+    auto lock = _rayModel->lockChains();
+    const BoundingBox stock = _rayModel->bounds();
+    if (!stock.valid()) return 0;
+
+    std::size_t total = 0;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        const RayGrid* grid = _rayModel->grid(axis);
+        if (!grid || grid->empty()) continue;
+
+        const std::size_t u = (axis + 1) % 3;
+        const std::size_t v = (axis + 2) % 3;
+        Point3d a{0.0, 0.0, 0.0};
+        Point3d b{0.0, 0.0, 0.0};
+        a[axis] = stock.min()[axis];
+        b[axis] = stock.max()[axis];
+
+        for (std::uint32_t iv = 0; iv < grid->height; ++iv)
+        {
+            if (static_cast<int>(iv) % stride != 0) continue;
+            for (std::uint32_t iu = 0; iu < grid->width; ++iu)
+            {
+                if (static_cast<int>(iu) % stride != 0) continue;
+                const RaySlot& slot = grid->at(iu, iv);
+                if (slot.empty()) continue;
+
+                a[u] = b[u] = grid->sampleU(iu);
+                a[v] = b[v] = grid->sampleV(iv);
+                const double da =
+                    (a[0] - cull.eyeModel.x) * (a[0] - cull.eyeModel.x) +
+                    (a[1] - cull.eyeModel.y) * (a[1] - cull.eyeModel.y) +
+                    (a[2] - cull.eyeModel.z) * (a[2] - cull.eyeModel.z);
+                const double db =
+                    (b[0] - cull.eyeModel.x) * (b[0] - cull.eyeModel.x) +
+                    (b[1] - cull.eyeModel.y) * (b[1] - cull.eyeModel.y) +
+                    (b[2] - cull.eyeModel.z) * (b[2] - cull.eyeModel.z);
+                const Point3d& nearPt = da <= db ? a : b;
+
+                const vsg::dvec4 clip =
+                    cull.modelToClip * vsg::dvec4(nearPt[0], nearPt[1], nearPt[2], 1.0);
+                if (clip.w <= 1.0e-12) continue;
+                const double invW = 1.0 / clip.w;
+                const double ndcX = clip.x * invW;
+                const double ndcY = clip.y * invW;
+                const double m = cull.ndcMargin;
+                if (ndcX < -1.0 - m || ndcX > 1.0 + m || ndcY < -1.0 - m || ndcY > 1.0 + m)
+                    continue;
+
+                // Budget the near-face densify only; far ends stay on coarseStride.
+                total += slot.intervalCount;
+            }
+        }
+    }
+    return total;
+}
+
+BoundingBox RenderManager::visibleStockAabb() const
+{
+    if (!_rayModel || !_rayModel->bounds().valid()) return {};
+
+    const BoundingBox stock = _rayModel->bounds();
+    if (!_camera || !_camera->projectionMatrix || !_camera->viewMatrix) return stock;
+
+    const vsg::dmat4 modelToWorld = fitMatrix(stock);
+    const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
+    const vsg::dmat4 projectionMatrix = _camera->projectionMatrix->transform();
+    const vsg::dmat4 viewMatrix = _camera->viewMatrix->transform();
+    const auto viewport = _camera->getViewport();
+    const bool reverseDepth = projectionMatrix(2, 2) > 0.0;
+    const double zNear = reverseDepth ? viewport.maxDepth : viewport.minDepth;
+    const double zFar = reverseDepth ? viewport.minDepth : viewport.maxDepth;
+
+    const vsg::dmat4 invViewProj = vsg::inverse(projectionMatrix * viewMatrix);
+    BoundingBox frustumModel;
+    for (int ix = 0; ix < 2; ++ix)
+        for (int iy = 0; iy < 2; ++iy)
+            for (int iz = 0; iz < 2; ++iz)
+            {
+                const vsg::dvec4 clip =
+                    invViewProj * vsg::dvec4(ix ? 1.0 : -1.0, iy ? 1.0 : -1.0,
+                                            iz ? zFar : zNear, 1.0);
+                if (std::abs(clip.w) < 1.0e-12) continue;
+                const vsg::dvec3 world(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+                const vsg::dvec3 model = worldToModel * world;
+                frustumModel.expand(Point3d{model.x, model.y, model.z});
+            }
+
+    BoundingBox visible = intersectAabb(stock, frustumModel);
+    if (!visible.valid()) return {};
+
+    const Point3d& res = _rayModel->resolution();
+    const double pad = 2.0 * std::max({res[0], res[1], res[2], 1.0e-9});
+    return expandAabb(visible, pad);
+}
+
+int RenderManager::displayStride() const
+{
+    if (!_rayModel) return 1;
+    if (!_camera) return _rayModel->strideForRayBudget(maxRenderedRays);
+
+    if (maxRenderedRays == 0) return 1;
+    const std::size_t total = rayCountVisibleAtStride(1);
+    if (total <= maxRenderedRays) return 1;
+
+    const double estimate = std::sqrt(static_cast<double>(total) / static_cast<double>(maxRenderedRays));
+    int stride = (estimate > 1.0) ? static_cast<int>(estimate) : 1;
+    while (stride < RayModel::maxStride && rayCountVisibleAtStride(stride) > maxRenderedRays)
+        ++stride;
+    return stride;
+}
+
+void RenderManager::refreshSplatViewForCamera()
+{
+    if (_viewMode != ViewMode::RayGS || !_rayModel || _rayModel->rayCount() == 0) return;
+    rebuildSplatCache();
+}
+
+void RenderManager::setCamera(vsg::ref_ptr<vsg::Camera> camera)
+{
+    _camera = std::move(camera);
+    if (!_splatViewDebounce)
+    {
+        _splatViewDebounce = new QTimer();
+        _splatViewDebounce->setSingleShot(true);
+        _splatViewDebounce->setInterval(splatViewDebounceMs);
+        QObject::connect(_splatViewDebounce, &QTimer::timeout, [this]() {
+            refreshSplatViewForCamera();
+        });
+    }
+}
+
+void RenderManager::noteCameraMoved()
+{
+    if (_viewMode != ViewMode::RayGS || !_camera) return;
+    if (!_splatViewDebounce) setCamera(_camera);
+    if (_splatViewDebounce) _splatViewDebounce->start();
+}
+
+namespace
+{
+
+struct CameraSettleHandler : public vsg::Inherit<vsg::Visitor, CameraSettleHandler>
+{
+    explicit CameraSettleHandler(RenderManager* manager) : _manager(manager) {}
+
+    void apply(vsg::ButtonPressEvent& /*event*/) override { kick(); }
+    void apply(vsg::ButtonReleaseEvent& /*event*/) override { kick(); }
+    void apply(vsg::MoveEvent& event) override
+    {
+        if (event.mask != 0) kick();
+    }
+    void apply(vsg::ScrollWheelEvent& /*event*/) override { kick(); }
+
+    void kick()
+    {
+        if (_manager) _manager->noteCameraMoved();
+    }
+
+    RenderManager* _manager = nullptr;
+};
+
+} // namespace
+
+vsg::ref_ptr<vsg::Visitor> RenderManager::createCameraSettleHandler()
+{
+    return CameraSettleHandler::create(this);
 }
 
 bool RenderManager::splatOnScreen() const
@@ -563,7 +907,7 @@ void RenderManager::syncInspectionSectionGrid(const BoundingBox& sectionAabb)
         return;
     }
 
-    const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+    const int stride = coarseStride();
     _splatCache.updateSectionGrid(*_rayModel, stride, sectionAabb, splatStyle().stockColor);
 }
 
@@ -682,6 +1026,7 @@ void RenderManager::setRayModel(RayModel model)
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
+    _preShellRayModel.reset();
     _inspectionRayModel.reset();
     _inspectionPrevAabb = {};
     _inspectionBooleanPose.reset();
@@ -711,6 +1056,7 @@ bool RenderManager::useCachedRayModel(const Point3d& resolution)
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
+    _preShellRayModel.reset();
     _inspectionRayModel.reset();
     _inspectionPrevAabb = {};
     _inspectionBooleanPose.reset();
@@ -747,6 +1093,7 @@ void RenderManager::clearRayModels()
     _rayModel = nullptr;
     _sourceRayModel = nullptr;
     _booleanRayModel.reset();
+    _preShellRayModel.reset();
     _inspectionRayModel.reset();
     _inspectionPrevAabb = {};
     _inspectionBooleanPose.reset();
@@ -784,18 +1131,51 @@ void RenderManager::rebuild()
     if (_current) attach(createNode(*_current), true);
 }
 
+void RenderManager::refreshRayViewsAfterStockEdit()
+{
+    if (_viewMode == ViewMode::RayGS)
+    {
+        if (_rayModel && _rayModel->rayCount() > 0)
+            rebuildSplatCache();
+        else
+        {
+            _splatCache.clear();
+            if (_current) attach(createNode(*_current), true);
+            else if (_viewer) _viewer->request();
+        }
+        return;
+    }
+
+    if (_viewMode == ViewMode::Ray)
+    {
+        // Drop any leftover GS subgraph so line mode shows the edited stock.
+        _splatCache.clear();
+        if (_rayModel && _rayModel->rayCount() > 0)
+            attach(createRayNode(*_rayModel), true);
+        else if (_current)
+            attach(createNode(*_current), true);
+        else if (_viewer)
+            _viewer->request();
+        return;
+    }
+
+    if (_viewer) _viewer->request();
+}
+
 void RenderManager::clear()
 {
     _scene->children.clear();
     _modelNode = nullptr;
     _toolTransform = nullptr;
     _sweptNode = nullptr;
+    _axesNode = nullptr;
     _sweptVolume.reset();
     _cutSweep.reset();
     _lastToolPose.reset();
     clearTrajectory();
     _current.reset();
     clearRayModels();
+    showWorldAxes(true);
     if (_viewer) _viewer->request();
 }
 
@@ -821,12 +1201,11 @@ void RenderManager::updateToolGeometry()
     rebuildTool(true);
 }
 
-float RenderManager::worldToolRadius() const
+float RenderManager::worldFromModelLength(double value) const
 {
-    double radius = Parameter::instance().toolRadius();
-    if (radius <= 0.0) radius = 0.05;
+    if (!(value > 0.0)) return 0.0f;
 
-    // Parameter stores model-space radius; the tool mesh is placed in world
+    // Parameter stores model-space sizes; the tool mesh is placed in world
     // space beside the fitted model, so apply the same scale as applyFit().
     if (_fitToUnitBox && _current)
     {
@@ -835,55 +1214,31 @@ float RenderManager::worldToolRadius() const
         {
             const double maxExtent =
                 std::max({bounds.extent(0), bounds.extent(1), bounds.extent(2)});
-            if (maxExtent > 0.0) radius /= maxExtent;
+            if (maxExtent > 0.0) value /= maxExtent;
         }
     }
 
-    return static_cast<float>(radius);
+    return static_cast<float>(value);
+}
+
+float RenderManager::worldToolRadius() const
+{
+    double radius = Parameter::instance().toolRadius();
+    if (radius <= 0.0) radius = 0.05;
+    return worldFromModelLength(radius);
 }
 
 float RenderManager::worldToolLength() const
 {
     double length = Parameter::instance().toolLength();
     if (length <= 0.0) length = static_cast<double>(worldToolRadius()) * 2.8;
-
-    if (_fitToUnitBox && _current)
-    {
-        const BoundingBox bounds = BoundingBox::fromBRep(*_current);
-        if (bounds.valid())
-        {
-            const double maxExtent =
-                std::max({bounds.extent(0), bounds.extent(1), bounds.extent(2)});
-            if (maxExtent > 0.0) length /= maxExtent;
-        }
-    }
-
-    return static_cast<float>(length);
+    return worldFromModelLength(length);
 }
 
-void RenderManager::rebuildTool(bool preservePose)
+vsg::ref_ptr<vsg::Node> RenderManager::toolMeshNode(const TriangleMesh& mesh,
+                                                    const vsg::vec4& color) const
 {
-    vsg::dmat4 previousMatrix;
-    const bool hadPose = _toolTransform != nullptr;
-    if (hadPose) previousMatrix = _toolTransform->matrix;
-
-    if (_toolTransform)
-    {
-        auto& children = _scene->children;
-        children.erase(std::remove(children.begin(), children.end(), _toolTransform), children.end());
-        _toolTransform = nullptr;
-    }
-
-    if (_toolType == ToolType::None)
-    {
-        if (_viewer) _viewer->request();
-        return;
-    }
-
-    const float radius = worldToolRadius();
-    const float height = worldToolLength();
-    const TriangleMesh mesh = createToolMesh(_toolType, radius, height);
-    if (mesh.triangles.empty()) return;
+    if (mesh.triangles.empty()) return {};
 
     const BRep toolBRep = BRep::fromTriangles(mesh);
     const auto& verts = toolBRep.vertices();
@@ -912,16 +1267,67 @@ void RenderManager::rebuildTool(bool preservePose)
         n = (len > 0.0f) ? n / len : vsg::vec3(0.0f, 0.0f, 1.0f);
     }
 
-    auto colors = vsg::vec4Array::create(1, _toolColor);
+    auto colors = vsg::vec4Array::create(1, color);
     auto indices = vsg::uintArray::create(faceVertices.size());
     for (std::size_t i = 0; i < faceVertices.size(); ++i) (*indices)[i] = faceVertices[i];
 
-    // Always a facet mesh, whatever view mode the model is in.
-    auto drawable = buildDrawable(positions, normals, colors,
-                                  VK_VERTEX_INPUT_RATE_INSTANCE, indices, false);
+    return buildDrawable(positions, normals, colors, VK_VERTEX_INPUT_RATE_INSTANCE,
+                         indices, false);
+}
+
+void RenderManager::rebuildTool(bool preservePose)
+{
+    vsg::dmat4 previousMatrix;
+    const bool hadPose = _toolTransform != nullptr;
+    if (hadPose) previousMatrix = _toolTransform->matrix;
+
+    if (_toolTransform)
+    {
+        auto& children = _scene->children;
+        children.erase(std::remove(children.begin(), children.end(), _toolTransform), children.end());
+        _toolTransform = nullptr;
+    }
+
+    if (_toolType == ToolType::None)
+    {
+        if (_viewer) _viewer->request();
+        return;
+    }
+
+    const float radius = worldToolRadius();
+    const float height = worldToolLength();
+    const float vertexAngle =
+        static_cast<float>(Parameter::instance().toolVertexAngleDeg());
+    const float shankRadius =
+        worldFromModelLength(Parameter::instance().toolShankRadius());
+    const float shankLength =
+        worldFromModelLength(Parameter::instance().toolShankLength());
+    const TriangleMesh mesh = createToolMesh(_toolType, radius, height, 48, 24, 12,
+                                             vertexAngle, shankRadius, shankLength);
+    auto drawable = toolMeshNode(mesh, _toolColor);
+    if (!drawable) return;
 
     _toolTransform = vsg::MatrixTransform::create();
     _toolTransform->addChild(drawable);
+
+    if (shankRadius > 0.0f && shankLength > 0.0f)
+    {
+        float drawnShankRadius = shankRadius;
+        if (_toolType == ToolType::Sphere && drawnShankRadius >= radius)
+            drawnShankRadius = radius * 0.6f;
+        TriangleMesh shankMesh;
+        if (_toolType == ToolType::GrindingWheel)
+            shankMesh = createGrindingShankMesh(radius, drawnShankRadius, shankLength);
+        else
+        {
+            const float z0 = (_toolType == ToolType::Sphere)
+                                 ? radius
+                                 : toolCuttingTop(_toolType, radius, height, vertexAngle);
+            shankMesh = createShankMesh(drawnShankRadius, z0, shankLength);
+        }
+        if (auto shankNode = toolMeshNode(shankMesh, _shankColor))
+            _toolTransform->addChild(shankNode);
+    }
 
     if (_viewer && _viewer->compileManager)
     {
@@ -967,34 +1373,123 @@ void RenderManager::setToolNodeAttached(bool attached)
 
 void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction)
 {
-    if (!_toolTransform || _toolType == ToolType::None) return;
+    vsg::dvec3 tip, x, y, z;
+    if (!referencePoseToTipFrame(position, direction, tip, x, y, z)) return;
+    commitToolTip(tip, x, y, z);
+}
 
-    vsg::dvec3 z = direction;
+bool RenderManager::referencePoseToTipFrame(const vsg::dvec3& position, const vsg::dvec3& direction,
+                                            vsg::dvec3& tip, vsg::dvec3& x, vsg::dvec3& y,
+                                            vsg::dvec3& z) const
+{
+    if (!_toolTransform || _toolType == ToolType::None) return false;
+
+    z = direction;
     const double zLen = vsg::length(z);
-    if (zLen <= 0.0) z = vsg::dvec3(0.0, 0.0, 1.0);
+    if (zLen <= 0.0) z = vsg::dvec3(0.0, 0.0, 0.0);
     else z /= zLen;
+
+    if (_toolType == ToolType::GrindingWheel)
+    {
+        // CL position is the triangle-base midpoint. `direction` is the spindle
+        // (parallel to the cylinder axis). Local +Z is radial from that axis
+        // through the CL point so the vertex points toward the stock.
+        if (zLen <= 0.0) z = vsg::dvec3(1.0, 0.0, 0.0);
+        x = z; // spindle = local +X
+        BoundingBox world = worldStockAabb();
+        vsg::dvec3 origin(0.0, 0.0, 0.0);
+        if (world.valid())
+        {
+            const Point3d c = world.centre();
+            origin = vsg::dvec3(c[0], c[1], c[2]);
+        }
+        vsg::dvec3 rel = position - origin;
+        rel = rel - x * vsg::dot(rel, x);
+        const double relLen = vsg::length(rel);
+        if (relLen > 1.0e-9)
+            z = rel / relLen; // outward radial → local +Z
+        else
+        {
+            vsg::dvec3 up(0.0, 0.0, 1.0);
+            if (std::abs(vsg::dot(x, up)) > 0.95) up = vsg::dvec3(0.0, 1.0, 0.0);
+            z = vsg::normalize(vsg::cross(up, x));
+        }
+        y = vsg::cross(z, x);
+        const double yLen = vsg::length(y);
+        if (yLen > 0.0) y /= yLen;
+        else y = vsg::dvec3(0.0, 1.0, 0.0);
+        z = vsg::cross(x, y); // re-orthonormalize
+        tip = position;
+        return true;
+    }
+
+    if (zLen <= 0.0) z = vsg::dvec3(0.0, 0.0, 1.0);
 
     // Prefer world +Z as the reference "up" when building the tool frame; fall
     // back to +X when the axis is nearly vertical.
     vsg::dvec3 up(0.0, 0.0, 1.0);
     if (std::abs(vsg::dot(z, up)) > 0.95) up = vsg::dvec3(1.0, 0.0, 0.0);
 
-    vsg::dvec3 x = vsg::cross(up, z);
+    x = vsg::cross(up, z);
     const double xLen = vsg::length(x);
     if (xLen <= 0.0) x = vsg::dvec3(1.0, 0.0, 0.0);
     else x /= xLen;
 
-    const vsg::dvec3 y = vsg::cross(z, x);
+    y = vsg::cross(z, x);
 
     // Mesh / sweep frames put the tip at the origin. The mouse / table hit is
     // the sphere or fillet centre for ball, sphere, and bull, so shift the tip
     // down the axis by that offset.
-    vsg::dvec3 tip = position;
+    tip = position;
     const double centerOffset = static_cast<double>(toolCenterOffset(_toolType, worldToolRadius()));
     if (centerOffset > 0.0)
         tip = position - z * centerOffset;
+    return true;
+}
 
-    commitToolTip(tip, x, y, z);
+void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
+{
+    if (!_toolTransform || _toolType == ToolType::None) return;
+    if (referencePoses.empty()) return;
+    if (referencePoses.size() == 1)
+    {
+        setToolPose(referencePoses.front().position, referencePoses.front().direction);
+        return;
+    }
+
+    std::vector<ToolPose> tipPoses;
+    tipPoses.reserve(referencePoses.size());
+    vsg::dvec3 tip, x, y, z;
+    for (const ToolPose& ref : referencePoses)
+    {
+        if (!referencePoseToTipFrame(ref.position, ref.direction, tip, x, y, z)) return;
+        // Grinding sweep stores radial as direction (local +Z); others store axis.
+        tipPoses.push_back(ToolPose{tip, z});
+    }
+
+    _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
+                                        y.x, y.y, y.z, 0.0,
+                                        z.x, z.y, z.z, 0.0,
+                                        tip.x, tip.y, tip.z, 1.0);
+    _lastToolPose = tipPoses.back();
+    for (const ToolPose& p : tipPoses)
+        appendToolTrajectory(p.position);
+
+    if (Parameter::instance().booleanOp() == BooleanOp::Inspection)
+    {
+        const bool movedEnough = placeInspectionCutter(tipPoses.back(), false);
+        if (movedEnough)
+            applyBooleanToRayModel();
+        else if (_viewer)
+            _viewer->request();
+        return;
+    }
+
+    const bool sweepChanged = recordSweepPath(tipPoses);
+    if (sweepChanged)
+        applyBooleanToRayModel();
+    else if (_viewer)
+        _viewer->request();
 }
 
 void RenderManager::setToolTipPose(const ToolPose& pose)
@@ -1051,6 +1546,7 @@ void RenderManager::resetSweepAnchor()
 void RenderManager::resetBooleanStock()
 {
     _booleanRayModel.reset();
+    _preShellRayModel.reset();
     _inspectionRayModel.reset();
     _inspectionPrevAabb = {};
     _inspectionBooleanPose.reset();
@@ -1060,6 +1556,63 @@ void RenderManager::resetBooleanStock()
         rebuild();
     else if (_viewer)
         _viewer->request();
+}
+
+bool RenderManager::shellStock(double thickness)
+{
+    if (!(thickness > 0.0)) return false;
+
+    // Re-shelling (new thickness): restore the pre-shell stock first so walls
+    // are not stacked on an already-hollowed model. First Shell: cache current.
+    if (_preShellRayModel)
+    {
+        _booleanRayModel = _preShellRayModel->clone();
+    }
+    else
+    {
+        const RayModel* current = nullptr;
+        if (_booleanRayModel) current = &*_booleanRayModel;
+        else if (_sourceRayModel) current = _sourceRayModel;
+        if (!current || current->rayCount() == 0) return false;
+
+        _preShellRayModel = current->clone();
+        if (!_booleanRayModel)
+            _booleanRayModel = _preShellRayModel->clone();
+    }
+
+    try
+    {
+        _booleanRayModel->shellInPlace(thickness);
+    }
+    catch (const std::exception&)
+    {
+        if (_preShellRayModel)
+            _booleanRayModel = _preShellRayModel->clone();
+        return false;
+    }
+
+    _inspectionRayModel.reset();
+    _inspectionPrevAabb = {};
+    _inspectionBooleanPose.reset();
+    _rayModel = &*_booleanRayModel;
+    _splatCache.clearCutFace();
+    refreshRayViewsAfterStockEdit();
+    return true;
+}
+
+bool RenderManager::cancelShell()
+{
+    if (!_preShellRayModel) return false;
+
+    _booleanRayModel = std::move(*_preShellRayModel);
+    _preShellRayModel.reset();
+    _inspectionRayModel.reset();
+    _inspectionPrevAabb = {};
+    _inspectionBooleanPose.reset();
+    _rayModel = &*_booleanRayModel;
+    _splatCache.clearCutFace();
+    refreshRayViewsAfterStockEdit();
+    return true;
 }
 
 void RenderManager::retractToolAndResetSweep()
@@ -1202,15 +1755,34 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
         (appliesBoolean(Parameter::instance().booleanOp())) ? 0.05 : 0.25;
     if (move < static_cast<double>(radius) * minMoveFactor) return false;
 
-    const ToolPose tipA = *sweep.lastPose();
+    return recordSweepPath({*sweep.lastPose(), pose});
+}
 
-    // Boolean always uses this one segment. Stock (_booleanRayModel) already
-    // holds prior cuts; re-walking the whole path would only grow cost.
+bool RenderManager::recordSweepPath(const std::vector<ToolPose>& tipPoses)
+{
+    if (_toolType == ToolType::None || tipPoses.size() < 2) return false;
+
+    if (!_sweptVolume) _sweptVolume = SweptVolume{};
+
+    SweptVolume& sweep = *_sweptVolume;
+
+    // Seed-only: remember the first station without cutting when nothing was
+    // anchored yet and the caller only handed a path that starts here.
+    if (!sweep.lastPose())
+        sweep.setLastPose(tipPoses.front());
+
+    const float radius = worldToolRadius();
+
+    // Boolean always uses this one path solid. Stock (_booleanRayModel) already
+    // holds prior cuts; re-walking the whole history would only grow cost.
     SweptVolume step;
-    step.appendSegment(_toolType, radius, worldToolLength(), tipA, pose);
+    step.appendPath(_toolType, radius, worldToolLength(), tipPoses, 8,
+                    static_cast<float>(Parameter::instance().toolVertexAngleDeg()),
+                    worldFromModelLength(Parameter::instance().toolShankRadius()),
+                    worldFromModelLength(Parameter::instance().toolShankLength()));
     if (step.empty())
     {
-        sweep.setLastPose(pose);
+        sweep.setLastPose(tipPoses.back());
         return false;
     }
     _cutSweep = step;
@@ -1230,7 +1802,7 @@ bool RenderManager::recordSweepStep(const ToolPose& pose)
     {
         // Keep the path for drawing only; skip BVH on the accumulator.
         sweep.appendTriangles(_cutSweep->mesh(), false);
-        sweep.setLastPose(pose);
+        sweep.setLastPose(tipPoses.back());
     }
 
     publishSweptVolume();
@@ -1241,7 +1813,11 @@ bool RenderManager::placeInspectionCutter(const ToolPose& pose, bool forceBoolea
 {
     if (_toolType == ToolType::None || !_toolTransform) return false;
 
-    TriangleMesh mesh = createToolMesh(_toolType, worldToolRadius(), worldToolLength());
+    TriangleMesh mesh =
+        createToolMesh(_toolType, worldToolRadius(), worldToolLength(), 48, 24, 12,
+                       static_cast<float>(Parameter::instance().toolVertexAngleDeg()),
+                       worldFromModelLength(Parameter::instance().toolShankRadius()),
+                       worldFromModelLength(Parameter::instance().toolShankLength()));
     if (mesh.triangles.empty()) return false;
 
     transformTriangleMesh(mesh, _toolTransform->matrix);
@@ -1376,6 +1952,35 @@ void RenderManager::clearTrajectory()
     _trajectoryPointCount = 0;
     _trajectoryIndexCount = 0;
     _trajectoryConnect = false;
+    if (_viewer) _viewer->request();
+}
+
+void RenderManager::setTrajectoryPath(const std::vector<vsg::dvec3>& points)
+{
+    clearTrajectory();
+    if (points.size() < 2) return;
+
+    _trajectoryConnect = false;
+    for (const vsg::dvec3& p : points)
+    {
+        const vsg::vec3 point(static_cast<float>(p.x), static_cast<float>(p.y),
+                              static_cast<float>(p.z));
+        ensureTrajectoryCapacity();
+        if (!_trajectoryPositions || !_trajectoryIndices || !_trajectoryDraw) return;
+
+        (*_trajectoryPositions)[_trajectoryPointCount] = point;
+        if (_trajectoryConnect && _trajectoryPointCount > 0)
+        {
+            (*_trajectoryIndices)[_trajectoryIndexCount] = _trajectoryPointCount - 1;
+            (*_trajectoryIndices)[_trajectoryIndexCount + 1] = _trajectoryPointCount;
+            _trajectoryIndexCount += 2;
+            _trajectoryDraw->indexCount = _trajectoryIndexCount;
+            _trajectoryIndices->dirty();
+        }
+        ++_trajectoryPointCount;
+        _trajectoryConnect = true;
+        _trajectoryPositions->dirty();
+    }
     if (_viewer) _viewer->request();
 }
 
@@ -1530,6 +2135,7 @@ void RenderManager::applyBooleanToRayModel()
     if (!_sourceRayModel)
     {
         _booleanRayModel.reset();
+        _preShellRayModel.reset();
         _inspectionRayModel.reset();
         _inspectionPrevAabb = {};
         _rayModel = nullptr;
@@ -1550,7 +2156,6 @@ void RenderManager::applyBooleanToRayModel()
     const RayModel* const displayedBefore = _rayModel;
     const bool wasInspecting =
         _inspectionRayModel.has_value() && displayedBefore == &*_inspectionRayModel;
-    const bool showingSource = displayedBefore == _sourceRayModel;
 
     if (op == BooleanOp::None || op == BooleanOp::Probe)
     {
@@ -1559,21 +2164,27 @@ void RenderManager::applyBooleanToRayModel()
     }
     else if (op == BooleanOp::Inspection)
     {
+        // Prefer shelled / cut boolean stock so Inspection matches Subtraction.
+        // Fall back to the pristine cast when no boolean session exists yet.
+        const RayModel* baseStock =
+            _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
+        const bool showingBase = displayedBefore == baseStock;
+
         if (!_cutSweep || _cutSweep->empty())
         {
             _rayModel = nullptr;
             _inspectionRayModel.reset();
             _inspectionPrevAabb = {};
-            _rayModel = _sourceRayModel;
-            raysMutated = !showingSource;
+            _rayModel = baseStock;
+            raysMutated = !showingBase;
         }
         else
         {
-            // Fresh stock every move: clone the cached original, then subtract
+            // Fresh stock every move: clone current session stock, then subtract
             // the cutter at this pose. Do not touch _booleanRayModel.
             _rayModel = nullptr;
             const auto cloneStart = ProfileClock::now();
-            _inspectionRayModel = _sourceRayModel->clone();
+            _inspectionRayModel = baseStock->clone();
             cloneMs = millisSince(cloneStart);
 
             const BoundingBox bounds = _inspectionRayModel->bounds();
@@ -1593,10 +2204,10 @@ void RenderManager::applyBooleanToRayModel()
 
             dirtyModelAabb = currentDirty;
             if (wasInspecting) restoreAabb = _inspectionPrevAabb;
-            // Patch when the previous display was already original stock
+            // Patch when the previous display was already base stock
             // (plus at most the last preview hole). Accumulated cuts need a
             // packed refill so old holes do not linger in the splat cache.
-            haveDirtyRegion = currentDirty.valid() && (wasInspecting || showingSource);
+            haveDirtyRegion = currentDirty.valid() && (wasInspecting || showingBase);
             _inspectionPrevAabb = currentDirty;
         }
     }
@@ -1641,7 +2252,9 @@ void RenderManager::applyBooleanToRayModel()
 
     if (_viewMode == ViewMode::RayGS && _rayModel && haveDirtyRegion && !_splatCache.empty())
     {
-        const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+        const int stride = displayStride();
+        const int cutStride = coarseStride();
+        const SplatViewCull viewCull = splatViewCull();
         const auto patchStart = ProfileClock::now();
         const auto radii = splatRadii(*_rayModel, stride);
         const SplatStyle style = splatStyle();
@@ -1650,15 +2263,15 @@ void RenderManager::applyBooleanToRayModel()
         if (restoreAabb.valid())
         {
             patched = _splatCache.updateRegion(*_rayModel, restoreAabb, stride, radii, style,
-                                               skipCutSplats);
+                                               skipCutSplats, viewCull);
             if (patched == PatchResult::Ok && dirtyModelAabb.valid())
                 patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii,
-                                                   style, skipCutSplats);
+                                                   style, skipCutSplats, viewCull);
         }
         else
         {
             patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii, style,
-                                               skipCutSplats);
+                                               skipCutSplats, viewCull);
         }
         if (patched == PatchResult::Ok)
         {
@@ -1666,11 +2279,18 @@ void RenderManager::applyBooleanToRayModel()
             const auto sectionStart = ProfileClock::now();
             if (op == BooleanOp::Inspection)
                 syncInspectionSectionGrid(dirtyModelAabb);
-            else if (accumulatesCutMesh(op))
-                _splatCache.patchCutFace(*_rayModel, stride, dirtyModelAabb,
-                                                 splatStyle().toolColor);
+            else if (cutMeshEnabled())
+            {
+                if (accumulatesCutMesh(op))
+                    _splatCache.patchCutFace(*_rayModel, cutStride, dirtyModelAabb,
+                                             splatStyle().toolColor);
+                else
+                    _splatCache.restoreCutFace(*_rayModel, cutStride, splatStyle().toolColor);
+            }
             else
-                _splatCache.restoreCutFace(*_rayModel, stride, splatStyle().toolColor);
+            {
+                _splatCache.clearCutFace();
+            }
             const double sectionMs = millisSince(sectionStart);
             logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
             if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
@@ -1698,18 +2318,27 @@ void RenderManager::applyBooleanToRayModel()
         const auto rebuildStart = ProfileClock::now();
         if (_viewMode == ViewMode::RayGS)
         {
-            const int stride = _rayModel->strideForRayBudget(maxRenderedRays);
+            const int stride = displayStride();
+            const int cutStride = coarseStride();
+            const SplatViewCull viewCull = splatViewCull();
             const bool skipCutSplats = skipCutSplatEnds(op, dirtyModelAabb.valid());
             _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
-                                skipCutSplats);
+                                skipCutSplats, viewCull);
             const double splatMs = millisSince(rebuildStart);
             const auto sectionStart = ProfileClock::now();
             if (op == BooleanOp::Inspection)
                 syncInspectionSectionGrid(dirtyModelAabb);
-            else if (accumulatesCutMesh(op))
-                _splatCache.rebuildCutFace(*_rayModel, stride, splatStyle().toolColor);
+            else if (cutMeshEnabled())
+            {
+                if (accumulatesCutMesh(op))
+                    _splatCache.rebuildCutFace(*_rayModel, cutStride, splatStyle().toolColor);
+                else
+                    _splatCache.restoreCutFace(*_rayModel, cutStride, splatStyle().toolColor);
+            }
             else
-                _splatCache.restoreCutFace(*_rayModel, stride, splatStyle().toolColor);
+            {
+                _splatCache.clearCutFace();
+            }
             const double sectionMs = millisSince(sectionStart);
             presentSplatCache();
             logCutProfile(booleanMs, "rebuild", splatMs, dirtyModelAabb, cloneMs, sectionMs);

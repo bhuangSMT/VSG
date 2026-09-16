@@ -25,6 +25,7 @@
 #include "SweptVolume.h"
 #include "ToolType.h"
 #include "ViewMode.h"
+#include "WorldAxes.h"
 
 namespace app
 {
@@ -38,6 +39,15 @@ public:
                   vsg::ref_ptr<vsg::Group> scene,
                   vsg::ref_ptr<vsg::Options> options);
     ~RenderManager();
+
+    // RGB XYZ gizmo at the world origin (tube + cone). Clickable via
+    // pickWorldAxis / selectWorldAxis.
+    void showWorldAxes(bool show = true);
+    bool worldAxesVisible() const { return _axesNode != nullptr; }
+    std::optional<WorldAxisPart> pickWorldAxis(const vsg::Camera& camera, int32_t x,
+                                               int32_t y) const;
+    void selectWorldAxis(WorldAxisPart part);
+    WorldAxisPart selectedWorldAxis() const { return _axesSelected; }
 
     // Replace everything currently in the scene with the given BRep. Any ray
     // model from a previous BRep is discarded.
@@ -83,9 +93,9 @@ public:
     void setToolType(ToolType type);
     ToolType toolType() const { return _toolType; }
 
-    // Rebuild the tool mesh from Parameter::toolRadius() / toolLength() (and
-    // the current type). Keeps the existing pose when the tool was already on
-    // screen.
+    // Rebuild the cutter (and display shank, if Parameter has shank size)
+    // from Parameter. Swept volume still uses the cutter only. Keeps the
+    // existing pose when the tool was already on screen.
     void updateToolGeometry();
 
     // Place the active tool at position with axis along direction (world space).
@@ -93,6 +103,12 @@ public:
     // centre for bull nose, and the tip for flat nose. The sweep still uses
     // the tip (shifted down the axis by toolCenterOffset).
     void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
+
+    // Advance along a polyline of reference poses (same convention as
+    // setToolPose). Builds one swept solid through all stations (caps at the
+    // ends only for grinding), places the tool at the last pose, and booleans
+    // once. Requires at least two poses.
+    void setToolPosePath(const std::vector<ToolPose>& referencePoses);
 
     // Place the cutter tip at pose.position with axis pose.direction. Unlike
     // setToolPose, position is always the tip (no ball-nose centre offset).
@@ -122,19 +138,40 @@ public:
     void setSweptVolumeVisible(bool visible);
     bool sweptVolumeVisible() const { return _showSweptVolume; }
 
+    // Rebuild Ray-GS after Parameter::cutMeshDisplay() changes (mesh vs dots).
+    void refreshCutMeshDisplay();
+
     // Drop the accumulated swept-volume mesh (CPU + scene node).
     void clearSweptVolume();
 
     // Drop the tool-tip polyline node. The next non-None pose starts a new path.
     void clearTrajectory();
 
+    // Replace the path line with an explicit polyline (model/world positions as
+    // drawn). Ignores boolean-op / tool-type gates used by appendToolTrajectory.
+    void setTrajectoryPath(const std::vector<vsg::dvec3>& points);
+
+    // Fit matrix for the currently displayed stock (BRep / ray model), or identity.
+    vsg::dmat4 currentFitMatrix() const;
+
     // Apply Parameter::booleanOp() using the current SweptVolume. Subtraction
     // and Union are cumulative: the input is the previous boolean result (or
-    // the original cast on the first cut). Inspection restores the cached
-    // original RayModel every move and subtracts only the current cutter.
+    // the original cast on the first cut). Inspection clones session stock
+    // (_booleanRayModel if present, else the original cast) every move and
+    // subtracts only the current cutter.
     // None stops further cuts but keeps the current RayModel as displayed.
     void setBooleanOp(BooleanOp op);
     void applyBooleanToRayModel();
+
+    // Hollow the current simulation stock by thickness (model units). On the
+    // first Shell, caches a deep clone for Cancel / re-shell. On later Shell
+    // OK, restores that cache first so the new thickness replaces the old
+    // walls instead of stacking. Returns false if there is no stock or
+    // thickness is invalid.
+    bool shellStock(double thickness);
+    // Restore stock from the pre-shell cache. Returns false if nothing cached.
+    bool cancelShell();
+    bool hasPreShellCache() const { return _preShellRayModel.has_value(); }
 
     // Cast a camera ray through (x, y) against the current BRep. On a miss,
     // project onto the view plane through the model centre (perpendicular to
@@ -152,6 +189,13 @@ public:
     void setFitToUnitBox(bool enable) { _fitToUnitBox = enable; }
     bool fitToUnitBox() const { return _fitToUnitBox; }
 
+    // Active view camera for Ray-GS density / frustum cull. Call after the
+    // viewer is framed; noteCameraMoved() restarts the settle debounce.
+    void setCamera(vsg::ref_ptr<vsg::Camera> camera);
+    void noteCameraMoved();
+    // Trackball / scroll events that should kick the Ray-GS view refresh.
+    vsg::ref_ptr<vsg::Visitor> createCameraSettleHandler();
+
     // Log per-cut timings (boolean, splat patch vs full rebuild) and the
     // interval-pool / splat-buffer occupancy that drives them to stdout.
     void setProfilingEnabled(bool enable) { _profiling = enable; }
@@ -162,6 +206,9 @@ public:
 private:
     // Draw whatever suits the current view mode.
     void rebuild();
+
+    // After Shell / Cancel shell: refresh Ray line mode and Ray-GS from _rayModel.
+    void refreshRayViewsAfterStockEdit();
 
     // Assemble a StateGroup around one indexed draw. lines selects a line list
     // topology (with culling off) instead of a triangle list. transparent turns
@@ -201,8 +248,12 @@ private:
 
     // Model-space radius / length from Parameter, converted into the space the
     // tool is drawn in (world / fitted), matching applyFit()'s scale.
+    float worldFromModelLength(double value) const;
     float worldToolRadius() const;
     float worldToolLength() const;
+
+    vsg::ref_ptr<vsg::Node> toolMeshNode(const TriangleMesh& mesh,
+                                         const vsg::vec4& color) const;
 
     // Rebuild the swept-volume scene node from the CPU SweptVolume, when the
     // swept-volume checkbox is on. Inspection draws the current cutter as a
@@ -217,9 +268,17 @@ private:
     // the sweep mesh changed (so callers can re-run boolean / rebuild Ray-GS).
     bool recordSweepStep(const ToolPose& pose);
 
+    // Accumulate one multi-station sweep (caps at ends only for grinding).
+    bool recordSweepPath(const std::vector<ToolPose>& tipPoses);
+
     // Write the tool matrix from a tip and orthonormal frame, then sweep/boolean.
     void commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, const vsg::dvec3& y,
                        const vsg::dvec3& z);
+
+    // Same frame / tip conversion as setToolPose, without committing.
+    bool referencePoseToTipFrame(const vsg::dvec3& position, const vsg::dvec3& direction,
+                                 vsg::dvec3& tip, vsg::dvec3& x, vsg::dvec3& y,
+                                 vsg::dvec3& z) const;
 
     // Inspection: put the cutter mesh at the current tool pose into _cutSweep
     // and publish it as the swept volume. Returns true when the pose moved
@@ -238,10 +297,22 @@ private:
     // Full Ray-GS rebuild through the Gaussian cache, then attach
     // only when the GPU node is new or its arrays grew.
     void rebuildSplatCache();
+    // Global (non-zoom) stride used for cut-face quads and far-face dots.
+    int coarseStride() const;
     void presentSplatCache();
     bool splatOnScreen() const;
     // Inspection: replace-in-window overlay. Does not rewrite _section slots.
     void syncInspectionSectionGrid(const BoundingBox& sectionAabb);
+
+    // Stock AABB ∩ camera frustum AABB in model space (padded). Empty when
+    // nothing is on screen; full stock bounds when no camera is set.
+    BoundingBox visibleStockAabb() const;
+    // View-aware display stride under maxRenderedRays (falls back to global).
+    int displayStride() const;
+    SplatViewCull splatViewCull() const;
+    std::size_t rayCountVisibleAtStride(int stride) const;
+    vsg::dmat4 modelToClipMatrix() const;
+    void refreshSplatViewForCamera();
 
     // One --profile line for a completed cut. drawPath names how the display
     // was refreshed: "patch" (splat AABB update), "rebuild" or "no-draw".
@@ -270,8 +341,8 @@ private:
     // separate from the tool so a view-mode change does not drop the cutter.
     vsg::ref_ptr<vsg::Node> _modelNode;
 
-    // Persistent tool placement. Children hold the cutter mesh; the matrix
-    // moves the tip to the latest pick.
+    // Persistent tool placement. Children hold the cutter and optional shank;
+    // the matrix moves the tip to the latest pick.
     vsg::ref_ptr<vsg::MatrixTransform> _toolTransform;
 
     // The last (current) swept volume on the CPU: triangle soup + BVH. Always
@@ -293,9 +364,15 @@ private:
     uint32_t _trajectoryIndexCount = 0;
     bool _trajectoryConnect = false;
 
+    // World-origin XYZ gizmo (tube + cone per axis).
+    vsg::ref_ptr<vsg::Group> _axesNode;
+    WorldAxesSpec _axesSpec{};
+    WorldAxisPart _axesSelected = WorldAxisPart::None;
+
     vsg::vec4 _surfaceColor{0.80f, 0.80f, 0.85f, 1.0f};
     vsg::vec4 _wireframeColor{0.20f, 0.90f, 0.40f, 1.0f};
     vsg::vec4 _toolColor{0.95f, 0.35f, 0.10f, 1.0f};
+    vsg::vec4 _shankColor{0.78f, 0.80f, 0.84f, 1.0f};
     vsg::vec4 _sweptColor{0.55f, 0.55f, 0.58f, 0.35f};
 
     // Rays are coloured by the axis they run along: x red, y green, z blue.
@@ -353,7 +430,7 @@ private:
     // splat quads, so this is about 1.5 million quads: past that the splats are
     // smaller than a pixel and the extra vertices buy nothing visible. A cast
     // finer than this is thinned by whole grid layers rather than refused.
-    static constexpr std::size_t maxRenderedRays = 750000;
+    static constexpr std::size_t maxRenderedRays = 2000000;
 
     // Points into _rayModels (the unmodified cast), or null before anything
     // has been cast.
@@ -364,9 +441,14 @@ private:
     // points here while a subtraction/union session is active.
     std::optional<RayModel> _booleanRayModel;
 
-    // Inspection working copy: cloned from _sourceRayModel each preview move,
-    // then subtracted. Discarded when leaving Inspection so accumulated cuts
-    // in _booleanRayModel stay intact.
+    // Stock immediately before the last successful Shell. One-slot undo; not
+    // keyed into _rayModels (those are resolution-keyed pristine casts).
+    std::optional<RayModel> _preShellRayModel;
+
+    // Inspection working copy: cloned from session stock (_booleanRayModel if
+    // present, else _sourceRayModel) each preview move, then subtracted.
+    // Discarded when leaving Inspection so accumulated cuts in
+    // _booleanRayModel stay intact.
     std::optional<RayModel> _inspectionRayModel;
 
     // Model-space AABB of the last inspection cutter, so the next move can
@@ -382,6 +464,10 @@ private:
 
     // What is drawn: _sourceRayModel, &_booleanRayModel, or &_inspectionRayModel.
     const RayModel* _rayModel = nullptr;
+
+    vsg::ref_ptr<vsg::Camera> _camera;
+    class QTimer* _splatViewDebounce = nullptr;
+    static constexpr int splatViewDebounceMs = 120;
 };
 
 } // namespace app

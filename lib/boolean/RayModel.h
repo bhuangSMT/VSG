@@ -49,6 +49,11 @@ public:
                         BooleanOp op,
                         const vsg::dmat4& modelToWorld);
 
+    // Hollow every solid interval: keep an inward wall of `thickness` (model
+    // units) at each endpoint. Degenerate walls and overlapping wall pairs from
+    // the same parent are dropped. Throws if thickness is not positive.
+    void shellInPlace(double thickness);
+
     // nullptr when that axis was not built.
     const RayGrid* grid(std::size_t axis) const;
     RayGrid* grid(std::size_t axis);
@@ -65,6 +70,12 @@ public:
     static constexpr int maxStride = 1024;
     int strideForRayBudget(std::size_t maxRays) const;
     std::size_t rayCountAtStride(int stride) const;
+
+    // Interval count on stride-aligned cells whose lateral sample falls in aabb.
+    // Falls back to rayCountAtStride when aabb is empty/invalid.
+    std::size_t rayCountInAabbAtStride(const BoundingBox& aabb, int stride) const;
+    // Smallest stride whose visible (aabb) interval count fits maxRays.
+    int strideForVisibleBudget(const BoundingBox& aabb, std::size_t maxRays) const;
 
     std::unique_lock<std::recursive_mutex> lockChains() const;
 

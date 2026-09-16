@@ -163,6 +163,113 @@ TriangleMesh flatNoseTool(float radius, float height, int slices)
     return mesh;
 }
 
+// Ring about an axis parallel to +X through (0, 0, axisZ).
+void ringAboutX(std::vector<vsg::vec3>& out, int segments, float radius, float x, float axisZ)
+{
+    out.clear();
+    out.reserve(static_cast<std::size_t>(segments));
+    for (int i = 0; i < segments; ++i)
+    {
+        const float a = (2.0f * pi * static_cast<float>(i)) / static_cast<float>(segments);
+        // a = 0 → toward −Z (vertex side of the triangle).
+        out.push_back(vsg::vec3(x, radius * std::sin(a), axisZ - radius * std::cos(a)));
+    }
+}
+
+void stitchRevolveRings(TriangleMesh& mesh,
+                        const std::vector<vsg::vec3>& a,
+                        const std::vector<vsg::vec3>& b,
+                        int slices)
+{
+    if (a.size() == 1 && b.size() > 1)
+    {
+        for (int i = 0; i < slices; ++i)
+        {
+            const int j = (i + 1) % slices;
+            addTriangleAuto(mesh, a[0], b[j], b[i]);
+        }
+    }
+    else if (b.size() == 1 && a.size() > 1)
+    {
+        for (int i = 0; i < slices; ++i)
+        {
+            const int j = (i + 1) % slices;
+            addTriangleAuto(mesh, a[i], a[j], b[0]);
+        }
+    }
+    else if (a.size() > 1 && b.size() > 1)
+    {
+        stitchRings(mesh, a, b, true);
+    }
+}
+
+// Revolve an (x, r) polyline about +X through (0, 0, axisZ).
+TriangleMesh revolveProfileX(const std::vector<std::pair<float, float>>& corners,
+                             float axisZ, int slices, int stacks, const char* name)
+{
+    TriangleMesh mesh;
+    mesh.name = name;
+    if (corners.size() < 2 || slices < 3) return mesh;
+    if (stacks < 1) stacks = 1;
+
+    std::vector<std::pair<float, float>> samples;
+    samples.reserve(corners.size() * static_cast<std::size_t>(stacks + 1));
+    for (std::size_t e = 0; e + 1 < corners.size(); ++e)
+    {
+        const auto a = corners[e];
+        const auto b = corners[e + 1];
+        for (int s = 0; s < stacks; ++s)
+        {
+            const float t = static_cast<float>(s) / static_cast<float>(stacks);
+            samples.push_back({a.first + (b.first - a.first) * t,
+                               a.second + (b.second - a.second) * t});
+        }
+    }
+    samples.push_back(corners.back());
+
+    std::vector<std::vector<vsg::vec3>> rings(samples.size());
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+        const float x = samples[i].first;
+        const float r = samples[i].second;
+        auto& row = rings[i];
+        if (r <= 1.0e-8f)
+            row.push_back(vsg::vec3(x, 0.0f, axisZ));
+        else
+            ringAboutX(row, slices, r, x, axisZ);
+    }
+
+    for (std::size_t s = 0; s + 1 < rings.size(); ++s)
+        stitchRevolveRings(mesh, rings[s], rings[s + 1], slices);
+
+    return mesh;
+}
+
+// Isosceles cutter only. Origin = triangle-base midpoint (CL). Spindle +X on
+// the shank edge (z = shankRadius); vertex at (0, 0, −H).
+TriangleMesh grindingWheelTool(float height, float vertexAngleDeg, float shankRadius,
+                               int slices, int stacks)
+{
+    TriangleMesh mesh;
+    mesh.name = "grinding-wheel";
+    if (!(height > 0.0f) || slices < 3) return mesh;
+    if (!(shankRadius >= 0.0f)) shankRadius = 0.0f;
+
+    const float halfBase = grindingWheelHalfBase(height, vertexAngleDeg);
+    if (!(halfBase > 0.0f)) return mesh;
+
+    const float axisZ = shankRadius;
+    const float rBase = shankRadius;
+    const float rVertex = shankRadius + height;
+
+    std::vector<std::pair<float, float>> corners = {
+        {-halfBase, rBase},
+        {0.0f, rVertex},
+        {halfBase, rBase},
+    };
+    return revolveProfileX(corners, axisZ, slices, stacks, "grinding-wheel");
+}
+
 // Ball-end mill: hemispherical tip of `radius` (tip at the origin, centre at
 // z = radius), then a cylindrical shank of the same radius and length `height`.
 TriangleMesh ballNoseTool(float radius, float height, int slices, int stacks)
@@ -278,12 +385,50 @@ TriangleMesh bullNoseTool(float radius, float height, float cornerRadius, int sl
 
 } // namespace
 
+TriangleMesh createShankMesh(float radius, float z0, float height, int slices)
+{
+    TriangleMesh mesh;
+    mesh.name = "shank";
+    if (!(radius > 0.0f) || !(height > 0.0f)) return mesh;
+    if (slices < 3) slices = 3;
+
+    std::vector<vsg::vec3> bottom;
+    std::vector<vsg::vec3> top;
+    ring(bottom, slices, radius, z0);
+    ring(top, slices, radius, z0 + height);
+    capDisk(mesh, bottom, false);
+    stitchRings(mesh, bottom, top, true);
+    capDisk(mesh, top, true);
+    return mesh;
+}
+
+TriangleMesh createGrindingShankMesh(float wheelHeight, float shankRadius, float shankLength,
+                                     int slices, int stacks)
+{
+    (void)wheelHeight;
+    if (!(shankRadius > 0.0f) || !(shankLength > 0.0f)) return {};
+    if (slices < 3) slices = 3;
+    if (stacks < 1) stacks = 1;
+
+    const float halfLen = 0.5f * shankLength;
+    const float axisZ = shankRadius;
+    const std::vector<std::pair<float, float>> corners = {
+        {-halfLen, 0.0f},
+        {-halfLen, shankRadius},
+        {halfLen, shankRadius},
+        {halfLen, 0.0f},
+    };
+    return revolveProfileX(corners, axisZ, slices, stacks, "shank");
+}
+
 TriangleMesh createToolMesh(ToolType type, float radius, float height,
-                            int slices, int stacks, int filletStacks)
+                            int slices, int stacks, int filletStacks,
+                            float vertexAngleDeg, float shankRadius, float shankLength)
 {
     if (slices < 3) slices = 3;
     if (stacks < 2) stacks = 2;
     if (filletStacks < 1) filletStacks = 1;
+    (void)shankLength;
 
     switch (type)
     {
@@ -295,6 +440,8 @@ TriangleMesh createToolMesh(ToolType type, float radius, float height,
         return ballNoseTool(radius, height, slices, stacks);
     case ToolType::BullNose:
         return bullNoseTool(radius, height, bullNoseFilletRadius(radius), slices, filletStacks);
+    case ToolType::GrindingWheel:
+        return grindingWheelTool(radius, vertexAngleDeg, shankRadius, slices, stacks);
     case ToolType::None:
         break;
     }

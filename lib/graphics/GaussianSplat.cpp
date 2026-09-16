@@ -61,9 +61,9 @@ void main()
     // On-screen size as a fraction of half the viewport height. Cap it so
     // zooming in shrinks world-space radius instead of ballooning into beads.
     // 0.12 filled a tenth of the view per splat and read as balls up close;
-    // 0.03 keeps the far sheet and only bites when the camera is near.
+    // 0.06 keeps the far sheet filled while still biting when the camera is near.
     float apparent = radius * abs(pc.projection[1][1]) / max(-centerEye.z, 1e-6);
-    const float maxApparent = 0.03;
+    const float maxApparent = 0.06;
     if (apparent > maxApparent)
         radius *= maxApparent / apparent;
 
@@ -318,6 +318,7 @@ void GaussianSplatSet::bindDrawArrays()
         colorGroup->add(vsg::BindGraphicsPipeline::create(_colorPipeline));
         colorGroup->addChild(_draw);
         _root->addChild(colorGroup);
+        _needsCompile = true;
     }
     attachOverlay();
 }
@@ -365,6 +366,8 @@ void GaussianSplatSet::ensureCapacity(std::size_t needed)
     _normals = normals;
     _indices = indices;
     _capacity = newCap;
+    _dirtySpans.clear();
+    _needsCompile = true;
     if (_drawCount > _capacity) _drawCount = _capacity;
 
     initSlotGeometry(oldCap, newCap);
@@ -378,6 +381,8 @@ void GaussianSplatSet::resize(std::size_t splatCount)
     {
         _capacity = 0;
         _drawCount = 0;
+        _needsCompile = false;
+        _dirtySpans.clear();
         _centerRadius = nullptr;
         _corners = nullptr;
         _colors = nullptr;
@@ -412,6 +417,7 @@ void GaussianSplatSet::resize(std::size_t splatCount)
 
         _capacity = splatCount;
         _drawCount = splatCount;
+        _dirtySpans.clear();
         initSlotGeometry(0, splatCount);
         zeroDynamicRange(0, splatCount);
         bindDrawArrays();
@@ -443,8 +449,39 @@ void GaussianSplatSet::clearSlot(std::size_t index)
     set(index, empty);
 }
 
+void GaussianSplatSet::noteDirtySlots(std::uint32_t first, std::uint32_t count)
+{
+    if (count == 0) return;
+
+    DirtySpan span{first, count};
+    auto it = std::lower_bound(
+        _dirtySpans.begin(), _dirtySpans.end(), span,
+        [](const DirtySpan& a, const DirtySpan& b) { return a.first < b.first; });
+    it = _dirtySpans.insert(it, span);
+
+    while (it + 1 != _dirtySpans.end() && it->first + it->count >= (it + 1)->first)
+    {
+        const auto nextEnd = (it + 1)->first + (it + 1)->count;
+        const auto thisEnd = it->first + it->count;
+        it->count = (nextEnd > thisEnd ? nextEnd : thisEnd) - it->first;
+        _dirtySpans.erase(it + 1);
+    }
+    if (it != _dirtySpans.begin())
+    {
+        auto prev = it - 1;
+        if (prev->first + prev->count >= it->first)
+        {
+            const auto thisEnd = it->first + it->count;
+            const auto prevEnd = prev->first + prev->count;
+            prev->count = (thisEnd > prevEnd ? thisEnd : prevEnd) - prev->first;
+            _dirtySpans.erase(it);
+        }
+    }
+}
+
 void GaussianSplatSet::markDirty()
 {
+    _dirtySpans.clear();
     if (_centerRadius) _centerRadius->dirty();
     if (_colors) _colors->dirty();
     if (_normals) _normals->dirty();
@@ -766,8 +803,9 @@ bool copyArrayRange(vsg::BufferInfo& info, std::uint32_t firstVert, std::uint32_
     {
         vsg::DeviceMemory* memory = info.buffer->getDeviceMemory(deviceID);
         if (!memory) return false;
-        if ((memory->getMemoryPropertyFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
-            return false;
+        const auto flags = memory->getMemoryPropertyFlags();
+        if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) return false;
+        if ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) return false;
 
         void* dst = nullptr;
         const VkResult result =
@@ -781,6 +819,37 @@ bool copyArrayRange(vsg::BufferInfo& info, std::uint32_t firstVert, std::uint32_
 }
 
 } // namespace
+
+bool GaussianSplatSet::copyDirtySpan(const DirtySpan& span)
+{
+    if (!_draw || _draw->arrays.size() < 4) return false;
+    const auto firstVert = span.first * 4u;
+    const auto vertCount = span.count * 4u;
+    // Corners are static; only the dynamic per-splat attributes move.
+    return copyArrayRange(*_draw->arrays[0], firstVert, vertCount) &&
+           copyArrayRange(*_draw->arrays[2], firstVert, vertCount) &&
+           copyArrayRange(*_draw->arrays[3], firstVert, vertCount);
+}
+
+void GaussianSplatSet::flushDirty()
+{
+    if (_dirtySpans.empty()) return;
+    if (_needsCompile || !_draw)
+    {
+        markDirty();
+        return;
+    }
+
+    for (const DirtySpan& span : _dirtySpans)
+    {
+        if (!copyDirtySpan(span))
+        {
+            markDirty();
+            return;
+        }
+    }
+    _dirtySpans.clear();
+}
 
 bool SectionLineSet::copyDirtySpan(const DirtySpan& span)
 {

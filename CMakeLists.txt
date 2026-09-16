@@ -100,6 +100,7 @@ set(VSG_QT_CUBE_SOURCES
     main/SimulationPanel.cpp
     main/StlImporter.cpp
     main/ThreeMfImporter.cpp
+    main/ToolManagerDialog.cpp
 )
 
 if(COMMAND qt_add_executable)

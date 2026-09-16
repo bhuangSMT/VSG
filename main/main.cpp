@@ -2,7 +2,7 @@
 //
 // Creates a Qt main window (QMainWindow) with dockable Controls and Simulation
 // panels around a VulkanSceneGraph rendering surface embedded via vsgQt. Geometry is held as a BRep and drawn by the RenderManager: the
-// scene starts with a unit cube, and STL or 3MF files can be imported at
+// scene starts with a capped cylinder (r=1, L=10), and STL or 3MF files can be imported at
 // runtime via the panel's import buttons. The panel's view mode selector switches
 // between facet and wireframe rendering of that BRep.
 //
@@ -25,6 +25,7 @@
 #include <QtWidgets/QStyleFactory>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFrame>
+#include <QtWidgets/QInputDialog>
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QScrollArea>
 #include <QtGui/QColor>
@@ -43,6 +44,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <vector>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -56,6 +58,7 @@
 #include "SimulationPanel.h"
 #include "StlImporter.h"
 #include "ThreeMfImporter.h"
+#include "ToolManagerDialog.h"
 #include "ToolTracker.h"
 #include "ToolType.h"
 #include "UcamDebug.h"
@@ -80,35 +83,59 @@ app::TriangleMesh importMesh(const std::string& path)
 
 // The startup geometry: a 1x1x1 cube centred on the origin, expressed as a
 // BRep so it travels the same path as imported models and therefore responds
-// to the view mode selector.
-app::BRep createCubeBRep()
+// to the view mode selector. Cylinder along +X (horizontal), radius 1, length 10,
+// both end caps.
+app::BRep createCylinderBRep()
 {
-    const vsg::vec3 corners[8] = {
-        {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f},
-        {-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}};
-
-    // Two counter-clockwise triangles per face, outward facing.
-    const int triangles[12][3] = {
-        {0, 3, 2}, {0, 2, 1}, // -Z
-        {4, 5, 6}, {4, 6, 7}, // +Z
-        {0, 1, 5}, {0, 5, 4}, // -Y
-        {1, 2, 6}, {1, 6, 5}, // +X
-        {2, 3, 7}, {2, 7, 6}, // +Y
-        {3, 0, 4}, {3, 4, 7}  // -X
-    };
+    constexpr float radius = 1.0f;
+    constexpr float length = 10.0f;
+    constexpr int slices = 64;
+    constexpr float pi = 3.14159265358979323846f;
+    const float x0 = -0.5f * length;
+    const float x1 = 0.5f * length;
 
     app::TriangleMesh mesh;
-    mesh.name = "cube";
-    mesh.triangles.reserve(12);
+    mesh.name = "cylinder";
+    mesh.triangles.reserve(static_cast<std::size_t>(slices * 4));
 
-    for (const auto& tri : triangles)
+    std::vector<vsg::vec3> end0;
+    std::vector<vsg::vec3> end1;
+    end0.reserve(static_cast<std::size_t>(slices));
+    end1.reserve(static_cast<std::size_t>(slices));
+    for (int i = 0; i < slices; ++i)
     {
+        const float a = (2.0f * pi * static_cast<float>(i)) / static_cast<float>(slices);
+        const float y = radius * std::cos(a);
+        const float z = radius * std::sin(a);
+        end0.push_back(vsg::vec3(x0, y, z));
+        end1.push_back(vsg::vec3(x1, y, z));
+    }
+
+    const vsg::vec3 c0(x0, 0.0f, 0.0f);
+    const vsg::vec3 c1(x1, 0.0f, 0.0f);
+    const vsg::vec3 n0(-1.0f, 0.0f, 0.0f);
+    const vsg::vec3 n1(1.0f, 0.0f, 0.0f);
+
+    auto addTri = [&](const vsg::vec3& a, const vsg::vec3& b, const vsg::vec3& c,
+                      const vsg::vec3& n) {
         app::MeshTriangle t;
-        t.v0 = corners[tri[0]];
-        t.v1 = corners[tri[1]];
-        t.v2 = corners[tri[2]];
-        t.normal = vsg::normalize(vsg::cross(t.v1 - t.v0, t.v2 - t.v0));
+        t.v0 = a;
+        t.v1 = b;
+        t.v2 = c;
+        t.normal = n;
         mesh.triangles.push_back(t);
+    };
+
+    for (int i = 0; i < slices; ++i)
+    {
+        const int j = (i + 1) % slices;
+        // Caps (outward along ±X).
+        addTri(c0, end0[i], end0[j], n0);
+        addTri(c1, end1[j], end1[i], n1);
+        // Side wall.
+        const vsg::vec3 n = vsg::normalize(vsg::vec3(0.0f, end0[i].y, end0[i].z));
+        addTri(end0[i], end1[i], end1[j], n);
+        addTri(end0[i], end1[j], end0[j], n);
     }
 
     return app::BRep::fromTriangles(mesh);
@@ -523,6 +550,19 @@ try
 
     addDivider();
 
+    auto designTitle = new QLabel("Design:");
+    designTitle->setFont(titleFont);
+    addWidget(designTitle);
+
+    auto shellButton = new QPushButton("Shell");
+    addWidget(shellButton);
+
+    auto cancelShellButton = new QPushButton("Cancel shell");
+    cancelShellButton->setEnabled(false);
+    addWidget(cancelShellButton);
+
+    addDivider();
+
     auto toolTitle = new QLabel("Tool:");
     toolTitle->setFont(titleFont);
     addWidget(toolTitle);
@@ -533,6 +573,8 @@ try
     toolCombo->addItem("Flat nose", static_cast<int>(app::ToolType::FlatNose));
     toolCombo->addItem("Ball nose", static_cast<int>(app::ToolType::BallNose));
     toolCombo->addItem("Sphere", static_cast<int>(app::ToolType::Sphere));
+    toolCombo->addItem("Grinding wheel", static_cast<int>(app::ToolType::GrindingWheel));
+    toolCombo->addItem("Tool library", -1);
     addWidget(toolCombo);
 
     addWidget(new QLabel("Radius:"));
@@ -596,6 +638,12 @@ try
                 "Subtraction: %3\nUnion: %4\nInspection: %5")
             .arg(noneKeys, probeKeys, subtractKeys, unionKeys, inspectKeys));
     addWidget(booleanCombo);
+
+    auto cutMeshDisplayCheck = new QCheckBox("Cut mesh display");
+    cutMeshDisplayCheck->setChecked(app::Parameter::instance().cutMeshDisplay());
+    cutMeshDisplayCheck->setToolTip(
+        "When on, draw cut faces as a quad mesh. When off, show cut-tagged splat dots only.");
+    addWidget(cutMeshDisplayCheck);
 
     addDivider();
     column->addSpacing(20);
@@ -732,7 +780,7 @@ try
         std::cout.flush();
     }
 
-    const app::BRep startupBRep = createCubeBRep();
+    const app::BRep startupBRep = createCylinderBRep();
     seedToolSize(startupBRep);
     renderManager->showBRep(startupBRep);
     writeResolution(defaultResolution(startupBRep));
@@ -749,17 +797,100 @@ try
         app::Parameter::instance().setContinuousUpdate(on);
         viewer->continuousUpdate = app::Parameter::instance().continuousUpdate();
     });
+    QObject::connect(shellButton, &QPushButton::clicked,
+                     [mainWindow, renderManager, radiusSpin, cancelShellButton]() {
+                         bool ok = false;
+                         const double fallback =
+                             radiusSpin->value() > 0.0 ? radiusSpin->value() * 0.25 : 0.01;
+                         const double thickness = QInputDialog::getDouble(
+                             mainWindow, "Shell", "Thickness:", fallback, 1.0e-9, 1.0e9, 6, &ok);
+                         if (!ok) return;
+                         if (!renderManager->shellStock(thickness))
+                         {
+                             QMessageBox::warning(
+                                 mainWindow, "Shell",
+                                 "No simulation stock to shell, or thickness is invalid.");
+                             return;
+                         }
+                         cancelShellButton->setEnabled(renderManager->hasPreShellCache());
+                     });
+    QObject::connect(cancelShellButton, &QPushButton::clicked,
+                     [mainWindow, renderManager, cancelShellButton]() {
+                         if (!renderManager->cancelShell())
+                         {
+                             QMessageBox::information(mainWindow, "Cancel shell",
+                                                      "Nothing to cancel.");
+                             cancelShellButton->setEnabled(false);
+                             return;
+                         }
+                         cancelShellButton->setEnabled(renderManager->hasPreShellCache());
+                     });
     QObject::connect(resetButton, &QPushButton::clicked,
                      [trackball, initialLookAt]() {
                          if (trackball && initialLookAt)
                              trackball->setViewpoint(vsg::LookAt::create(*initialLookAt), 1.0);
                      });
+    app::ToolManagerDialog* toolManager = nullptr;
+    const auto ensureToolManager = [mainWindow, windowTraits, options, interval, simPanel,
+                                    &toolManager]() -> app::ToolManagerDialog* {
+        if (!toolManager)
+        {
+            toolManager = new app::ToolManagerDialog(windowTraits, options, interval, mainWindow);
+            QObject::connect(toolManager, &app::ToolManagerDialog::toolLibraryEntryChanged,
+                             simPanel, &app::SimulationPanel::updateLibraryEntry);
+        }
+        return toolManager;
+    };
     QObject::connect(toolCombo, &QComboBox::currentIndexChanged,
-                     [renderManager, toolCombo](int index) {
+                     [renderManager, toolCombo, simPanel, ensureToolManager](int index) {
+                         if (toolCombo->itemData(index).toInt() == -1)
+                         {
+                             toolCombo->blockSignals(true);
+                             const int current =
+                                 static_cast<int>(app::Parameter::instance().toolType());
+                             const int restore = toolCombo->findData(current);
+                             if (restore >= 0) toolCombo->setCurrentIndex(restore);
+                             toolCombo->blockSignals(false);
+
+                             auto* manager = ensureToolManager();
+                             manager->show();
+                             manager->raise();
+                             manager->activateWindow();
+                             return;
+                         }
                          const auto type =
                              static_cast<app::ToolType>(toolCombo->itemData(index).toInt());
                          app::Parameter::instance().setToolType(type);
+                         app::Parameter::instance().setToolShankRadius(0.0);
+                         app::Parameter::instance().setToolShankLength(0.0);
                          renderManager->setToolType(type);
+                         renderManager->updateToolGeometry();
+                         simPanel->clearLibrarySelection();
+                     });
+    QObject::connect(simPanel, &app::SimulationPanel::toolLibraryApplied,
+                     [toolCombo, radiusSpin, lengthSpin](int, double radius,
+                                                          double cuttingLength, double,
+                                                          double) {
+                         toolCombo->blockSignals(true);
+                         const int libraryIndex = toolCombo->findData(-1);
+                         if (libraryIndex >= 0) toolCombo->setCurrentIndex(libraryIndex);
+                         toolCombo->blockSignals(false);
+                         radiusSpin->blockSignals(true);
+                         radiusSpin->setValue(radius);
+                         radiusSpin->blockSignals(false);
+                         lengthSpin->blockSignals(true);
+                         lengthSpin->setValue(cuttingLength);
+                         lengthSpin->blockSignals(false);
+                     });
+    QObject::connect(simPanel, &app::SimulationPanel::toolLibraryPreviewRequested,
+                     [ensureToolManager](int toolType, double radius, double cuttingLength,
+                                         double shankLength, double shankRadius) {
+                         auto* manager = ensureToolManager();
+                         manager->previewTool(static_cast<app::ToolType>(toolType), radius,
+                                              cuttingLength, shankLength, shankRadius);
+                         manager->show();
+                         manager->raise();
+                         manager->activateWindow();
                      });
     QObject::connect(radiusSpin, &QDoubleSpinBox::valueChanged,
                      [renderManager](double radius) {
@@ -788,6 +919,10 @@ try
                          renderManager->setBooleanOp(op);
                          simPanel->notifyBooleanOp(op);
                      });
+    QObject::connect(cutMeshDisplayCheck, &QCheckBox::toggled, [renderManager](bool on) {
+        app::Parameter::instance().setCutMeshDisplay(on);
+        renderManager->refreshCutMeshDisplay();
+    });
 
     auto selectBooleanOp = [booleanCombo](app::BooleanOp op) {
         const int want = static_cast<int>(op);
@@ -986,6 +1121,8 @@ try
     // Tool tracking has to see moves before (or at least as well as) the
     // trackball; it never marks events handled, so orbit/zoom keep working.
     viewer->addEventHandler(app::ToolTracker::create(renderManager, camera, simPanel, controlCube));
+    renderManager->setCamera(camera);
+    viewer->addEventHandler(renderManager->createCameraSettleHandler());
     viewer->addEventHandler(vsg::CloseHandler::create(viewer));
     viewer->compile();
 

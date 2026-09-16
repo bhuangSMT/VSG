@@ -5,6 +5,7 @@ ucam_add_library(ucam_graphics graphics
     ModelPick.cpp
     Parameter.cpp
     RenderManager.cpp
+    WorldAxes.cpp
 )
 
 target_link_libraries(ucam_graphics PUBLIC ucam_boolean vsg::vsg vsgQt::vsgQt TBB::tbb)
@@ -19,5 +20,6 @@ install(FILES
     SimulationMode.h
     UcamDebug.h
     ViewMode.h
+    WorldAxes.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )

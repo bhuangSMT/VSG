@@ -10,7 +10,8 @@ enum class ToolType
     BullNose,
     FlatNose,
     BallNose,
-    Sphere
+    Sphere,
+    GrindingWheel
 };
 
 } // namespace app

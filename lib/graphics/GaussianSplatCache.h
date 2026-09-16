@@ -26,6 +26,19 @@ struct SplatStyle
     float opacity = 0.5f;
 };
 
+// Optional view-adaptive packing. modelToClip is proj * view * modelToWorld.
+// Near-face ends densify with the display stride; far-face ends stay on the
+// coarseStride lattice so the back face is not culled or over-densified.
+struct SplatViewCull
+{
+    bool enabled = false;
+    vsg::dmat4 modelToClip{};
+    vsg::dvec3 eyeModel{0.0, 0.0, 0.0};
+    int coarseStride = 1;
+    // Expand the clip rectangle slightly so edge dots do not pop.
+    float ndcMargin = 0.08f;
+};
+
 // Why an incremental patch could not be completed. Anything but Ok means the
 // caller has to fall back to a full rebuild, so the reasons are worth telling
 // apart: they have different fixes.
@@ -54,22 +67,26 @@ public:
 
     // Packed refill from the displayed RayModel. Reuses the compiled GPU
     // arrays when they already hold enough slots. Issues only the packed live
-    // endpoints. skipCutSplats drops cutBegin/cutEnd discs (Inspection window,
-    // or Probe / Subtraction / Union leftovers covered by the cut-face overlay).
+    // endpoints. skipCutSplats drops cutBegin/cutEnd discs when the cut-face
+    // overlay alone should cover them. viewCull skips cells whose lateral
+    // sample falls outside the camera NDC frustum.
     vsg::ref_ptr<vsg::Node> rebuild(const RayModel& rayModel,
                                     int stride,
                                     const std::array<float, 3>& radii,
                                     const SplatStyle& style,
-                                    bool skipCutSplats = false);
+                                    bool skipCutSplats = false,
+                                    const SplatViewCull& viewCull = {});
 
-    // Regenerate only cells overlapping modelAabb. Anything but PatchResult::Ok
-    // leaves the region partly updated, so the caller has to rebuild.
+    // Regenerate only cells overlapping modelAabb and upload those GPU slots.
+    // Anything but PatchResult::Ok leaves the region partly updated, so the
+    // caller has to rebuild. viewCull clears cells that leave the frustum.
     PatchResult updateRegion(const RayModel& rayModel,
                              const BoundingBox& modelAabb,
                              int stride,
                              const std::array<float, 3>& radii,
                              const SplatStyle& style,
-                             bool skipCutSplats = false);
+                             bool skipCutSplats = false,
+                             const SplatViewCull& viewCull = {});
 
     // Inspection preview: draw UV quads in sectionAabb on a separate overlay.
     // Does not overwrite the GPU-resident Subtraction/Union cut-face mesh.
@@ -96,7 +113,8 @@ public:
     // True when rebuild allocated or grew GPU arrays; the viewer must compile.
     bool gpuNeedsCompile() const
     {
-        return _gpuNeedsCompile || _section.needsCompile() || _inspectionSection.needsCompile();
+        return _gpuNeedsCompile || _set.needsCompile() || _section.needsCompile() ||
+               _inspectionSection.needsCompile();
     }
     void noteCompiled();
 
@@ -200,6 +218,7 @@ private:
     std::uint32_t _allocEnd = 0; // one past the last allocated slot
     bool _gpuNeedsCompile = false;
     bool _skipCutSplats = false;
+    SplatViewCull _viewCull{};
     int _cutFaceStride = 0;
     Point3d _cutFaceResolution{0.0, 0.0, 0.0};
     vsg::vec4 _cutFaceColor{0.95f, 0.35f, 0.10f, 1.0f};
