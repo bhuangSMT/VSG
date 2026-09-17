@@ -65,13 +65,15 @@ double bleedHideLength(const RayGrid& grid, int stride)
 }
 
 void skipSplatEnds(const Interval& span, double modelLength, double hideShorterThan,
-                   double bleedHideLength, bool skipCutSplats, bool& skipStart, bool& skipEnd)
+                   double bleedHideLength, bool skipCutSplats, bool onCutRim,
+                   bool& skipStart, bool& skipEnd)
 {
     const bool cutStart = span.cutBegin();
     const bool cutEnd = span.cutEnd();
-    // Drop cut-tagged ends only when the cut-face overlay replaces them.
-    skipStart = skipCutSplats && cutStart;
-    skipEnd = skipCutSplats && cutEnd;
+    // Interior cut ends are covered by the overlay mesh; rim cells keep dots
+    // so the edge seals against stock Gaussians.
+    skipStart = skipCutSplats && cutStart && !onCutRim;
+    skipEnd = skipCutSplats && cutEnd && !onCutRim;
     // Short leftovers and bleed partners: still useful when cut dots are kept.
     if ((cutStart || cutEnd) && hideShorterThan > 0.0 && modelLength <= hideShorterThan)
     {
@@ -84,6 +86,34 @@ void skipSplatEnds(const Interval& span, double modelLength, double hideShorterT
         if (cutStart && !cutEnd) skipEnd = true;
         if (cutEnd && !cutStart) skipStart = true;
     }
+}
+
+bool cellHasCutTag(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv)
+{
+    if (iu >= grid.width || iv >= grid.height) return false;
+    const RaySlot& slot = grid.at(iu, iv);
+    if (slot.empty()) return false;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        if (!span.hasSolidLength()) continue;
+        if (span.cutBegin() || span.cutEnd()) return true;
+    }
+    return false;
+}
+
+// Cut-region UV rim at packing stride: any missing/empty/non-cut neighbour.
+bool cutCellOnRim(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv, int stride)
+{
+    if (stride < 1) stride = 1;
+    const auto s = static_cast<std::uint32_t>(stride);
+    auto neighborCut = [&](std::uint32_t nu, std::uint32_t nv) {
+        return nu < grid.width && nv < grid.height && cellHasCutTag(grid, nu, nv);
+    };
+    if (iu < s || !neighborCut(iu - s, iv)) return true;
+    if (iu + s >= grid.width || !neighborCut(iu + s, iv)) return true;
+    if (iv < s || !neighborCut(iu, iv - s)) return true;
+    if (iv + s >= grid.height || !neighborCut(iu, iv + s)) return true;
+    return false;
 }
 
 bool onCoarseLattice(std::uint32_t iu, std::uint32_t iv, int coarseStride)
@@ -175,6 +205,7 @@ std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t 
     const double u0 = grid.sampleU(iu);
     const double v0 = grid.sampleV(iv);
     const double hide = leftoverHideLength(grid, stride);
+    const bool onRim = !skipCutSplats || cutCellOnRim(grid, iu, iv, stride);
     std::uint32_t n = 0;
     for (const Interval& span : grid.pool.span(slot))
     {
@@ -190,7 +221,7 @@ std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t 
         bool skipStart = false;
         bool skipEnd = false;
         skipSplatEnds(span, modelLength, hide, bleedHideLength(grid, stride), skipCutSplats,
-                      skipStart, skipEnd);
+                      onRim, skipStart, skipEnd);
         applyViewEndPolicy(start, end, iu, iv, viewCull, skipStart, skipEnd);
         if (!skipStart &&
             endpointInViewCull(grid, iu, iv, start[axis], viewCull))
@@ -332,7 +363,10 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
         }
         if (!ne) continue;
 
-        const vsg::vec3 hint = h.normal;
+        // Orient winding from the four corner normals (stock/cut face normals
+        // carried on the interval ends), not from positions alone.
+        vsg::vec3 hint = h.normal + e->normal + n->normal + ne->normal;
+        if (vsg::length(hint) < 1.0e-12f) hint = h.normal;
         emitOriented(h.pos, h.normal, e->pos, e->normal, n->pos, n->normal, hint);
         emitOriented(e->pos, e->normal, ne->pos, ne->normal, n->pos, n->normal, hint);
     }
@@ -362,7 +396,7 @@ double vecComponent(const vsg::vec3& p, std::size_t axis)
     return static_cast<double>(p.z);
 }
 
-constexpr int kCutFaceHaloCells = 4;
+constexpr int kCutFaceHaloCells = 6;
 constexpr float kInspectionMaxEdgeScale = 2.5f;
 constexpr float kCutFaceMaxEdgeScale = 8.0f;
 
@@ -714,8 +748,10 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
             const float spanRadius = splatRadiusForSpan(radius, modelLength, cellDiag, stride);
             bool skipStart = false;
             bool skipEnd = false;
+            const bool onRim = !_skipCutSplats || cutCellOnRim(*grid, iu, iv, stride);
             skipSplatEnds(span, modelLength, leftoverHideLength(*grid, stride),
-                          bleedHideLength(*grid, stride), _skipCutSplats, skipStart, skipEnd);
+                          bleedHideLength(*grid, stride), _skipCutSplats, onRim, skipStart,
+                          skipEnd);
             applyViewEndPolicy(start, end, iu, iv, _viewCull, skipStart, skipEnd);
 
             if (!skipStart &&
@@ -782,10 +818,10 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
     if (su >= layout.sampledW || sv >= layout.sampledH) return PatchResult::Ok;
 
     CellRef& ref = cellRef(axis, su, sv);
-    const std::uint32_t needed = endpointNeed(*grid, iu, iv, _stride, _skipCutSplats, _viewCull);
-
+    std::uint32_t needed = endpointNeed(*grid, iu, iv, _stride, _skipCutSplats, _viewCull);
+    // Match rebuild: truncate dense cells instead of forcing a full-cache rebuild.
     if (needed > static_cast<std::uint32_t>(maxEndpointsPerCell))
-        return PatchResult::CellTooDense;
+        needed = static_cast<std::uint32_t>(maxEndpointsPerCell);
 
     if (needed == 0)
     {
@@ -807,7 +843,6 @@ PatchResult GaussianSplatCache::updateCell(const RayModel& rayModel,
     std::uint32_t blockSize = needed + 2;
     if (blockSize > static_cast<std::uint32_t>(maxEndpointsPerCell))
         blockSize = static_cast<std::uint32_t>(maxEndpointsPerCell);
-    if (blockSize < needed) return PatchResult::CellTooDense;
 
     if (ref.block != 0 && ref.first != CellRef::kInvalid)
         freeBlock(ref.first, ref.block);
@@ -931,7 +966,10 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     const bool hadNode = _set.node() != nullptr;
     if (capBefore < live)
         _set.ensureCapacity(live * 2);
-    _gpuNeedsCompile = !hadNode || _set.capacity() != capBefore;
+    // Capacity growth rebinds BufferInfos (needs compile). Also honour any
+    // needsCompile already set on the set/section overlays.
+    _gpuNeedsCompile = !hadNode || _set.capacity() != capBefore || _set.needsCompile() ||
+                       _section.needsCompile() || _inspectionSection.needsCompile();
     _capacity = _set.capacity();
     _live = live;
     _allocEnd = 0;

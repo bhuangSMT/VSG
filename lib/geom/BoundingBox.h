@@ -26,6 +26,9 @@ public:
     // Grow the box to include other. No-op when other is empty.
     void expand(const BoundingBox& other);
 
+    // Axis-aligned intersection. Empty (valid()==false) when boxes miss or either is empty.
+    BoundingBox intersection(const BoundingBox& other) const;
+
     bool valid() const { return _valid; }
 
     bool contains(const Point3d& p) const

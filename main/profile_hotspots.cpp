@@ -19,6 +19,7 @@
 #include "BooleanOp.h"
 #include "GaussianSplatCache.h"
 #include "RayBoolean.h"
+#include "RayGrid.h"
 #include "RayModel.h"
 #include "SweptVolume.h"
 #include "ToolType.h"
@@ -223,6 +224,51 @@ int main(int argc, char** argv)
         rows.push_back({"boolean cumulative x10", total,
                         std::to_string(working.rayCount()) + " intervals (sum of 10 cuts)"});
         rows.push_back({"boolean cumulative /cut", total / steps, "avg of 10 successive cuts"});
+    }
+
+    // Long path: many small current-move sweeps; compare early vs late median.
+    {
+        app::RayModel working = app::RayModel::fromBRep(brep, res);
+        const int steps = 400;
+        std::vector<double> times;
+        times.reserve(static_cast<std::size_t>(steps));
+        for (int s = 0; s < steps; ++s)
+        {
+            app::SweptVolume step;
+            // Serpentine XY so each cutSweep AABB stays local (current move only).
+            const int row = s / 20;
+            const int col = s % 20;
+            const double x0 = -0.35 + 0.035 * col;
+            const double y0 = -0.35 + 0.035 * row;
+            const app::ToolPose a{vsg::dvec3(x0, y0, 0.10), vsg::dvec3(0.0, 0.0, 1.0)};
+            const app::ToolPose b{vsg::dvec3(x0 + 0.03, y0, 0.10), vsg::dvec3(0.0, 0.0, 1.0)};
+            step.appendSegment(app::ToolType::Sphere, static_cast<float>(toolR),
+                               static_cast<float>(toolL), a, b, 12);
+            const auto t0 = Clock::now();
+            working.booleanInPlace(step, app::BooleanOp::Subtraction, identity);
+            times.push_back(elapsedMs(t0));
+        }
+        auto medianOf = [](std::vector<double> slice) {
+            if (slice.empty()) return 0.0;
+            std::sort(slice.begin(), slice.end());
+            return slice[slice.size() / 2];
+        };
+        std::vector<double> early(times.begin(), times.begin() + 50);
+        std::vector<double> late(times.end() - 50, times.end());
+        const double earlyMed = medianOf(std::move(early));
+        const double lateMed = medianOf(std::move(late));
+        std::size_t intervals = 0;
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            if (const app::RayGrid* g = working.grid(axis))
+                intervals += g->intervalCount();
+        }
+        rows.push_back({"boolean long early med50", earlyMed, "first 50 of 400 cuts"});
+        rows.push_back({"boolean long late med50", lateMed,
+                        "last 50; intervals=" + std::to_string(intervals) +
+                            " dirtyCells=" + std::to_string(working.lastDirtyCellCount())});
+        rows.push_back({"boolean long late/early",
+                        earlyMed > 0.0 ? lateMed / earlyMed : 0.0, "ratio (want near 1)"});
     }
 
     // --- Splat cache ---

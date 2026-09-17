@@ -70,21 +70,6 @@ void stitchOrientedQuad(TriangleMesh& mesh,
     addOrientedTriangle(mesh, a00, a11, a10, outwardHint);
 }
 
-void addTriangle(TriangleMesh& mesh,
-                 const vsg::dvec3& a, const vsg::dvec3& b, const vsg::dvec3& c)
-{
-    addOrientedTriangle(mesh, a, b, c, vsg::cross(b - a, c - a));
-}
-
-void stitchQuad(TriangleMesh& mesh,
-                const vsg::dvec3& a00, const vsg::dvec3& a01,
-                const vsg::dvec3& a11, const vsg::dvec3& a10)
-{
-    const vsg::dvec3 hint = vsg::cross(a01 - a00, a10 - a00) + vsg::cross(a11 - a00, a10 - a00);
-    stitchOrientedQuad(mesh, a00, a01, a11, a10,
-                       (vsg::length(hint) > 1.0e-18) ? hint : (a01 - a00));
-}
-
 vsg::dvec3 sphereCentre(const ToolPose& tip, double radius)
 {
     return tip.position + normalizeOr(tip.direction, vsg::dvec3(0.0, 0.0, 1.0)) * radius;
@@ -115,6 +100,9 @@ void loftRingPair(TriangleMesh& mesh,
                   double radius, int azimuthSegments,
                   const vsg::dvec3& outwardHint = {})
 {
+    // Per-quad radial (quad centroid − segment mid) points out of the cylinder.
+    // A single global outwardHint cannot cover every azimuth, so only use it when
+    // the radial falls back (degenerate / collapsed loft).
     const vsg::dvec3 mid = (a0 + b0) * 0.5;
     const bool haveHint = vsg::length(outwardHint) > 1.0e-12;
     for (int k = 0; k < azimuthSegments; ++k)
@@ -124,8 +112,10 @@ void loftRingPair(TriangleMesh& mesh,
         const vsg::dvec3 aK1 = capsuleRingPoint(a0, aSide, aAxis, radius, k1, azimuthSegments);
         const vsg::dvec3 bK1 = capsuleRingPoint(b0, bSide, bAxis, radius, k1, azimuthSegments);
         const vsg::dvec3 bK = capsuleRingPoint(b0, bSide, bAxis, radius, k, azimuthSegments);
+        const vsg::dvec3 radial = (aK + aK1 + bK + bK1) * 0.25 - mid;
         const vsg::dvec3 hint =
-            haveHint ? outwardHint : ((aK + aK1 + bK + bK1) * 0.25 - mid);
+            (vsg::length(radial) > 1.0e-12) ? radial
+            : (haveHint ? outwardHint : (aK - a0));
         stitchOrientedQuad(mesh, aK, aK1, bK1, bK, hint);
     }
 }
@@ -250,7 +240,9 @@ void appendVerticalHemiCylinder(TriangleMesh& mesh,
         const double a1 = pi * (static_cast<double>(k + 1) / static_cast<double>(segments));
         const vsg::dvec3 r0 = (x * std::cos(a0) + y * std::sin(a0)) * radius;
         const vsg::dvec3 r1 = (x * std::cos(a1) + y * std::sin(a1)) * radius;
-        stitchOrientedQuad(mesh, tip + r0, tip + r1, top + r1, top + r0, r0 + r1);
+        // Out of the hemi-cylinder: average of the two ring radii (in the ⊥dir plane).
+        const vsg::dvec3 out = normalizeOr(r0 + r1, y);
+        stitchOrientedQuad(mesh, tip + r0, tip + r1, top + r1, top + r0, out);
     }
 }
 
@@ -779,26 +771,39 @@ void appendGrindingWheelPath(TriangleMesh& mesh,
     const vsg::dvec3 alongEnd = normalizeOr(
         poses.back().position - poses[poses.size() - 2].position, alongStart);
 
-    addOrientedTriangle(mesh, stations.front().p0, stations.front().p1, stations.front().p2,
-                        -alongStart);
-    addOrientedTriangle(mesh, stations.back().p0, stations.back().p2, stations.back().p1, alongEnd);
+    auto triCentroid = [](const Tri& t) { return (t.p0 + t.p1 + t.p2) * (1.0 / 3.0); };
 
-    vsg::dvec3 centroid(0.0, 0.0, 0.0);
-    for (const Tri& t : stations)
-        centroid = centroid + t.p0 + t.p1 + t.p2;
-    centroid = centroid * (1.0 / static_cast<double>(stations.size() * 3));
+    // End caps: outward = away from the adjacent station (into free space).
+    {
+        const vsg::dvec3 c0 = triCentroid(stations.front());
+        const vsg::dvec3 c1 = triCentroid(stations[1]);
+        vsg::dvec3 startOut = c0 - c1;
+        if (vsg::length(startOut) <= 1.0e-12) startOut = -alongStart;
+        addOrientedTriangle(mesh, stations.front().p0, stations.front().p1, stations.front().p2,
+                            startOut);
 
-    auto sideOut = [&](const vsg::dvec3& p0, const vsg::dvec3& p1, const vsg::dvec3& q0,
-                       const vsg::dvec3& q1) {
-        const vsg::dvec3 edgeMid = (p0 + p1 + q0 + q1) * 0.25;
-        const vsg::dvec3 n = vsg::cross(p1 - p0, q0 - p0) + vsg::cross(q1 - p0, q0 - p0);
-        return (vsg::dot(n, edgeMid - centroid) >= 0.0) ? n : -n;
-    };
+        const vsg::dvec3 cN = triCentroid(stations.back());
+        const vsg::dvec3 cPrev = triCentroid(stations[stations.size() - 2]);
+        vsg::dvec3 endOut = cN - cPrev;
+        if (vsg::length(endOut) <= 1.0e-12) endOut = alongEnd;
+        addOrientedTriangle(mesh, stations.back().p0, stations.back().p2, stations.back().p1,
+                            endOut);
+    }
 
     for (std::size_t i = 0; i + 1 < stations.size(); ++i)
     {
         const Tri& a = stations[i];
         const Tri& b = stations[i + 1];
+        const vsg::dvec3 localC = (a.p0 + a.p1 + a.p2 + b.p0 + b.p1 + b.p2) * (1.0 / 6.0);
+
+        auto sideOut = [&](const vsg::dvec3& p0, const vsg::dvec3& p1, const vsg::dvec3& q0,
+                           const vsg::dvec3& q1) {
+            const vsg::dvec3 edgeMid = (p0 + p1 + q0 + q1) * 0.25;
+            vsg::dvec3 n = vsg::cross(p1 - p0, q0 - p0) + vsg::cross(q1 - p0, q0 - p0);
+            if (vsg::dot(n, edgeMid - localC) < 0.0) n = -n;
+            return n;
+        };
+
         stitchOrientedQuad(mesh, a.p0, a.p1, b.p1, b.p0, sideOut(a.p0, a.p1, b.p0, b.p1));
         stitchOrientedQuad(mesh, a.p1, a.p2, b.p2, b.p1, sideOut(a.p1, a.p2, b.p1, b.p2));
         stitchOrientedQuad(mesh, a.p2, a.p0, b.p0, b.p2, sideOut(a.p2, a.p0, b.p2, b.p0));

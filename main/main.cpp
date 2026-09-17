@@ -184,6 +184,10 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
                                       vsg::ViewportState::create(VkExtent2D{width, height}));
 
     auto trackball = vsg::Trackball::create(camera);
+    // Throw keeps rotating after release. With Continuous update off, frames
+    // only run on mouse moves, so inertia advances in large jumps and feels
+    // like the view is tracking the cursor. Keep orbit to button-drag only.
+    trackball->supportsThrow = false;
     trackball->addWindow(*window);
 
     auto controlCube = app::ControlCube::create(camera, trackball, options,
@@ -639,12 +643,6 @@ try
             .arg(noneKeys, probeKeys, subtractKeys, unionKeys, inspectKeys));
     addWidget(booleanCombo);
 
-    auto cutMeshDisplayCheck = new QCheckBox("Cut mesh display");
-    cutMeshDisplayCheck->setChecked(app::Parameter::instance().cutMeshDisplay());
-    cutMeshDisplayCheck->setToolTip(
-        "When on, draw cut faces as a quad mesh. When off, show cut-tagged splat dots only.");
-    addWidget(cutMeshDisplayCheck);
-
     addDivider();
     column->addSpacing(20);
 
@@ -790,6 +788,7 @@ try
     vsg::ref_ptr<app::ControlCube> controlCube;
     auto trackball = initializeViewer(window, viewer, windowTraits, vsg_scene, options,
                                       camera, initialLookAt, controlCube);
+    renderManager->configureRayBudgets(windowTraits->device);
 
     // Wire up the panel controls.
     QObject::connect(quitButton, &QPushButton::clicked, &application, &QApplication::quit);
@@ -919,10 +918,6 @@ try
                          renderManager->setBooleanOp(op);
                          simPanel->notifyBooleanOp(op);
                      });
-    QObject::connect(cutMeshDisplayCheck, &QCheckBox::toggled, [renderManager](bool on) {
-        app::Parameter::instance().setCutMeshDisplay(on);
-        renderManager->refreshCutMeshDisplay();
-    });
 
     auto selectBooleanOp = [booleanCombo](app::BooleanOp op) {
         const int want = static_cast<int>(op);

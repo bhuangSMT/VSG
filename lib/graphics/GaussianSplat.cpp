@@ -42,6 +42,7 @@ layout(location = 3) in vec3 inNormal;
 layout(location = 0) out vec2 corner;
 layout(location = 1) out vec4 color;
 layout(location = 2) out vec3 normalEye;
+layout(location = 3) out float bell;
 
 void main()
 {
@@ -53,20 +54,25 @@ void main()
         corner = vec2(0.0);
         color = vec4(0.0);
         normalEye = vec3(0.0, 0.0, 1.0);
+        bell = 2.77;
         return;
     }
 
     vec4 centerEye = pc.modelView * vec4(inCenterRadius.xyz, 1.0);
 
-    // On-screen size as a fraction of half the viewport height. Cap it so
-    // zooming in shrinks world-space radius instead of ballooning into beads.
-    // 0.12 filled a tenth of the view per splat and read as balls up close;
-    // 0.06 keeps the far sheet filled while still biting when the camera is near.
-    float apparent = radius * abs(pc.projection[1][1]) / max(-centerEye.z, 1e-6);
-    const float maxApparent = 0.06;
-    if (apparent > maxApparent)
-        radius *= maxApparent / apparent;
+    // Zoom proxy from eye depth only — not packed radius. Stride densify scales
+    // radius ∝ stride while z shrinks on zoom-in, so radius/z stayed flat and
+    // bell never moved. Soft when far (fit-to-unit eye ~3–4), sharp when close.
+    const float bellMin = 2.77;
+    const float bellMax = 10.0;
+    const float zSoft = 4.0;
+    const float zSharp = 1.0;
+    float t = 1.0 - clamp((-centerEye.z - zSharp) / (zSoft - zSharp), 0.0, 1.0);
+    bell = mix(bellMin, bellMax, t);
 
+    // Sharper falloff shrinks the visible core; grow the eye-space radius so
+    // the half-intensity footprint still meets the neighbour (≈ √(bell/bellMin)).
+    radius *= mix(1.0, sqrt(bellMax / bellMin), t);
     centerEye.xy += inCorner * radius;
 
 #ifdef SPLAT_DEPTH_PREPASS
@@ -101,6 +107,7 @@ const char* const splatFragmentBody = R"(
 layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 color;
 layout(location = 2) in vec3 normalEye;
+layout(location = 3) in float bell;
 
 layout(location = 0) out vec4 outColor;
 
@@ -120,8 +127,9 @@ void main()
 #else
     // Windowed Gaussian: subtracting the falloff's value at the quad's edge and
     // rescaling takes it to exactly zero there, so the splat fades out rather
-    // than ending on a visible rim. Half intensity at half radius (bell 2.77).
-    const float bell = 2.77;
+    // than ending on a visible rim. bell comes from the vertex stage (2.77 far
+    // → 10 close, from eye depth) so zoomed-in disks read sharper while overlaps
+    // still blend.
     float edge = exp(-bell);
     float falloff = max(exp(-bell * radiusSquared) - edge, 0.0) / (1.0 - edge);
 
@@ -296,9 +304,22 @@ void GaussianSplatSet::zeroDynamicRange(std::size_t beginSplat, std::size_t endS
 
 void GaussianSplatSet::bindDrawArrays()
 {
-    if (!_draw)
-        _draw = vsg::VertexIndexDraw::create();
+    // assignArrays/assignIndices allocate fresh BufferInfos with no vk buffers.
+    // Reusing a VertexIndexDraw that CompileManager already visited leaves
+    // record() calling indices->buffer->vk() on a null buffer (SIGSEGV at ~0x30).
+    if (_draw && _root)
+    {
+        for (auto& child : _root->children)
+        {
+            auto* sg = dynamic_cast<vsg::StateGroup*>(child.get());
+            if (!sg) continue;
+            auto& kids = sg->children;
+            kids.erase(std::remove(kids.begin(), kids.end(), _draw), kids.end());
+        }
+        _draw = nullptr;
+    }
 
+    _draw = vsg::VertexIndexDraw::create();
     _draw->assignArrays(vsg::DataList{_centerRadius, _corners, _colors, _normals});
     _draw->assignIndices(_indices);
     applyDrawCount();
@@ -318,6 +339,15 @@ void GaussianSplatSet::bindDrawArrays()
         colorGroup->add(vsg::BindGraphicsPipeline::create(_colorPipeline));
         colorGroup->addChild(_draw);
         _root->addChild(colorGroup);
+        _needsCompile = true;
+    }
+    else
+    {
+        for (auto& child : _root->children)
+        {
+            auto* sg = dynamic_cast<vsg::StateGroup*>(child.get());
+            if (sg) sg->addChild(_draw);
+        }
         _needsCompile = true;
     }
     attachOverlay();
@@ -629,9 +659,16 @@ void SectionLineSet::applyDrawCount()
 
 void SectionLineSet::bindDraw()
 {
-    if (!_draw)
-        _draw = vsg::VertexIndexDraw::create();
+    // Same as GaussianSplatSet: rebinding BufferInfos on a compiled draw leaves
+    // null vk buffers if CompileManager skips the node.
+    if (_draw && _root)
+    {
+        auto& kids = _root->children;
+        kids.erase(std::remove(kids.begin(), kids.end(), _draw), kids.end());
+        _draw = nullptr;
+    }
 
+    _draw = vsg::VertexIndexDraw::create();
     _draw->assignArrays(vsg::DataList{_positions, _colors, _normals});
     _draw->assignIndices(_indices);
     applyDrawCount();
@@ -642,6 +679,11 @@ void SectionLineSet::bindDraw()
         ensurePipeline();
         _root = vsg::StateGroup::create();
         _root->add(vsg::BindGraphicsPipeline::create(_pipeline));
+        _root->addChild(_draw);
+        _needsCompile = true;
+    }
+    else
+    {
         _root->addChild(_draw);
         _needsCompile = true;
     }

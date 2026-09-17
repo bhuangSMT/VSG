@@ -43,6 +43,11 @@ Normal3f toNormal3f(const vsg::dvec3& n)
                     static_cast<float>(n.z / len)};
 }
 
+Normal3f negateNormal(const Normal3f& n)
+{
+    return Normal3f{-n[0], -n[1], -n[2]};
+}
+
 void collectHits(const WorldSweep& sweep,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
@@ -95,9 +100,15 @@ void collectHits(const WorldSweep& sweep,
         worldHit[axis] = alongWorld;
         const vsg::dvec3 modelHit = sweep.worldToModel * worldHit;
 
-        const vsg::dvec3 e1(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
-        const vsg::dvec3 e2(c[0] - a[0], c[1] - a[1], c[2] - a[2]);
-        const vsg::dvec3 nWorld = vsg::cross(e1, e2);
+        // Prefer the stored outward mesh normal (set at sweep emit); fall back to
+        // winding cross when the facet normal is missing / degenerate.
+        vsg::dvec3 nWorld(tri.normal.x, tri.normal.y, tri.normal.z);
+        if (vsg::length(nWorld) <= 1.0e-12)
+        {
+            const vsg::dvec3 e1(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+            const vsg::dvec3 e2(c[0] - a[0], c[1] - a[1], c[2] - a[2]);
+            nWorld = vsg::cross(e1, e2);
+        }
         // w=0 so translation in worldToModel does not affect the normal.
         const vsg::dvec4 nModel4 =
             sweep.worldToModel * vsg::dvec4(nWorld.x, nWorld.y, nWorld.z, 0.0);
@@ -125,7 +136,8 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
             {
                 Interval left = piece;
                 left.end = cut.begin;
-                left.endNormal = cut.beginNormal;
+                // Stock cavity face: opposite of tool-outward at the cutter enter.
+                left.endNormal = negateNormal(cut.beginNormal);
                 left.setCutEnd(true);
                 if (left.hasSolidLength()) next.push_back(left);
             }
@@ -133,7 +145,8 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
             {
                 Interval right = piece;
                 right.begin = cut.end;
-                right.beginNormal = cut.endNormal;
+                // Stock cavity face: opposite of tool-outward at the cutter leave.
+                right.beginNormal = negateNormal(cut.endNormal);
                 right.setFromBoolean(true);
                 right.setCutBegin(true);
                 if (right.hasSolidLength()) next.push_back(right);
@@ -186,6 +199,106 @@ std::vector<Interval> unionTicks(const std::vector<Interval>& solid,
         }
     }
     return merged;
+}
+
+// Micro-slivers shorter than this are dropped after subtract (2–3 tick crumbs).
+constexpr std::int32_t kMinKeepTicks = 4;
+
+// Drop degenerates / micro-slivers and merge abutting or overlapping solids.
+std::vector<Interval> consolidateIntervals(std::vector<Interval> spans)
+{
+    spans.erase(std::remove_if(spans.begin(), spans.end(),
+                               [](const Interval& iv) {
+                                   return (iv.end - iv.begin) < kMinKeepTicks;
+                               }),
+                spans.end());
+    if (spans.size() < 2) return spans;
+
+    std::sort(spans.begin(), spans.end(),
+              [](const Interval& a, const Interval& b) { return a.begin < b.begin; });
+
+    std::vector<Interval> merged;
+    merged.reserve(spans.size());
+    merged.push_back(spans.front());
+    for (std::size_t i = 1; i < spans.size(); ++i)
+    {
+        Interval& cur = merged.back();
+        const Interval& nxt = spans[i];
+        if (nxt.begin <= cur.end)
+        {
+            if (nxt.end > cur.end)
+            {
+                cur.end = nxt.end;
+                cur.endNormal = nxt.endNormal;
+                cur.setCutEnd(nxt.cutEnd());
+            }
+            else if (nxt.end == cur.end && nxt.cutEnd())
+            {
+                cur.setCutEnd(true);
+                cur.endNormal = nxt.endNormal;
+            }
+            if (nxt.begin == cur.begin && nxt.cutBegin())
+            {
+                cur.setCutBegin(true);
+                cur.beginNormal = nxt.beginNormal;
+            }
+            if (nxt.fromBoolean()) cur.setFromBoolean(true);
+        }
+        else
+        {
+            merged.push_back(nxt);
+        }
+    }
+    return merged;
+}
+
+// Inclusive-exclusive index range of stock intervals overlapping [tickLo, tickHi].
+// Spans must be sorted by begin (cast / boolean invariant).
+struct TickOverlap
+{
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    bool empty() const { return begin >= end; }
+};
+
+TickOverlap overlappingTickRange(const Interval* data, std::size_t count,
+                                 std::int32_t tickLo, std::int32_t tickHi)
+{
+    TickOverlap out;
+    if (count == 0 || tickHi <= tickLo) return out;
+
+    // First interval with end > tickLo.
+    std::size_t lo = 0;
+    std::size_t hi = count;
+    while (lo < hi)
+    {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (data[mid].end <= tickLo) lo = mid + 1;
+        else hi = mid;
+    }
+    out.begin = lo;
+
+    // First interval with begin >= tickHi.
+    lo = out.begin;
+    hi = count;
+    while (lo < hi)
+    {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (data[mid].begin < tickHi) lo = mid + 1;
+        else hi = mid;
+    }
+    out.end = lo;
+    return out;
+}
+
+void tickRangeFromModelAabb(const RayGrid& grid, const BoundingBox& modelAabb,
+                            std::int32_t& tickLo, std::int32_t& tickHi)
+{
+    const Point3d& lo = modelAabb.min();
+    const Point3d& hi = modelAabb.max();
+    tickLo = grid.toTick(lo[grid.axis]) - 1;
+    tickHi = grid.toTick(hi[grid.axis]) + 1;
+    if (tickLo > tickHi) std::swap(tickLo, tickHi);
 }
 
 void maybeCompactPool(RayGrid& grid)
@@ -284,7 +397,8 @@ void growGridToCover(RayGrid& grid, const BoundingBox& modelAabb)
 // parallel window walk; workers only read.
 struct PendingUpdate
 {
-    std::size_t flat = 0;
+    std::uint32_t iu = 0;
+    std::uint32_t iv = 0;
     std::vector<Interval> intervals; // empty => clear the slot
 };
 
@@ -296,11 +410,97 @@ struct CellScratch
     PairingStats pairing;
 };
 
+struct CellUv
+{
+    std::uint32_t iu = 0;
+    std::uint32_t iv = 0;
+};
+
+// Mark grid cells covered by any sweep triangle's lateral UV box (model space),
+// clipped to clipRegion. Returns sorted unique (iu,iv) list.
+std::vector<CellUv> markCellsFromTriangles(const RayGrid& grid,
+                                           const WorldSweep& sweep,
+                                           const BoundingBox& clipRegion,
+                                           std::uint32_t iu0, std::uint32_t iu1,
+                                           std::uint32_t iv0, std::uint32_t iv1)
+{
+    std::vector<CellUv> out;
+    if (grid.empty() || !clipRegion.valid() || iu0 > iu1 || iv0 > iv1) return out;
+
+    const std::size_t axis = grid.axis;
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    const Point3d& clo = clipRegion.min();
+    const Point3d& chi = clipRegion.max();
+
+    const std::uint32_t windowW = iu1 - iu0 + 1;
+    const std::uint32_t windowH = iv1 - iv0 + 1;
+    const std::size_t cellCount =
+        static_cast<std::size_t>(windowW) * static_cast<std::size_t>(windowH);
+    std::vector<std::uint8_t> marked(cellCount, 0);
+
+    for (const MeshTriangle& tri : sweep.mesh.triangles)
+    {
+        const vsg::dvec3 a =
+            sweep.worldToModel * vsg::dvec3(tri.v0.x, tri.v0.y, tri.v0.z);
+        const vsg::dvec3 b =
+            sweep.worldToModel * vsg::dvec3(tri.v1.x, tri.v1.y, tri.v1.z);
+        const vsg::dvec3 c =
+            sweep.worldToModel * vsg::dvec3(tri.v2.x, tri.v2.y, tri.v2.z);
+
+        double loU = std::min({a[u], b[u], c[u]});
+        double hiU = std::max({a[u], b[u], c[u]});
+        double loV = std::min({a[v], b[v], c[v]});
+        double hiV = std::max({a[v], b[v], c[v]});
+
+        loU = std::max(loU, clo[u]);
+        hiU = std::min(hiU, chi[u]);
+        loV = std::max(loV, clo[v]);
+        hiV = std::min(hiV, chi[v]);
+        if (loU > hiU || loV > hiV) continue;
+
+        std::uint32_t tu0 = grid.indexU(loU);
+        std::uint32_t tu1 = grid.indexU(hiU);
+        std::uint32_t tv0 = grid.indexV(loV);
+        std::uint32_t tv1 = grid.indexV(hiV);
+        if (tu0 > tu1) std::swap(tu0, tu1);
+        if (tv0 > tv1) std::swap(tv0, tv1);
+        tu0 = std::max(tu0, iu0);
+        tu1 = std::min(tu1, iu1);
+        tv0 = std::max(tv0, iv0);
+        tv1 = std::min(tv1, iv1);
+        if (tu0 > tu1 || tv0 > tv1) continue;
+
+        for (std::uint32_t iv = tv0; iv <= tv1; ++iv)
+        {
+            const std::size_t row =
+                static_cast<std::size_t>(iv - iv0) * static_cast<std::size_t>(windowW);
+            for (std::uint32_t iu = tu0; iu <= tu1; ++iu)
+                marked[row + static_cast<std::size_t>(iu - iu0)] = 1;
+        }
+    }
+
+    out.reserve(cellCount / 8 + 1);
+    for (std::uint32_t iv = iv0; iv <= iv1; ++iv)
+    {
+        const std::size_t row =
+            static_cast<std::size_t>(iv - iv0) * static_cast<std::size_t>(windowW);
+        for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
+        {
+            if (marked[row + static_cast<std::size_t>(iu - iu0)])
+                out.push_back(CellUv{iu, iv});
+        }
+    }
+    return out;
+}
+
 void processAxisGrid(RayGrid& grid,
                      const WorldSweep& sweep,
                      BooleanOp op,
                      double mergeTol,
-                     PairingStats& pairing)
+                     const BoundingBox& stockBounds,
+                     PairingStats& pairing,
+                     std::size_t& dirtyCells)
 {
     if (grid.empty() || !sweep.worldBounds.valid()) return;
 
@@ -308,32 +508,64 @@ void processAxisGrid(RayGrid& grid,
     const std::size_t u = (axis + 1) % 3;
     const std::size_t v = (axis + 2) % 3;
 
+    const BoundingBox sweepModelAabb =
+        modelAabbFromWorld(sweep.worldBounds, sweep.worldToModel);
+    if (!sweepModelAabb.valid()) return;
+
+    // Subtraction: only stock∩sweep. Union: allow coverage past stock for new cells.
+    BoundingBox clipRegion = stockBounds;
+    BoundingBox windowAabb = sweepModelAabb;
+    if (op == BooleanOp::Union)
+    {
+        clipRegion.expand(sweepModelAabb);
+    }
+    else
+    {
+        windowAabb = sweepModelAabb.intersection(stockBounds);
+        if (!windowAabb.valid()) return;
+        clipRegion = stockBounds;
+    }
+
     std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
-    if (!gridWindowFromWorldAabb(grid, sweep.worldBounds, sweep.worldToModel,
-                                 iu0, iu1, iv0, iv1))
+    if (!gridWindowFromModelAabb(grid, windowAabb, iu0, iu1, iv0, iv1))
         return;
 
-    const std::uint32_t windowW = iu1 - iu0 + 1;
-    const std::size_t cellCount =
-        static_cast<std::size_t>(windowW) * static_cast<std::size_t>(iv1 - iv0 + 1);
+    std::int32_t tickLo = 0;
+    std::int32_t tickHi = 0;
+    tickRangeFromModelAabb(grid, windowAabb, tickLo, tickHi);
+
+    const std::vector<CellUv> cells =
+        markCellsFromTriangles(grid, sweep, clipRegion, iu0, iu1, iv0, iv1);
+    dirtyCells += cells.size();
+    if (cells.empty()) return;
 
     tbb::enumerable_thread_specific<CellScratch> scratch;
 
     tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, cellCount),
+        tbb::blocked_range<std::size_t>(0, cells.size()),
         [&](const tbb::blocked_range<std::size_t>& range) {
             CellScratch& local = scratch.local();
 
-            for (std::size_t flat = range.begin(); flat != range.end(); ++flat)
+            for (std::size_t idx = range.begin(); idx != range.end(); ++idx)
             {
-                const std::uint32_t iu =
-                    iu0 + static_cast<std::uint32_t>(flat % windowW);
-                const std::uint32_t iv =
-                    iv0 + static_cast<std::uint32_t>(flat / windowW);
+                const std::uint32_t iu = cells[idx].iu;
+                const std::uint32_t iv = cells[idx].iv;
 
                 const RaySlot& slot = grid.at(iu, iv);
                 const double u0 = grid.sampleU(iu);
                 const double v0 = grid.sampleV(iv);
+
+                IntervalSpan spans;
+                TickOverlap overlap;
+                if (!slot.empty())
+                {
+                    spans = grid.pool.span(slot);
+                    overlap = overlappingTickRange(spans.data(), spans.size(), tickLo, tickHi);
+                }
+
+                // Subtract: skip rays with no stock in the current-move tick band
+                // before paying for BVH triangle tests.
+                if (op == BooleanOp::Subtraction && overlap.empty()) continue;
 
                 collectHits(sweep, axis, u, v, u0, v0, local.hits);
                 if (local.hits.size() < 2) continue;
@@ -343,25 +575,52 @@ void processAxisGrid(RayGrid& grid,
                                   &local.pairing);
                 if (sweepSolid.empty()) continue;
 
-                local.current.clear();
-                if (!slot.empty())
-                {
-                    auto spans = grid.pool.span(slot);
-                    local.current.assign(spans.begin(), spans.end());
-                }
-
                 std::vector<Interval> result;
                 if (op == BooleanOp::Subtraction)
                 {
-                    if (local.current.empty()) continue;
-                    result = subtractTicks(local.current, sweepSolid);
+                    local.current.assign(spans.begin() + static_cast<std::ptrdiff_t>(overlap.begin),
+                                         spans.begin() + static_cast<std::ptrdiff_t>(overlap.end));
+                    std::vector<Interval> mid =
+                        consolidateIntervals(subtractTicks(local.current, sweepSolid));
+
+                    result.reserve((overlap.begin) + mid.size() + (spans.size() - overlap.end));
+                    result.insert(result.end(), spans.begin(),
+                                  spans.begin() + static_cast<std::ptrdiff_t>(overlap.begin));
+                    result.insert(result.end(), mid.begin(), mid.end());
+                    result.insert(result.end(),
+                                  spans.begin() + static_cast<std::ptrdiff_t>(overlap.end),
+                                  spans.end());
+                    result = consolidateIntervals(std::move(result));
                 }
                 else
                 {
-                    result = unionTicks(local.current, sweepSolid);
+                    local.current.clear();
+                    if (!overlap.empty())
+                    {
+                        local.current.assign(
+                            spans.begin() + static_cast<std::ptrdiff_t>(overlap.begin),
+                            spans.begin() + static_cast<std::ptrdiff_t>(overlap.end));
+                    }
+                    std::vector<Interval> mid =
+                        consolidateIntervals(unionTicks(local.current, sweepSolid));
+
+                    result.reserve(overlap.begin + mid.size() + (spans.size() - overlap.end));
+                    if (!spans.empty())
+                    {
+                        result.insert(result.end(), spans.begin(),
+                                      spans.begin() + static_cast<std::ptrdiff_t>(overlap.begin));
+                    }
+                    result.insert(result.end(), mid.begin(), mid.end());
+                    if (!spans.empty())
+                    {
+                        result.insert(result.end(),
+                                      spans.begin() + static_cast<std::ptrdiff_t>(overlap.end),
+                                      spans.end());
+                    }
+                    result = consolidateIntervals(std::move(result));
                 }
 
-                local.pending.push_back(PendingUpdate{flat, std::move(result)});
+                local.pending.push_back(PendingUpdate{iu, iv, std::move(result)});
             }
         });
 
@@ -374,14 +633,13 @@ void processAxisGrid(RayGrid& grid,
     }
     std::sort(pending.begin(), pending.end(),
               [](const PendingUpdate& lhs, const PendingUpdate& rhs) {
-                  return lhs.flat < rhs.flat;
+                  if (lhs.iv != rhs.iv) return lhs.iv < rhs.iv;
+                  return lhs.iu < rhs.iu;
               });
 
     for (const PendingUpdate& entry : pending)
     {
-        const std::uint32_t iu = iu0 + static_cast<std::uint32_t>(entry.flat % windowW);
-        const std::uint32_t iv = iv0 + static_cast<std::uint32_t>(entry.flat / windowW);
-        RaySlot& slot = grid.at(iu, iv);
+        RaySlot& slot = grid.at(entry.iu, entry.iv);
         if (entry.intervals.empty())
         {
             slot.intervalCount = 0;
@@ -513,6 +771,7 @@ void applyBooleanInPlace(RayModel& model,
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
     model._pairingStats = {};
+    model._lastDirtyCellCount = 0;
 
     const BoundingBox sweepModelAabb =
         modelAabbFromWorld(worldSweep.worldBounds, worldSweep.worldToModel);
@@ -532,11 +791,12 @@ void applyBooleanInPlace(RayModel& model,
     }
 
     // Axes share nothing, but nested TBB (axis × cell) raced the interval
-    // pool. Walk axes in order; each axis still parallelizes its dirty window.
+    // pool. Walk axes in order; each axis still parallelizes its dirty cells.
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
         if (RayGrid* g = model.grid(axis))
-            processAxisGrid(*g, worldSweep, op, mergeTol, model._pairingStats);
+            processAxisGrid(*g, worldSweep, op, mergeTol, model._bounds,
+                            model._pairingStats, model._lastDirtyCellCount);
     }
 }
 

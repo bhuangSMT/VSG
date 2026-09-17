@@ -1,9 +1,9 @@
-// ToolTracker - moves the active cutter with the mouse.
+// ToolTracker - moves the active cutter with the mouse (Interactive mode only).
 //
 // On each move it casts a ray through the cursor against the current BRep, falls
 // back to the view projection plane through the model centre on a miss, then
 // tilts the hit normal by 15 degrees toward the camera and hands the pose to
-// the RenderManager.
+// the RenderManager. CL data / NC machining leave the cutter where replay put it.
 #pragma once
 
 #include <cmath>
@@ -17,6 +17,7 @@
 #include "ControlCube.h"
 #include "Parameter.h"
 #include "RenderManager.h"
+#include "SimulationMode.h"
 #include "SimulationPanel.h"
 #include "WorldAxes.h"
 
@@ -92,6 +93,8 @@ private:
     {
         if (!_renderManager || !_camera) return;
         if (_simulationPanel && _simulationPanel->isPlaying()) return;
+        // CL / NC: cutter pose comes from the table / replay, not the cursor.
+        if (Parameter::instance().simulationMode() != SimulationMode::Interactive) return;
         if (Parameter::instance().toolType() == ToolType::None) return;
 
         vsg::dvec3 position;

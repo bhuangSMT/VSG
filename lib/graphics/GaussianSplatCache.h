@@ -67,9 +67,10 @@ public:
 
     // Packed refill from the displayed RayModel. Reuses the compiled GPU
     // arrays when they already hold enough slots. Issues only the packed live
-    // endpoints. skipCutSplats drops cutBegin/cutEnd discs when the cut-face
-    // overlay alone should cover them. viewCull skips cells whose lateral
-    // sample falls outside the camera NDC frustum.
+    // endpoints. skipCutSplats drops interior cutBegin/cutEnd discs; rim cells
+    // still keep dots to seal against stock when the cut-face mesh is shown.
+    // viewCull skips cells whose lateral sample falls outside the camera NDC
+    // frustum.
     vsg::ref_ptr<vsg::Node> rebuild(const RayModel& rayModel,
                                     int stride,
                                     const std::array<float, 3>& radii,

@@ -51,6 +51,22 @@ void BoundingBox::expand(const BoundingBox& other)
     expand(other._max);
 }
 
+BoundingBox BoundingBox::intersection(const BoundingBox& other) const
+{
+    BoundingBox out;
+    if (!_valid || !other._valid) return out;
+
+    Point3d lo{};
+    Point3d hi{};
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+        lo[i] = std::max(_min[i], other._min[i]);
+        hi[i] = std::min(_max[i], other._max[i]);
+        if (lo[i] > hi[i]) return out;
+    }
+    return BoundingBox(lo, hi);
+}
+
 double BoundingBox::extent(std::size_t axis) const
 {
     if (!_valid || axis > 2) return 0.0;

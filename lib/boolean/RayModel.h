@@ -67,6 +67,9 @@ public:
     // Hit pairing leftovers from the last fromBRep / booleanInPlace.
     const PairingStats& pairingStats() const { return _pairingStats; }
 
+    // Cells visited by the last booleanInPlace (per-triangle UV footprints).
+    std::size_t lastDirtyCellCount() const { return _lastDirtyCellCount; }
+
     static constexpr int maxStride = 1024;
     int strideForRayBudget(std::size_t maxRays) const;
     std::size_t rayCountAtStride(int stride) const;
@@ -93,6 +96,7 @@ private:
     BoundingBox _bounds;
     Point3d _resolution{0.0, 0.0, 0.0};
     PairingStats _pairingStats;
+    std::size_t _lastDirtyCellCount = 0;
 
     mutable std::recursive_mutex _chainMutex;
 };

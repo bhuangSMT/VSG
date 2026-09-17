@@ -358,7 +358,8 @@ RayModel::RayModel(RayModel&& other) noexcept :
     _grids(std::move(other._grids)),
     _bounds(other._bounds),
     _resolution(other._resolution),
-    _pairingStats(other._pairingStats)
+    _pairingStats(other._pairingStats),
+    _lastDirtyCellCount(other._lastDirtyCellCount)
 {
 }
 
@@ -370,6 +371,7 @@ RayModel& RayModel::operator=(RayModel&& other) noexcept
     _bounds = other._bounds;
     _resolution = other._resolution;
     _pairingStats = other._pairingStats;
+    _lastDirtyCellCount = other._lastDirtyCellCount;
     return *this;
 }
 

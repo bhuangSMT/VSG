@@ -3,13 +3,18 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
 #include <QTimer>
+
+#include <vsg/vk/Device.h>
+#include <vsg/vk/PhysicalDevice.h>
 
 #include "RenderManager.h"
 
@@ -39,16 +44,34 @@ bool cutMeshEnabled()
     return Parameter::instance().cutMeshDisplay();
 }
 
-bool skipCutSplatEnds(BooleanOp op, bool /*inspectionBoxValid*/)
+bool skipCutSplatEnds(bool cutFaceLive)
 {
-    // Cut-tagged dots are the cut face when mesh display is off — never drop
-    // them (including after rerun finishes and switches to None).
-    if (!cutMeshEnabled()) return false;
+    // Skip interior cut-tagged Gaussians when the orange overlay should cover
+    // them: mesh display on, or a GPU cut face already live (playback turns
+    // cutMeshDisplay off to avoid remesh, but keeps the uploaded overlay).
+    return cutMeshEnabled() || cutFaceLive;
+}
 
-    // Mesh on: keep dots during Subtraction/Union/Inspection to fill gaps
-    // between quads; idle ops can skip dots and rely on the mesh alone.
-    if (accumulatesCutMesh(op) || op == BooleanOp::Inspection) return false;
-    return true;
+// Keep / patch / build cut-face GPU overlay. Never clear just because
+// cutMeshDisplay is temporarily false during Re run.
+void syncCutFaceOverlay(GaussianSplatCache& cache, const RayModel& rayModel, int cutStride,
+                        const vsg::vec4& color, BooleanOp op, const BoundingBox& dirtyModelAabb,
+                        bool allowPatch)
+{
+    const bool wantMesh = cutMeshEnabled() || cache.hasCutFace();
+    if (!wantMesh) return;
+
+    if (accumulatesCutMesh(op))
+    {
+        if (allowPatch && dirtyModelAabb.valid() && cache.hasCutFace())
+            cache.patchCutFace(rayModel, cutStride, dirtyModelAabb, color);
+        else
+            cache.rebuildCutFace(rayModel, cutStride, color);
+    }
+    else if (!cache.hasCutFace())
+        cache.rebuildCutFace(rayModel, cutStride, color);
+    else
+        cache.showCutFace();
 }
 
 BoundingBox intersectAabb(const BoundingBox& a, const BoundingBox& b)
@@ -115,7 +138,7 @@ double millisSince(ProfileClock::time_point start)
 
 // Cells the boolean will visit for this dirty box, summed over present axes.
 // This is the work the sweep AABB actually buys, independent of what it cuts.
-std::size_t dirtyWindowCells(const RayModel& model, const BoundingBox& modelAabb)
+[[maybe_unused]] std::size_t dirtyWindowCells(const RayModel& model, const BoundingBox& modelAabb)
 {
     if (!modelAabb.valid()) return 0;
 
@@ -190,6 +213,79 @@ RenderManager::~RenderManager()
     }
 }
 
+void RenderManager::configureRayBudgets(vsg::ref_ptr<vsg::Device> device)
+{
+    constexpr std::size_t kBytesPerRay = 512;
+    constexpr std::size_t kStockMin = 500000;
+    constexpr std::size_t kStockMax = 4000000;
+    constexpr std::size_t kCutMin = 1000000;
+    constexpr std::size_t kCutMax = 6000000;
+    constexpr std::size_t kFallbackStock = 2000000;
+    constexpr std::size_t kFallbackCut = 4000000;
+
+    std::uint64_t heapBytes = 0;
+    if (device)
+    {
+        if (vsg::PhysicalDevice* pd = device->getPhysicalDevice())
+        {
+            VkPhysicalDeviceMemoryProperties memProps{};
+            vkGetPhysicalDeviceMemoryProperties(pd->vk(), &memProps);
+            for (std::uint32_t i = 0; i < memProps.memoryHeapCount; ++i)
+            {
+                if (memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    heapBytes += memProps.memoryHeaps[i].size;
+            }
+        }
+    }
+
+    const unsigned cores = std::thread::hardware_concurrency();
+    std::size_t stock = kFallbackStock;
+    std::size_t cut = kFallbackCut;
+
+    if (heapBytes > 0)
+    {
+        const double raw = (static_cast<double>(heapBytes) * 0.20) / static_cast<double>(kBytesPerRay);
+        stock = static_cast<std::size_t>(raw);
+        // Round down to nearest 100k for stable logging.
+        stock = (stock / 100000) * 100000;
+        if (stock < kStockMin) stock = kStockMin;
+        if (stock > kStockMax) stock = kStockMax;
+
+        const double cutMul = (cores > 0 && cores < 4) ? 1.5 : 2.0;
+        cut = static_cast<std::size_t>(static_cast<double>(stock) * cutMul);
+        if (cut < kCutMin) cut = kCutMin;
+        if (cut > kCutMax) cut = kCutMax;
+    }
+
+    _maxRenderedRays = stock;
+    _maxCutFaceRays = cut;
+
+    const double heapGiB = static_cast<double>(heapBytes) / (1024.0 * 1024.0 * 1024.0);
+    std::cout << "Ray-GS budgets: rendered=" << _maxRenderedRays
+              << " cutFace=" << _maxCutFaceRays
+              << " (heap=" << heapGiB << " GiB, cores=" << cores << ")\n";
+    std::cout.flush();
+}
+
+void RenderManager::updateWorldAxesSpecFromStock()
+{
+    // Length = half the fitted stock AABB diagonal; radii scale with length so
+    // the gizmo stays readable without dominating the stock.
+    const BoundingBox world = worldStockAabb();
+    const double diag = world.valid() ? world.diagonal() : 0.0;
+    if (!(diag > 0.0))
+    {
+        _axesSpec = WorldAxesSpec{};
+        return;
+    }
+
+    const float length = static_cast<float>(diag * 0.5);
+    _axesSpec.length = length;
+    _axesSpec.tubeRadius = length * 0.018f;
+    _axesSpec.coneRadius = length * 0.040f;
+    _axesSpec.coneLength = length * 0.18f;
+}
+
 void RenderManager::showWorldAxes(bool show)
 {
     if (_axesNode)
@@ -204,16 +300,25 @@ void RenderManager::showWorldAxes(bool show)
         return;
     }
 
+    updateWorldAxesSpecFromStock();
+
+    // Dedicated scene subgraph, separate from stock / tool / trajectory.
+    // One child group per axis so X / Y / Z stay independently addressable.
     _axesNode = vsg::Group::create();
     const auto meshes = buildWorldAxesMeshes(_axesSpec, _axesSelected);
     const int selectedAxis = worldAxisIndex(_axesSelected);
-    for (int i = 0; i < 6; ++i)
+    for (int axis = 0; axis < 3; ++axis)
     {
-        const int axis = i / 2;
+        auto axisNode = vsg::Group::create();
         const bool selected = selectedAxis == axis;
-        if (auto node = toolMeshNode(meshes[static_cast<std::size_t>(i)],
-                                     worldAxisColor(axis, selected)))
-            _axesNode->addChild(node);
+        for (int part = 0; part < 2; ++part)
+        {
+            const int i = axis * 2 + part;
+            if (auto node = toolMeshNode(meshes[static_cast<std::size_t>(i)],
+                                         worldAxisColor(axis, selected)))
+                axisNode->addChild(node);
+        }
+        _axesNode->addChild(axisNode);
     }
 
     if (_viewer && _viewer->compileManager)
@@ -483,7 +588,7 @@ vsg::ref_ptr<vsg::Node> RenderManager::createRayNode(const RayModel& rayModel) c
     if (rayModel.rayCount() == 0)
         throw std::runtime_error("The ray model contains no rays; try a coarser resolution.");
 
-    const int stride = rayModel.strideForRayBudget(maxRenderedRays);
+    const int stride = rayModel.strideForRayBudget(maxRenderedRays());
     const std::size_t rays = rayModel.rayCountAtStride(stride);
     const std::size_t pointCount = rays * 2;
 
@@ -614,7 +719,8 @@ float RenderManager::splatRadius(const RayModel& rayModel, std::size_t axis) con
 
 std::array<float, 3> RenderManager::splatRadii(const RayModel& rayModel, int stride) const
 {
-    const float s = static_cast<float>(stride < 1 ? 1 : stride) * 1.15f;
+    // Extra 1.4× so soft rims still seal after stride sampling (was 1.15).
+    const float s = static_cast<float>(stride < 1 ? 1 : stride) * 1.4f;
     return {splatRadius(rayModel, 0) * s, splatRadius(rayModel, 1) * s,
             splatRadius(rayModel, 2) * s};
 }
@@ -635,25 +741,45 @@ void RenderManager::rebuildSplatCache()
     const BooleanOp op = Parameter::instance().booleanOp();
     const SplatViewCull viewCull = splatViewCull();
     const int stride = displayStride();
-    const int cutStride = coarseStride();
-    const bool skipCutSplats = skipCutSplatEnds(op, _inspectionPrevAabb.valid());
+    const int cutStride = cutFaceStride();
+    const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
     _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
                         skipCutSplats, viewCull);
-    // Cut-face quads stay on the global budget stride so zoom densify does not
-    // remesh / drop the orange overlay.
+    // Cut-face GPU buffers stay put once uploaded. Zoom densify / playback
+    // only refills stock dots; remesh only when the overlay is still empty.
     if (op == BooleanOp::Inspection)
         syncInspectionSectionGrid(_inspectionPrevAabb);
-    else if (cutMeshEnabled())
-        _splatCache.restoreCutFace(*_rayModel, cutStride, splatStyle().toolColor);
-    else
-        _splatCache.clearCutFace();
+    else if (cutMeshEnabled() || _splatCache.hasCutFace())
+    {
+        if (!_splatCache.hasCutFace())
+            _splatCache.rebuildCutFace(*_rayModel, cutStride, splatStyle().toolColor);
+        else
+            _splatCache.showCutFace();
+    }
     presentSplatCache();
 }
 
 void RenderManager::refreshCutMeshDisplay()
 {
     if (_viewMode != ViewMode::RayGS) return;
+    // Playback toggles cutMeshDisplay off to skip remesh — do not destroy a
+    // live GPU overlay or fall back to rebuilding the cut face from dots.
     rebuildSplatCache();
+}
+
+void RenderManager::refreshSplatViewForCamera()
+{
+    if (_viewMode != ViewMode::RayGS || !_rayModel || _rayModel->rayCount() == 0) return;
+    // Stock densify only — never remesh an already-uploaded cut face.
+    const BooleanOp op = Parameter::instance().booleanOp();
+    const SplatViewCull viewCull = splatViewCull();
+    const int stride = displayStride();
+    const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
+    _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
+                        skipCutSplats, viewCull);
+    if (_splatCache.hasCutFace())
+        _splatCache.showCutFace();
+    presentSplatCache();
 }
 
 vsg::dmat4 RenderManager::modelToClipMatrix() const
@@ -673,7 +799,13 @@ vsg::dmat4 RenderManager::modelToClipMatrix() const
 int RenderManager::coarseStride() const
 {
     if (!_rayModel) return 1;
-    return _rayModel->strideForRayBudget(maxRenderedRays);
+    return _rayModel->strideForRayBudget(maxRenderedRays());
+}
+
+int RenderManager::cutFaceStride() const
+{
+    if (!_rayModel) return 1;
+    return _rayModel->strideForRayBudget(maxCutFaceRays());
 }
 
 SplatViewCull RenderManager::splatViewCull() const
@@ -806,23 +938,17 @@ BoundingBox RenderManager::visibleStockAabb() const
 int RenderManager::displayStride() const
 {
     if (!_rayModel) return 1;
-    if (!_camera) return _rayModel->strideForRayBudget(maxRenderedRays);
+    if (!_camera) return _rayModel->strideForRayBudget(maxRenderedRays());
 
-    if (maxRenderedRays == 0) return 1;
+    if (maxRenderedRays() == 0) return 1;
     const std::size_t total = rayCountVisibleAtStride(1);
-    if (total <= maxRenderedRays) return 1;
+    if (total <= maxRenderedRays()) return 1;
 
-    const double estimate = std::sqrt(static_cast<double>(total) / static_cast<double>(maxRenderedRays));
+    const double estimate = std::sqrt(static_cast<double>(total) / static_cast<double>(maxRenderedRays()));
     int stride = (estimate > 1.0) ? static_cast<int>(estimate) : 1;
-    while (stride < RayModel::maxStride && rayCountVisibleAtStride(stride) > maxRenderedRays)
+    while (stride < RayModel::maxStride && rayCountVisibleAtStride(stride) > maxRenderedRays())
         ++stride;
     return stride;
-}
-
-void RenderManager::refreshSplatViewForCamera()
-{
-    if (_viewMode != ViewMode::RayGS || !_rayModel || _rayModel->rayCount() == 0) return;
-    rebuildSplatCache();
 }
 
 void RenderManager::setCamera(vsg::ref_ptr<vsg::Camera> camera)
@@ -918,7 +1044,7 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
     if (rayModel.rayCount() == 0)
         throw std::runtime_error("The ray model contains no rays; try a coarser resolution.");
 
-    const int stride = rayModel.strideForRayBudget(maxRenderedRays);
+    const int stride = rayModel.strideForRayBudget(maxRenderedRays());
 
     std::vector<Splat> splats;
     splats.reserve(rayModel.rayCountAtStride(stride) * 2);
@@ -1011,6 +1137,9 @@ void RenderManager::showBRep(const BRep& brep)
     // A new model may change units; the caller reseeds Parameter::toolRadius
     // first, then this rebuilds the mesh if a cutter is active.
     if (_toolType != ToolType::None) rebuildTool(true);
+
+    // Rescale the XYZ gizmo to the new stock AABB.
+    if (_axesNode) showWorldAxes(true);
 }
 
 void RenderManager::addBRep(const BRep& brep)
@@ -2253,12 +2382,12 @@ void RenderManager::applyBooleanToRayModel()
     if (_viewMode == ViewMode::RayGS && _rayModel && haveDirtyRegion && !_splatCache.empty())
     {
         const int stride = displayStride();
-        const int cutStride = coarseStride();
+        const int cutStride = cutFaceStride();
         const SplatViewCull viewCull = splatViewCull();
         const auto patchStart = ProfileClock::now();
         const auto radii = splatRadii(*_rayModel, stride);
         const SplatStyle style = splatStyle();
-        const bool skipCutSplats = skipCutSplatEnds(op, dirtyModelAabb.valid());
+        const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
         PatchResult patched = PatchResult::Ok;
         if (restoreAabb.valid())
         {
@@ -2279,18 +2408,9 @@ void RenderManager::applyBooleanToRayModel()
             const auto sectionStart = ProfileClock::now();
             if (op == BooleanOp::Inspection)
                 syncInspectionSectionGrid(dirtyModelAabb);
-            else if (cutMeshEnabled())
-            {
-                if (accumulatesCutMesh(op))
-                    _splatCache.patchCutFace(*_rayModel, cutStride, dirtyModelAabb,
-                                             splatStyle().toolColor);
-                else
-                    _splatCache.restoreCutFace(*_rayModel, cutStride, splatStyle().toolColor);
-            }
             else
-            {
-                _splatCache.clearCutFace();
-            }
+                syncCutFaceOverlay(_splatCache, *_rayModel, cutStride, splatStyle().toolColor, op,
+                                   dirtyModelAabb, /*allowPatch=*/true);
             const double sectionMs = millisSince(sectionStart);
             logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
             if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
@@ -2319,26 +2439,18 @@ void RenderManager::applyBooleanToRayModel()
         if (_viewMode == ViewMode::RayGS)
         {
             const int stride = displayStride();
-            const int cutStride = coarseStride();
+            const int cutStride = cutFaceStride();
             const SplatViewCull viewCull = splatViewCull();
-            const bool skipCutSplats = skipCutSplatEnds(op, dirtyModelAabb.valid());
+            const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
             _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
                                 skipCutSplats, viewCull);
             const double splatMs = millisSince(rebuildStart);
             const auto sectionStart = ProfileClock::now();
             if (op == BooleanOp::Inspection)
                 syncInspectionSectionGrid(dirtyModelAabb);
-            else if (cutMeshEnabled())
-            {
-                if (accumulatesCutMesh(op))
-                    _splatCache.rebuildCutFace(*_rayModel, cutStride, splatStyle().toolColor);
-                else
-                    _splatCache.restoreCutFace(*_rayModel, cutStride, splatStyle().toolColor);
-            }
             else
-            {
-                _splatCache.clearCutFace();
-            }
+                syncCutFaceOverlay(_splatCache, *_rayModel, cutStride, splatStyle().toolColor, op,
+                                   dirtyModelAabb, /*allowPatch=*/false);
             const double sectionMs = millisSince(sectionStart);
             presentSplatCache();
             logCutProfile(booleanMs, "rebuild", splatMs, dirtyModelAabb, cloneMs, sectionMs);
@@ -2378,7 +2490,7 @@ void RenderManager::logCutProfile(double booleanMs, const char* drawPath, double
         splatCap > 0 ? static_cast<double>(splatLive) / static_cast<double>(splatCap) : 0.0;
 
     const std::size_t windowCells =
-        _rayModel ? dirtyWindowCells(*_rayModel, dirtyModelAabb) : 0;
+        _rayModel ? _rayModel->lastDirtyCellCount() : 0;
     const std::size_t sweepTris = _cutSweep ? _cutSweep->mesh().triangles.size() : 0;
 
     std::printf("cut %-4lld total %7.2f ms  clone %6.2f ms  boolean %7.2f ms  %-7s %6.2f ms"

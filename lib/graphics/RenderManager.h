@@ -40,8 +40,9 @@ public:
                   vsg::ref_ptr<vsg::Options> options);
     ~RenderManager();
 
-    // RGB XYZ gizmo at the world origin (tube + cone). Clickable via
-    // pickWorldAxis / selectWorldAxis.
+    // RGB XYZ gizmo at the world origin (tube + cone), kept in its own scene
+    // subgraph with one child group per axis. Sized from the stock AABB.
+    // Clickable via pickWorldAxis / selectWorldAxis.
     void showWorldAxes(bool show = true);
     bool worldAxesVisible() const { return _axesNode != nullptr; }
     std::optional<WorldAxisPart> pickWorldAxis(const vsg::Camera& camera, int32_t x,
@@ -138,7 +139,8 @@ public:
     void setSweptVolumeVisible(bool visible);
     bool sweptVolumeVisible() const { return _showSweptVolume; }
 
-    // Rebuild Ray-GS after Parameter::cutMeshDisplay() changes (mesh vs dots).
+    // Rebuild Ray-GS after Parameter::cutMeshDisplay() changes. A live GPU cut
+    // mesh is kept across playback toggles until reset or a dirty patch.
     void refreshCutMeshDisplay();
 
     // Drop the accumulated swept-volume mesh (CPU + scene node).
@@ -196,6 +198,12 @@ public:
     // Trackball / scroll events that should kick the Ray-GS view refresh.
     vsg::ref_ptr<vsg::Visitor> createCameraSettleHandler();
 
+    // Once after Vulkan device creation: pick stock / cut-face ray budgets from
+    // device-local heap size and CPU cores. No mid-session retune.
+    void configureRayBudgets(vsg::ref_ptr<vsg::Device> device);
+    std::size_t maxRenderedRays() const { return _maxRenderedRays; }
+    std::size_t maxCutFaceRays() const { return _maxCutFaceRays; }
+
     // Log per-cut timings (boolean, splat patch vs full rebuild) and the
     // interval-pool / splat-buffer occupancy that drives them to stdout.
     void setProfilingEnabled(bool enable) { _profiling = enable; }
@@ -234,6 +242,7 @@ private:
     vsg::dmat4 fitMatrix(const BoundingBox& bounds) const;
 
     BoundingBox worldStockAabb() const;
+    void updateWorldAxesSpecFromStock();
 
     // Build (or rebuild) the tool subgraph for the current type and the
     // radius/length held in Parameter. preservePose keeps the previous
@@ -297,8 +306,10 @@ private:
     // Full Ray-GS rebuild through the Gaussian cache, then attach
     // only when the GPU node is new or its arrays grew.
     void rebuildSplatCache();
-    // Global (non-zoom) stride used for cut-face quads and far-face dots.
+    // Global (non-zoom) stride used for stock splat far-face policy.
     int coarseStride() const;
+    // Denser stride for orange cut-face mesh only (maxCutFaceRays).
+    int cutFaceStride() const;
     void presentSplatCache();
     bool splatOnScreen() const;
     // Inspection: replace-in-window overlay. Does not rewrite _section slots.
@@ -427,10 +438,11 @@ private:
     static constexpr std::size_t maxCachedRays = 10000000;
 
     // How many rays may be handed to the GPU at once. Each one becomes two
-    // splat quads, so this is about 1.5 million quads: past that the splats are
-    // smaller than a pixel and the extra vertices buy nothing visible. A cast
-    // finer than this is thinned by whole grid layers rather than refused.
-    static constexpr std::size_t maxRenderedRays = 2000000;
+    // splat quads. Defaults are balanced mid-range; configureRayBudgets() sets
+    // them once from GPU heap / CPU cores after the Vulkan device exists.
+    std::size_t _maxRenderedRays = 2000000;
+    // Cut-face mesh stride budget (independent of stock splat fill-rate).
+    std::size_t _maxCutFaceRays = 4000000;
 
     // Points into _rayModels (the unmodified cast), or null before anything
     // has been cast.
@@ -467,7 +479,9 @@ private:
 
     vsg::ref_ptr<vsg::Camera> _camera;
     class QTimer* _splatViewDebounce = nullptr;
-    static constexpr int splatViewDebounceMs = 120;
+    // Short settle so zoom densify (displayStride + matching radii) catches up
+    // quickly; lattice coverage no longer depends on maxApparent shrink.
+    static constexpr int splatViewDebounceMs = 40;
 };
 
 } // namespace app

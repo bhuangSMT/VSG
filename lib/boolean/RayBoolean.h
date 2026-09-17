@@ -1,8 +1,9 @@
 // RayBoolean - combine a RayModel with a SweptVolume along the cast rays.
 //
-// For each present RayGrid, the sweep AABB maps to a dense (iu, iv) window.
-// Only those slots run BVH triangle tests; hits are quantized to int32 ticks
-// and subtracted/unioned into that grid's IntervalPool.
+// For each present RayGrid, dirty cells come from the union of current-move
+// sweep triangle UV footprints (clipped to stock), not the fat BVH-root AABB.
+// Those slots run BVH triangle tests; hits are quantized to int32 ticks and
+// subtracted/unioned into that grid's IntervalPool.
 //
 // Union that grows the stock AABB appends new lattice rows/columns so the
 // corner region is sampled, rather than only stretching existing X/Y spans.

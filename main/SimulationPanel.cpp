@@ -6,9 +6,11 @@
 #include <QtCore/QEvent>
 #include <QtCore/QTimer>
 #include <QtGui/QContextMenuEvent>
+#include <QtGui/QCursor>
 #include <QtGui/QFont>
 #include <QtGui/QHideEvent>
 #include <QtGui/QStandardItemModel>
+#include <QtWidgets/QApplication>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QDialog>
 #include <QtWidgets/QDialogButtonBox>
@@ -189,7 +191,7 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
     _waitSlider = new QSlider(Qt::Horizontal);
     _waitSlider->setRange(0, sliderMax);
     _waitSlider->setValue(0);
-    _waitSlider->setToolTip("Rerun step: min = 1 row, max = 10 rows");
+    _waitSlider->setToolTip("Rerun step: min = 1 row, max = 100 rows");
     poseLayout->addWidget(_waitSlider);
 
     auto* librarySection = new QWidget();
@@ -308,6 +310,11 @@ bool SimulationPanel::eventFilter(QObject* watched, QEvent* event)
 void SimulationPanel::hideEvent(QHideEvent* event)
 {
     stopPlayback();
+    if (_pickingHelixAxis)
+    {
+        _reopenHelixDialog = false;
+        endHelixAxisPick();
+    }
     QWidget::hideEvent(event);
 }
 
@@ -368,11 +375,20 @@ void SimulationPanel::onModeChanged(int index)
     setTableVisibleForMode();
 }
 
+void SimulationPanel::endHelixAxisPick()
+{
+    if (!_pickingHelixAxis) return;
+    _pickingHelixAxis = false;
+    QApplication::restoreOverrideCursor();
+}
+
 void SimulationPanel::beginHelixAxisPick()
 {
+    if (_pickingHelixAxis) return;
     _pickingHelixAxis = true;
     _reopenHelixDialog = true;
     if (_renderManager) _renderManager->selectWorldAxis(WorldAxisPart::None);
+    QApplication::setOverrideCursor(Qt::CrossCursor);
 }
 
 void SimulationPanel::reopenHelixDialogIfNeeded()
@@ -386,8 +402,10 @@ void SimulationPanel::reopenHelixDialogIfNeeded()
 void SimulationPanel::setHelixAxisFromPick(int axisIndex)
 {
     if (axisIndex < 0 || axisIndex > 2) return;
+    static const char* axisNames[] = {"X", "Y", "Z"};
     _helixAxis = axisIndex;
-    _pickingHelixAxis = false;
+    _helixAxisStatus = QString("Selected axis: %1").arg(axisNames[axisIndex]);
+    endHelixAxisPick();
     if (_renderManager)
         _renderManager->selectWorldAxis(static_cast<WorldAxisPart>(axisIndex * 2));
     reopenHelixDialogIfNeeded();
@@ -396,7 +414,11 @@ void SimulationPanel::setHelixAxisFromPick(int axisIndex)
 void SimulationPanel::cancelHelixAxisPick()
 {
     if (!_pickingHelixAxis) return;
-    _pickingHelixAxis = false;
+    static const char* axisNames[] = {"X", "Y", "Z"};
+    const char* name =
+        (_helixAxis >= 0 && _helixAxis < 3) ? axisNames[_helixAxis] : "X";
+    _helixAxisStatus = QString("Axis selection cancelled. Current axis: %1").arg(name);
+    endHelixAxisPick();
     reopenHelixDialogIfNeeded();
 }
 
@@ -435,8 +457,14 @@ void SimulationPanel::onHelixClicked()
     static const char* axisNames[] = {"X", "Y", "Z"};
     const char* axisName =
         (_helixAxis >= 0 && _helixAxis < 3) ? axisNames[_helixAxis] : "X";
-    auto* axisButton = new QPushButton(QString("Select axis (%1)").arg(axisName));
+    auto* axisButton = new QPushButton(QString("Select axis (%1)…").arg(axisName));
     axisButton->setToolTip("Click to pick X, Y, or Z from the world axes in the viewport.");
+
+    auto* axisStatus = new QLabel(
+        _helixAxisStatus.isEmpty() ? QString("Current axis: %1").arg(axisName)
+                                   : _helixAxisStatus);
+    axisStatus->setWordWrap(true);
+    axisStatus->setStyleSheet("color: #c8d2dc;");
 
     form->addRow("Radius", radiusSpin);
     form->addRow("Pitch", pitchSpin);
@@ -457,6 +485,7 @@ void SimulationPanel::onHelixClicked()
 
     auto* layout = new QVBoxLayout(&dialog);
     layout->addLayout(form);
+    layout->addWidget(axisStatus);
     layout->addWidget(buttons);
 
     const int result = dialog.exec();
@@ -610,7 +639,7 @@ void SimulationPanel::applyFifoCap()
 int SimulationPanel::rowsPerStepFromSlider() const
 {
     const int value = _waitSlider ? _waitSlider->value() : 0;
-    // Min speed (0) → 1 row; max speed (sliderMax) → 10 rows.
+    // Min speed (0) → 1 row; max speed (sliderMax) → 100 rows.
     return 1 + (value * (maxRowsPerStep - 1)) / sliderMax;
 }
 
@@ -686,6 +715,13 @@ void SimulationPanel::updateRerunButton()
         _rerunButton->setText(_playing ? QStringLiteral("Pause") : QStringLiteral("Re run"));
 }
 
+void SimulationPanel::setCutMeshDisplayForPlayback(bool showMesh)
+{
+    if (Parameter::instance().cutMeshDisplay() == showMesh) return;
+    Parameter::instance().setCutMeshDisplay(showMesh);
+    if (_renderManager) _renderManager->refreshCutMeshDisplay();
+}
+
 void SimulationPanel::stopPlayback()
 {
     _playing = false;
@@ -693,6 +729,7 @@ void SimulationPanel::stopPlayback()
     _playRow = 0;
     if (_playTimer) _playTimer->stop();
     updateRerunButton();
+    setCutMeshDisplayForPlayback(true);
 }
 
 void SimulationPanel::pausePlayback()
@@ -701,6 +738,7 @@ void SimulationPanel::pausePlayback()
     _paused = true;
     if (_playTimer) _playTimer->stop();
     updateRerunButton();
+    setCutMeshDisplayForPlayback(true);
 }
 
 void SimulationPanel::finishPlayback()
@@ -730,6 +768,7 @@ void SimulationPanel::onRerun()
     {
         _paused = false;
         _playing = true;
+        setCutMeshDisplayForPlayback(false);
         updateRerunButton();
         if (_playRow + 1 >= _table->rowCount())
         {
@@ -749,6 +788,7 @@ void SimulationPanel::onRerun()
     _renderManager->resetSweepAnchor();
     _paused = false;
     _playing = true;
+    setCutMeshDisplayForPlayback(false);
     _playRow = 0;
     updateRerunButton();
     applyRow(0);

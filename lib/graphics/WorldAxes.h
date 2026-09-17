@@ -40,6 +40,8 @@ inline bool worldAxisIsCone(WorldAxisPart part)
 
 struct WorldAxesSpec
 {
+    // Fallback sizes before a stock AABB is known. RenderManager replaces these
+    // with length = 0.5 * stockDiagonal and radii proportional to that length.
     float length = 1.0f;
     float tubeRadius = 0.018f;
     float coneRadius = 0.040f;

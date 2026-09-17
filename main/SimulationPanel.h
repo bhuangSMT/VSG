@@ -5,6 +5,7 @@
 #include <optional>
 
 #include <QtCore/QPoint>
+#include <QtCore/QString>
 #include <QtWidgets/QWidget>
 
 #include "BooleanOp.h"
@@ -32,7 +33,7 @@ class SimulationPanel : public QWidget
 public:
     static constexpr int maxRows = 5000;
     static constexpr int sliderMax = 100;
-    static constexpr int maxRowsPerStep = 10;
+    static constexpr int maxRowsPerStep = 100;
 
     explicit SimulationPanel(QWidget* parent = nullptr);
 
@@ -95,8 +96,12 @@ private:
     void stopPlayback();
     void pausePlayback();
     void finishPlayback();
+    // Rerun playing → false (skip remesh; keep live GPU cut mesh).
+    // Pause / stop / done → true (show mesh; build if empty).
+    void setCutMeshDisplayForPlayback(bool showMesh);
     void updateRerunButton();
     void beginHelixAxisPick();
+    void endHelixAxisPick();
     void reopenHelixDialogIfNeeded();
     void applyRow(int row);
     // Advance from fromRow to toRow (inclusive), building one multi-station
@@ -132,6 +137,7 @@ private:
     double _helixHeight = 10.0;
     double _helixDt = 0.1;
     int _helixAxis = 0; // 0=X, 1=Y, 2=Z
+    QString _helixAxisStatus;
     bool _pickingHelixAxis = false;
     bool _reopenHelixDialog = false;
 };
