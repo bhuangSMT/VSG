@@ -1,4 +1,7 @@
 #include "ToolManagerDialog.h"
+#include "UcamVsgGuard.h"
+
+#include <algorithm>
 
 #include <QtGui/QCloseEvent>
 #include <QtGui/QFont>
@@ -40,11 +43,11 @@ bool parsePositive(const QString& text, double* out)
     return true;
 }
 
-bool parseAngleDeg(const QString& text, double* out)
+bool parseNonNegative(const QString& text, double* out)
 {
     bool ok = false;
     const double value = text.trimmed().toDouble(&ok);
-    if (!ok || !(value > 0.0) || !(value < 180.0)) return false;
+    if (!ok || value < 0.0) return false;
     *out = value;
     return true;
 }
@@ -71,8 +74,10 @@ const char* leafLabel(ToolManagerDialog::LeafKind kind)
     case ToolManagerDialog::LeafKind::CuttingLength: return "Cutting length";
     case ToolManagerDialog::LeafKind::ShankLength: return "Shank length";
     case ToolManagerDialog::LeafKind::ShankRadius: return "Shank radius";
-    case ToolManagerDialog::LeafKind::VertexAngle: return "Vertex angle (deg)";
-    case ToolManagerDialog::LeafKind::Height: return "Height";
+    case ToolManagerDialog::LeafKind::TipWidth: return "Tip width";
+    case ToolManagerDialog::LeafKind::ShoulderWidth: return "Shoulder width";
+    case ToolManagerDialog::LeafKind::TaperHeight: return "Taper height";
+    case ToolManagerDialog::LeafKind::ShoulderHeight: return "Shoulder height";
     }
     return "Value";
 }
@@ -204,8 +209,10 @@ ToolManagerDialog::ToolManagerDialog(vsg::ref_ptr<vsg::WindowTraits> sharedTrait
     }
 
     _scene = vsg::Group::create();
-    _viewer = vsgQt::Viewer::create();
-    _window = new vsgQt::Window(_viewer, _traits);
+    _viewer = SafeViewer::create();
+    if (auto* app = UcamApplication::instance())
+        app->addViewer(_viewer);
+    _window = new SafeVsgWindow(_viewer, _traits);
 
     auto* viewport = QWidget::createWindowContainer(_window, this);
     viewport->setMinimumSize(320, 240);
@@ -267,8 +274,9 @@ void ToolManagerDialog::closeEvent(QCloseEvent* event)
 }
 
 void ToolManagerDialog::previewTool(ToolType type, double radius, double cuttingLength,
-                                    double shankLength, double shankRadius,
-                                    double vertexAngleDeg)
+                                    double shankLength, double shankRadius, double tipWidth,
+                                    double shoulderWidth, double taperHeight,
+                                    double shoulderHeight)
 {
     selectToolForType(type);
     QTreeWidgetItem* toolItem = nullptr;
@@ -291,16 +299,29 @@ void ToolManagerDialog::previewTool(ToolType type, double radius, double cutting
         if (cuttingLength > 0.0) params.cuttingLength = cuttingLength;
         if (shankLength > 0.0) params.shankLength = shankLength;
         if (shankRadius > 0.0) params.shankRadius = shankRadius;
-        if (vertexAngleDeg > 0.0 && vertexAngleDeg < 180.0) params.vertexAngleDeg = vertexAngleDeg;
-        if (type == ToolType::GrindingWheel) params.radius = params.cuttingLength;
+        const bool haveWheel = tipWidth > 0.0 || shoulderWidth > 0.0 || taperHeight > 0.0;
+        if (haveWheel)
+        {
+            if (tipWidth > 0.0) params.tipWidth = tipWidth;
+            if (shoulderWidth > 0.0) params.shoulderWidth = shoulderWidth;
+            if (taperHeight > 0.0) params.taperHeight = taperHeight;
+            params.shoulderHeight = std::max(0.0, shoulderHeight);
+        }
+        if (type == ToolType::GrindingWheel)
+        {
+            params.cuttingLength = params.taperHeight + params.shoulderHeight;
+            params.radius = params.cuttingLength;
+        }
         writeToolParams(toolItem, params);
     }
     if (!_ready)
     {
-        _pending = {true, type, radius, cuttingLength, shankLength, shankRadius, vertexAngleDeg};
+        _pending = {true, type, radius, cuttingLength, shankLength, shankRadius,
+                    tipWidth, shoulderWidth, taperHeight, shoulderHeight};
         return;
     }
-    applyPreview(type, radius, cuttingLength, shankLength, shankRadius, vertexAngleDeg);
+    applyPreview(type, radius, cuttingLength, shankLength, shankRadius, tipWidth, shoulderWidth,
+                 taperHeight, shoulderHeight);
 }
 
 void ToolManagerDialog::fillToolLibrary()
@@ -310,8 +331,13 @@ void ToolManagerDialog::fillToolLibrary()
     const Parameter& store = Parameter::instance();
     const double radius = store.toolRadius() > 0.0 ? store.toolRadius() : 0.05;
     const double length = store.toolLength() > 0.0 ? store.toolLength() : radius * 2.8;
-    const double angle =
-        store.toolVertexAngleDeg() > 0.0 ? store.toolVertexAngleDeg() : 60.0;
+    const double tipWidth = store.toolWheelTipWidth() > 0.0 ? store.toolWheelTipWidth() : 0.01;
+    const double shoulderWidth =
+        store.toolWheelShoulderWidth() > 0.0 ? store.toolWheelShoulderWidth() : 0.06;
+    const double taperHeight =
+        store.toolWheelTaperHeight() > 0.0 ? store.toolWheelTaperHeight() : 0.035;
+    const double shoulderHeight =
+        store.toolWheelShoulderHeight() >= 0.0 ? store.toolWheelShoulderHeight() : 0.015;
 
     struct Seed
     {
@@ -337,13 +363,16 @@ void ToolManagerDialog::fillToolLibrary()
 
         const double shankRadius =
             (seed.type == ToolType::Sphere) ? radius * 0.6 : radius * 1.2;
-        ToolParams params{radius, length, length, shankRadius, angle};
+        ToolParams params{radius, length, length, shankRadius, tipWidth, shoulderWidth,
+                          taperHeight, shoulderHeight};
         if (seed.type == ToolType::GrindingWheel)
         {
-            params.radius = length;
-            params.cuttingLength = length;
-            tool->addChild(makeLeaf(LeafKind::VertexAngle, params.vertexAngleDeg));
-            tool->addChild(makeLeaf(LeafKind::Height, params.cuttingLength));
+            params.cuttingLength = params.taperHeight + params.shoulderHeight;
+            params.radius = params.cuttingLength;
+            tool->addChild(makeLeaf(LeafKind::TipWidth, params.tipWidth));
+            tool->addChild(makeLeaf(LeafKind::ShoulderWidth, params.shoulderWidth));
+            tool->addChild(makeLeaf(LeafKind::TaperHeight, params.taperHeight));
+            tool->addChild(makeLeaf(LeafKind::ShoulderHeight, params.shoulderHeight));
         }
         else if (seed.type == ToolType::Sphere)
         {
@@ -383,13 +412,12 @@ ToolManagerDialog::ToolParams ToolManagerDialog::readToolParams(QTreeWidgetItem*
         {
         case LeafKind::Radius: params.radius = value; break;
         case LeafKind::CuttingLength: params.cuttingLength = value; break;
-        case LeafKind::Height:
-            params.cuttingLength = value;
-            params.radius = value;
-            break;
         case LeafKind::ShankLength: params.shankLength = value; break;
         case LeafKind::ShankRadius: params.shankRadius = value; break;
-        case LeafKind::VertexAngle: params.vertexAngleDeg = value; break;
+        case LeafKind::TipWidth: params.tipWidth = value; break;
+        case LeafKind::ShoulderWidth: params.shoulderWidth = value; break;
+        case LeafKind::TaperHeight: params.taperHeight = value; break;
+        case LeafKind::ShoulderHeight: params.shoulderHeight = value; break;
         }
     }
     return params;
@@ -408,10 +436,12 @@ void ToolManagerDialog::writeToolParams(QTreeWidgetItem* toolItem, const ToolPar
         {
         case LeafKind::Radius: setLeafValue(leaf, params.radius); break;
         case LeafKind::CuttingLength: setLeafValue(leaf, params.cuttingLength); break;
-        case LeafKind::Height: setLeafValue(leaf, params.cuttingLength); break;
         case LeafKind::ShankLength: setLeafValue(leaf, params.shankLength); break;
         case LeafKind::ShankRadius: setLeafValue(leaf, params.shankRadius); break;
-        case LeafKind::VertexAngle: setLeafValue(leaf, params.vertexAngleDeg); break;
+        case LeafKind::TipWidth: setLeafValue(leaf, params.tipWidth); break;
+        case LeafKind::ShoulderWidth: setLeafValue(leaf, params.shoulderWidth); break;
+        case LeafKind::TaperHeight: setLeafValue(leaf, params.taperHeight); break;
+        case LeafKind::ShoulderHeight: setLeafValue(leaf, params.shoulderHeight); break;
         }
     }
     _toolTree->blockSignals(blocked);
@@ -426,11 +456,13 @@ void ToolManagerDialog::previewToolItem(QTreeWidgetItem* toolItem)
     if (!_ready)
     {
         _pending = {true, type, params.radius, params.cuttingLength, params.shankLength,
-                    params.shankRadius, params.vertexAngleDeg};
+                    params.shankRadius, params.tipWidth, params.shoulderWidth, params.taperHeight,
+                    params.shoulderHeight};
         return;
     }
     applyPreview(type, params.radius, params.cuttingLength, params.shankLength,
-                 params.shankRadius, params.vertexAngleDeg);
+                 params.shankRadius, params.tipWidth, params.shoulderWidth, params.taperHeight,
+                 params.shoulderHeight);
 }
 
 void ToolManagerDialog::onLibrarySelectionChanged()
@@ -464,18 +496,28 @@ void ToolManagerDialog::onLibraryItemChanged(QTreeWidgetItem* item, int)
 
     double value = 0.0;
     bool ok = false;
-    if (kind == LeafKind::VertexAngle)
-        ok = parseAngleDeg(raw, &value);
+    if (kind == LeafKind::ShoulderHeight)
+        ok = parseNonNegative(raw, &value);
     else
         ok = parsePositive(raw, &value);
 
     if (!ok)
     {
         value = item->data(0, kRoleValue).toDouble();
-        if (!(value > 0.0))
+        if (kind == LeafKind::ShoulderHeight)
+        {
+            if (value < 0.0) value = 0.0;
+        }
+        else if (!(value > 0.0))
         {
             const Parameter& store = Parameter::instance();
-            if (kind == LeafKind::VertexAngle) value = 60.0;
+            if (kind == LeafKind::TipWidth)
+                value = store.toolWheelTipWidth() > 0.0 ? store.toolWheelTipWidth() : 0.01;
+            else if (kind == LeafKind::ShoulderWidth)
+                value = store.toolWheelShoulderWidth() > 0.0 ? store.toolWheelShoulderWidth()
+                                                             : 0.06;
+            else if (kind == LeafKind::TaperHeight)
+                value = store.toolWheelTaperHeight() > 0.0 ? store.toolWheelTaperHeight() : 0.035;
             else if (kind == LeafKind::Radius || kind == LeafKind::ShankRadius)
                 value = store.toolRadius() > 0.0 ? store.toolRadius() : 0.05;
             else
@@ -492,8 +534,14 @@ void ToolManagerDialog::onLibraryItemChanged(QTreeWidgetItem* item, int)
 
     const auto type = static_cast<ToolType>(toolItem->data(0, kRoleType).toInt());
     const ToolParams params = readToolParams(toolItem);
-    emit toolLibraryEntryChanged(static_cast<int>(type), params.radius, params.cuttingLength,
-                                 params.shankLength, params.shankRadius, params.vertexAngleDeg);
+    const double totalH = params.taperHeight + params.shoulderHeight;
+    const double radius =
+        (type == ToolType::GrindingWheel && totalH > 0.0) ? totalH : params.radius;
+    const double cutting =
+        (type == ToolType::GrindingWheel && totalH > 0.0) ? totalH : params.cuttingLength;
+    emit toolLibraryEntryChanged(static_cast<int>(type), radius, cutting, params.shankLength,
+                                 params.shankRadius, params.tipWidth, params.shoulderWidth,
+                                 params.taperHeight, params.shoulderHeight);
 }
 
 void ToolManagerDialog::selectToolForType(ToolType type)
@@ -510,8 +558,9 @@ void ToolManagerDialog::selectToolForType(ToolType type)
 }
 
 void ToolManagerDialog::applyPreview(ToolType type, double radius, double cuttingLength,
-                                     double shankLength, double shankRadius,
-                                     double vertexAngleDeg)
+                                     double shankLength, double shankRadius, double tipWidth,
+                                     double shoulderWidth, double taperHeight,
+                                     double shoulderHeight)
 {
     if (type == ToolType::None)
     {
@@ -523,17 +572,25 @@ void ToolManagerDialog::applyPreview(ToolType type, double radius, double cuttin
     if (!(cuttingLength > 0.0)) cuttingLength = radius * 2.8;
     if (!(shankLength > 0.0)) shankLength = cuttingLength;
     if (!(shankRadius > 0.0)) shankRadius = radius;
-    if (!(vertexAngleDeg > 0.0) || !(vertexAngleDeg < 180.0)) vertexAngleDeg = 60.0;
+    if (!(tipWidth > 0.0)) tipWidth = 0.01;
+    if (!(shoulderWidth > 0.0)) shoulderWidth = 0.06;
+    if (!(taperHeight > 0.0)) taperHeight = 0.035;
+    if (shoulderHeight < 0.0) shoulderHeight = 0.0;
     if (type == ToolType::Sphere && shankRadius >= radius)
         shankRadius = radius * 0.6;
-    if (type == ToolType::GrindingWheel) radius = cuttingLength;
+
+    GrindingWheelProfile wheel;
+    wheel.tipWidth = static_cast<float>(tipWidth);
+    wheel.shoulderWidth = static_cast<float>(shoulderWidth);
+    wheel.taperHeight = static_cast<float>(taperHeight);
+    wheel.shoulderHeight = static_cast<float>(shoulderHeight);
+    if (type == ToolType::GrindingWheel && !wheel.valid()) wheel = GrindingWheelProfile{};
 
     const auto cutterRadius = static_cast<float>(radius);
     const auto cutterLength = static_cast<float>(cuttingLength);
-    const auto angle = static_cast<float>(vertexAngleDeg);
     const TriangleMesh cutMesh =
-        createToolMesh(type, cutterRadius, cutterLength, 48, 24, 12, angle,
-                       static_cast<float>(shankRadius), static_cast<float>(shankLength));
+        createToolMesh(type, cutterRadius, cutterLength, 48, 24, 12, 60.0f,
+                       static_cast<float>(shankRadius), static_cast<float>(shankLength), wheel);
     auto cutNode = makeToolNode(cutMesh, _options, kCutColor, false);
 
     const auto group = vsg::Group::create();
@@ -543,13 +600,13 @@ void ToolManagerDialog::applyPreview(ToolType type, double radius, double cuttin
     {
         TriangleMesh shankMesh;
         if (type == ToolType::GrindingWheel)
-            shankMesh = createGrindingShankMesh(cutterRadius, static_cast<float>(shankRadius),
+            shankMesh = createGrindingShankMesh(wheel.shoulderHeight, static_cast<float>(shankRadius),
                                                static_cast<float>(shankLength));
         else
         {
             const float z0 = (type == ToolType::Sphere)
                                  ? cutterRadius
-                                 : toolCuttingTop(type, cutterRadius, cutterLength, angle);
+                                 : toolCuttingTop(type, cutterRadius, cutterLength);
             shankMesh = createShankMesh(static_cast<float>(shankRadius), z0,
                                         static_cast<float>(shankLength));
         }
@@ -616,7 +673,8 @@ void ToolManagerDialog::initializeScene()
 
         if (_pending.valid)
             applyPreview(_pending.type, _pending.radius, _pending.cuttingLength,
-                         _pending.shankLength, _pending.shankRadius, _pending.vertexAngleDeg);
+                         _pending.shankLength, _pending.shankRadius, _pending.tipWidth,
+                         _pending.shoulderWidth, _pending.taperHeight, _pending.shoulderHeight);
         else
             _scene->addChild(makePlaceholder(_options));
         _pending = {};

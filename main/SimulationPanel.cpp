@@ -554,6 +554,10 @@ void SimulationPanel::onHelixClicked()
     if (_renderManager) modelToWorld = _renderManager->currentFitMatrix();
 
     auto toWorld = [&](const vsg::dvec3& p) { return modelToWorld * p; };
+    auto toWorldDir = [&](const vsg::dvec3& d) {
+        const vsg::dvec4 h = modelToWorld * vsg::dvec4(d.x, d.y, d.z, 0.0);
+        return vsg::dvec3(h.x, h.y, h.z);
+    };
 
     // Tool spindle along the helix axis.
     const ToolPose axisPose{vsg::dvec3(0.0, 0.0, 0.0), axialDir};
@@ -570,6 +574,8 @@ void SimulationPanel::onHelixClicked()
         const double axial = pitch * useT; // signed advance along the axis
         const vsg::dvec3 model =
             axialDir * (axialStart + axial) + u * (r * std::cos(useT)) + v * (r * std::sin(useT));
+        const vsg::dvec3 modelT =
+            axialDir * pitch + u * (-r * std::sin(useT)) + v * (r * std::cos(useT));
         const vsg::dvec3 world = toWorld(model);
         ToolSample sample;
         sample.x = world.x;
@@ -578,6 +584,8 @@ void SimulationPanel::onHelixClicked()
         sample.a = axisSample.a;
         sample.b = axisSample.b;
         sample.c = axisSample.c;
+        sample.hasFeed = true;
+        sample.feed = toWorldDir(modelT);
         samples.push_back(sample);
         path.push_back(world);
         if (t >= tEnd) break;
@@ -605,12 +613,16 @@ void SimulationPanel::appendSamples(const std::vector<ToolSample>& samples)
     {
         const int row = _table->rowCount();
         _table->insertRow(row);
-        _table->setItem(row, 0, makeCell(sample.x, 4));
-        _table->setItem(row, 1, makeCell(sample.y, 4));
-        _table->setItem(row, 2, makeCell(sample.z, 4));
+        _table->setItem(row, 0, makeCell(sample.x, 8));
+        _table->setItem(row, 1, makeCell(sample.y, 8));
+        _table->setItem(row, 2, makeCell(sample.z, 8));
         _table->setItem(row, 3, makeCell(sample.a, 2));
         _table->setItem(row, 4, makeCell(sample.b, 2));
         _table->setItem(row, 5, makeCell(sample.c, 2));
+        if (sample.hasFeed)
+            _pathFeeds.emplace_back(sample.feed);
+        else
+            _pathFeeds.emplace_back(std::nullopt);
     }
 }
 
@@ -624,6 +636,7 @@ void SimulationPanel::appendNullRow()
     _table->setItem(row, 0, makeNullCell(true));
     for (int col = 1; col < 6; ++col)
         _table->setItem(row, col, makeNullCell(false));
+    _pathFeeds.emplace_back(std::nullopt);
     applyFifoCap();
     _table->scrollToBottom();
 }
@@ -639,7 +652,14 @@ void SimulationPanel::applyFifoCap()
     // CL data keeps the full path (helix / APT); Interactive still FIFO-caps.
     if (Parameter::instance().simulationMode() == SimulationMode::ClData) return;
     const int extra = _table->rowCount() - maxRows;
-    if (extra > 0) _table->model()->removeRows(0, extra);
+    if (extra > 0)
+    {
+        _table->model()->removeRows(0, extra);
+        if (static_cast<int>(_pathFeeds.size()) > extra)
+            _pathFeeds.erase(_pathFeeds.begin(), _pathFeeds.begin() + extra);
+        else
+            _pathFeeds.clear();
+    }
 }
 
 int SimulationPanel::rowsPerStepFromSlider() const
@@ -678,7 +698,15 @@ void SimulationPanel::applyRow(int row)
     else
     {
         const ToolPose pose = toolPoseFromSample(sampleAt(row));
-        _renderManager->setToolPose(pose.position, pose.direction);
+        const vsg::dvec3* along = nullptr;
+        vsg::dvec3 feed;
+        if (row >= 0 && static_cast<std::size_t>(row) < _pathFeeds.size() &&
+            _pathFeeds[static_cast<std::size_t>(row)])
+        {
+            feed = *_pathFeeds[static_cast<std::size_t>(row)];
+            along = &feed;
+        }
+        _renderManager->setToolPose(pose.position, pose.direction, along);
     }
 }
 
@@ -706,7 +734,13 @@ void SimulationPanel::applyRowRange(int fromRow, int toRow)
     std::vector<ToolPose> poses;
     poses.reserve(static_cast<std::size_t>(toRow - fromRow + 1));
     for (int row = fromRow; row <= toRow; ++row)
-        poses.push_back(toolPoseFromSample(sampleAt(row)));
+    {
+        ToolPose pose = toolPoseFromSample(sampleAt(row));
+        if (row >= 0 && static_cast<std::size_t>(row) < _pathFeeds.size() &&
+            _pathFeeds[static_cast<std::size_t>(row)])
+            pose.feed = *_pathFeeds[static_cast<std::size_t>(row)];
+        poses.push_back(pose);
+    }
 
     _table->selectRow(toRow);
     if (QTableWidgetItem* item = _table->item(toRow, 0))
@@ -757,6 +791,7 @@ void SimulationPanel::onReset()
 {
     stopPlayback();
     _table->setRowCount(0);
+    _pathFeeds.clear();
     _log.take();
     _lastRecorded.reset();
 }
@@ -853,8 +888,9 @@ void SimulationPanel::clearLibrarySelection()
 }
 
 void SimulationPanel::updateLibraryEntry(int toolType, double radius, double cuttingLength,
-                                         double shankLength, double shankRadius,
-                                         double vertexAngleDeg)
+                                         double shankLength, double shankRadius, double tipWidth,
+                                         double shoulderWidth, double taperHeight,
+                                         double shoulderHeight)
 {
     if (!_toolTable || toolType == static_cast<int>(ToolType::None)) return;
     if (!(radius > 0.0) || !(cuttingLength > 0.0) || !(shankLength > 0.0) ||
@@ -868,7 +904,20 @@ void SimulationPanel::updateLibraryEntry(int toolType, double radius, double cut
         QTableWidgetItem* idItem = _toolTable->item(row, 0);
         if (!idItem || idItem->data(Qt::UserRole).toInt() != toolType) continue;
         matchRow = row;
-        if (vertexAngleDeg > 0.0) idItem->setData(Qt::UserRole + 1, vertexAngleDeg);
+        if (toolType == static_cast<int>(ToolType::GrindingWheel))
+        {
+            if (tipWidth > 0.0) idItem->setData(Qt::UserRole + 1, tipWidth);
+            if (shoulderWidth > 0.0) idItem->setData(Qt::UserRole + 2, shoulderWidth);
+            if (taperHeight > 0.0) idItem->setData(Qt::UserRole + 3, taperHeight);
+            if (shoulderHeight >= 0.0) idItem->setData(Qt::UserRole + 4, shoulderHeight);
+            const double totalH =
+                idItem->data(Qt::UserRole + 3).toDouble() + idItem->data(Qt::UserRole + 4).toDouble();
+            if (totalH > 0.0)
+            {
+                radius = totalH;
+                cuttingLength = totalH;
+            }
+        }
         auto setNumber = [this, row](int col, double value) {
             QTableWidgetItem* cell = _toolTable->item(row, col);
             if (!cell)
@@ -929,9 +978,21 @@ bool SimulationPanel::applySelectedLibraryTool()
     Parameter::instance().setToolShankLength(shankLength);
     if (type == ToolType::GrindingWheel)
     {
-        const double angle = idItem->data(Qt::UserRole + 1).toDouble();
-        Parameter::instance().setToolVertexAngleDeg(angle > 0.0 ? angle : 60.0);
-        Parameter::instance().setToolRadius(cuttingLength); // H
+        const double tipWidth = idItem->data(Qt::UserRole + 1).toDouble();
+        const double shoulderWidth = idItem->data(Qt::UserRole + 2).toDouble();
+        const double taperHeight = idItem->data(Qt::UserRole + 3).toDouble();
+        const double shoulderHeight = idItem->data(Qt::UserRole + 4).toDouble();
+        if (tipWidth > 0.0) Parameter::instance().setToolWheelTipWidth(tipWidth);
+        if (shoulderWidth > 0.0) Parameter::instance().setToolWheelShoulderWidth(shoulderWidth);
+        if (taperHeight > 0.0) Parameter::instance().setToolWheelTaperHeight(taperHeight);
+        if (shoulderHeight >= 0.0) Parameter::instance().setToolWheelShoulderHeight(shoulderHeight);
+        const double totalH = Parameter::instance().toolWheelTaperHeight() +
+                              Parameter::instance().toolWheelShoulderHeight();
+        if (totalH > 0.0)
+        {
+            Parameter::instance().setToolRadius(totalH);
+            Parameter::instance().setToolLength(totalH);
+        }
     }
     if (_renderManager)
     {
@@ -963,7 +1024,11 @@ void SimulationPanel::onToolLibraryDoubleClicked(int row, int)
                                      radiusItem->text().toDouble(),
                                      cuttingItem->text().toDouble(),
                                      shankItem->text().toDouble(),
-                                     shankRadiusItem->text().toDouble());
+                                     shankRadiusItem->text().toDouble(),
+                                     idItem->data(Qt::UserRole + 1).toDouble(),
+                                     idItem->data(Qt::UserRole + 2).toDouble(),
+                                     idItem->data(Qt::UserRole + 3).toDouble(),
+                                     idItem->data(Qt::UserRole + 4).toDouble());
 }
 
 void SimulationPanel::fillToolLibrary()
@@ -987,8 +1052,13 @@ void SimulationPanel::fillToolLibrary()
         {5, ToolType::GrindingWheel},
     };
 
-    const double angle =
-        store.toolVertexAngleDeg() > 0.0 ? store.toolVertexAngleDeg() : 60.0;
+    const double tipWidth = store.toolWheelTipWidth() > 0.0 ? store.toolWheelTipWidth() : 0.01;
+    const double shoulderWidth =
+        store.toolWheelShoulderWidth() > 0.0 ? store.toolWheelShoulderWidth() : 0.06;
+    const double taperHeight =
+        store.toolWheelTaperHeight() > 0.0 ? store.toolWheelTaperHeight() : 0.035;
+    const double shoulderHeight =
+        store.toolWheelShoulderHeight() >= 0.0 ? store.toolWheelShoulderHeight() : 0.015;
 
     _toolTable->blockSignals(true);
     _toolTable->setRowCount(0);
@@ -999,16 +1069,23 @@ void SimulationPanel::fillToolLibrary()
         auto* idItem = makeTextCell(QString::number(seed.id));
         idItem->setData(Qt::UserRole, static_cast<int>(seed.type));
         if (seed.type == ToolType::GrindingWheel)
-            idItem->setData(Qt::UserRole + 1, angle);
+        {
+            idItem->setData(Qt::UserRole + 1, tipWidth);
+            idItem->setData(Qt::UserRole + 2, shoulderWidth);
+            idItem->setData(Qt::UserRole + 3, taperHeight);
+            idItem->setData(Qt::UserRole + 4, shoulderHeight);
+        }
         _toolTable->setItem(row, 0, idItem);
         _toolTable->setItem(row, 1, makeTextCell(QString::fromLatin1(toolTypeLabel(seed.type)),
                                                  Qt::AlignLeft));
         const double shankRadius =
             (seed.type == ToolType::Sphere) ? radius * 0.6 : radius * 1.2;
+        const double rowLength =
+            (seed.type == ToolType::GrindingWheel) ? (taperHeight + shoulderHeight) : length;
         const double rowRadius =
-            (seed.type == ToolType::GrindingWheel) ? length : radius;
+            (seed.type == ToolType::GrindingWheel) ? rowLength : radius;
         _toolTable->setItem(row, 2, makeEditableCell(rowRadius, 6));
-        _toolTable->setItem(row, 3, makeEditableCell(length, 6));
+        _toolTable->setItem(row, 3, makeEditableCell(rowLength, 6));
         _toolTable->setItem(row, 4, makeEditableCell(length, 6));
         _toolTable->setItem(row, 5, makeEditableCell(shankRadius, 6));
     }

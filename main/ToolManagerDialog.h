@@ -28,8 +28,10 @@ public:
         CuttingLength,
         ShankLength,
         ShankRadius,
-        VertexAngle,
-        Height
+        TipWidth,
+        ShoulderWidth,
+        TaperHeight,
+        ShoulderHeight
     };
 
     ToolManagerDialog(vsg::ref_ptr<vsg::WindowTraits> sharedTraits,
@@ -39,13 +41,15 @@ public:
 
     vsg::ref_ptr<vsg::Group> scene() const { return _scene; }
     void previewTool(ToolType type, double radius, double cuttingLength, double shankLength,
-                     double shankRadius, double vertexAngleDeg = 60.0);
+                     double shankRadius, double tipWidth = 0.0, double shoulderWidth = 0.0,
+                     double taperHeight = 0.0, double shoulderHeight = 0.0);
 
 signals:
     // Fired after a numeric library leaf is committed in this dialog.
     void toolLibraryEntryChanged(int toolType, double radius, double cuttingLength,
-                                 double shankLength, double shankRadius,
-                                 double vertexAngleDeg);
+                                 double shankLength, double shankRadius, double tipWidth,
+                                 double shoulderWidth, double taperHeight,
+                                 double shoulderHeight);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -58,7 +62,10 @@ private:
         double cuttingLength = 0.14;
         double shankLength = 0.14;
         double shankRadius = 0.06;
-        double vertexAngleDeg = 60.0;
+        double tipWidth = 0.01;
+        double shoulderWidth = 0.06;
+        double taperHeight = 0.035;
+        double shoulderHeight = 0.015;
     };
 
     struct PendingPreview
@@ -69,13 +76,17 @@ private:
         double cuttingLength = 0.0;
         double shankLength = 0.0;
         double shankRadius = 0.0;
-        double vertexAngleDeg = 60.0;
+        double tipWidth = 0.01;
+        double shoulderWidth = 0.06;
+        double taperHeight = 0.035;
+        double shoulderHeight = 0.015;
     };
 
     void initializeScene();
     void fillToolLibrary();
     void applyPreview(ToolType type, double radius, double cuttingLength, double shankLength,
-                      double shankRadius, double vertexAngleDeg);
+                      double shankRadius, double tipWidth, double shoulderWidth,
+                      double taperHeight, double shoulderHeight);
     void previewToolItem(QTreeWidgetItem* toolItem);
     void onLibraryItemChanged(QTreeWidgetItem* item, int column);
     void onLibrarySelectionChanged();

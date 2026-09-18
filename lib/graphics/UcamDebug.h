@@ -61,4 +61,35 @@ inline const char* ucamSplatDebugDefine()
     return nullptr;
 }
 
+// Set UCAM_NORMAL_STATS=1 to print, after each splat rebuild, how many endpoint
+// normals disagree with every neighbour, split by whether the boolean recorded
+// them or the cache estimated them, and by how close to grazing the ray was.
+// Off by default: the counters are atomics written from the parallel fill.
+inline constexpr char kUcamNormalStatsEnv[] = "UCAM_NORMAL_STATS";
+
+// Read once: this is queried per endpoint from every worker in the parallel
+// fill, and getenv on that path is slow enough to look like a hang.
+inline bool ucamNormalStatsEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv(kUcamNormalStatsEnv);
+        return value && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Set UCAM_REPAIR_CUT_NORMALS=0 to skip the post-boolean neighbour-consensus
+// pass. Default on. Restart the process to change it (read once).
+inline constexpr char kUcamRepairCutNormalsEnv[] = "UCAM_REPAIR_CUT_NORMALS";
+
+inline bool ucamRepairCutNormalsEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv(kUcamRepairCutNormalsEnv);
+        if (!value || *value == '\0') return true;
+        return std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 } // namespace app

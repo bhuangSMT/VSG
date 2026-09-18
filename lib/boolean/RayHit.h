@@ -19,6 +19,7 @@ struct RayHit
 {
     double along = 0.0;
     Normal3f normal{0.0f, 0.0f, 0.0f};
+    bool motionCap = false;
 };
 
 struct PairingStats

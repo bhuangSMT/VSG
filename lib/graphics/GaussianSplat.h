@@ -44,6 +44,9 @@ enum class PointRenderMode
 struct Splat
 {
     vsg::vec3 position;
+    // Averaged with the neighbours the edgeStrength ramp says are on the same
+    // face. Per-bite cuts step the raw normal across the seam where one swept
+    // volume meets the next, which shades as a thin dark line.
     vsg::vec3 normal;
     vsg::vec4 color;
     float radius = 0.0f;

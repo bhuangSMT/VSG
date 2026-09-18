@@ -12,6 +12,7 @@
 #include <vsg/maths/vec3.h>
 
 #include "BVH.h"
+#include "ToolGeometry.h"
 #include "ToolType.h"
 #include "TriangleMesh.h"
 
@@ -22,6 +23,8 @@ struct ToolPose
 {
     vsg::dvec3 position{0.0, 0.0, 0.0};
     vsg::dvec3 direction{0.0, 0.0, 1.0};
+    // Analytic / stored feed. Zero means derive along from neighbour tips.
+    vsg::dvec3 feed{0.0, 0.0, 0.0};
 };
 
 class SweptVolume
@@ -43,36 +46,40 @@ public:
     // Drop mesh, BVH, and the remembered tip pose.
     void clear();
 
+    // Azimuthal tessellation for rings / stadium ends on the boolean sweep.
+    static constexpr int kCircleSegments = 32;
+
     // Append one linear segment at constant cost.
     // Flat: stadium prism (Minkowski of the cylinder with tipA→tipB).
     // Bull: flat tip stadium + quarter-torus fillet loft + shank stadium prism.
     // Sphere: capsule about the centre path (cylinder + hemispheres).
     // Ball nose: lower motion capsule, vertical shank lofts, one stadium lid.
-    // Grinding wheel: loft the cutter triangle from A to B with two flat
-    // triangular caps (no revolved ends).
+    // Grinding wheel: loft the cutter 6-gon (trapezoid + rectangle) from A to B
+    // with fan-triangulated end caps (no revolved ends).
     // circleSegments is the azimuthal tessellation for rings / stadium ends.
     void appendSegment(ToolType type,
                        float radius,
                        float height,
                        const ToolPose& tipA,
                        const ToolPose& tipB,
-                       int circleSegments = 8,
+                       int circleSegments = kCircleSegments,
                        float vertexAngleDeg = 60.0f,
                        float shankRadius = 0.0f,
-                       float shankLength = 0.0f);
+                       float shankLength = 0.0f,
+                       GrindingWheelProfile wheel = {});
 
-    // Append a polyline of tool poses as one swept solid: projections are
-    // connected station-to-station with caps only at the first and last pose
-    // (grinding wheel). Other tool types fall back to consecutive segments.
+    // Append a polyline of tool poses as one swept solid: side walls loft
+    // station-to-station, motion-end caps only at the first and last pose.
     // Requires at least two poses.
     void appendPath(ToolType type,
                     float radius,
                     float height,
                     const std::vector<ToolPose>& poses,
-                    int circleSegments = 8,
+                    int circleSegments = kCircleSegments,
                     float vertexAngleDeg = 60.0f,
                     float shankRadius = 0.0f,
-                    float shankLength = 0.0f);
+                    float shankLength = 0.0f,
+                    GrindingWheelProfile wheel = {});
 
     // Append triangles from another soup. rebuildHierarchy rebuilds the BVH
     // (needed when this volume is used for boolean). Display-only accumulation

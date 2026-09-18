@@ -245,28 +245,34 @@ TriangleMesh revolveProfileX(const std::vector<std::pair<float, float>>& corners
     return mesh;
 }
 
-// Isosceles cutter only. Origin = triangle-base midpoint (CL). Spindle +X on
-// the shank edge (z = shankRadius); vertex at (0, 0, −H).
-TriangleMesh grindingWheelTool(float height, float vertexAngleDeg, float shankRadius,
+// Trapezoid + rectangle cutter. Origin = shoulder-rectangle midpoint (CL).
+// Spindle +X on the shank edge; outer rim toward −Z. a=0 at the shoulder mid
+// sits at the mesh origin (axisZ = shankRadius + H2/2).
+TriangleMesh grindingWheelTool(const GrindingWheelProfile& wheel, float shankRadius,
                                int slices, int stacks)
 {
     TriangleMesh mesh;
     mesh.name = "grinding-wheel";
-    if (!(height > 0.0f) || slices < 3) return mesh;
+    if (!wheel.valid() || slices < 3) return mesh;
     if (!(shankRadius >= 0.0f)) shankRadius = 0.0f;
 
-    const float halfBase = grindingWheelHalfBase(height, vertexAngleDeg);
-    if (!(halfBase > 0.0f)) return mesh;
+    const float halfA = 0.5f * wheel.tipWidth;
+    const float halfB = 0.5f * wheel.shoulderWidth;
+    const float h2 = (wheel.shoulderHeight > 0.0f) ? wheel.shoulderHeight : 0.0f;
+    const float axisZ = shankRadius + 0.5f * h2;
+    const float rInner = shankRadius;
+    const float rJunc = shankRadius + h2;
+    const float rTip = shankRadius + wheel.totalHeight();
+    const bool hasRect = h2 > 1.0e-8f;
+    const bool flared = std::abs(wheel.tipWidth - wheel.shoulderWidth) > 1.0e-8f;
 
-    const float axisZ = shankRadius;
-    const float rBase = shankRadius;
-    const float rVertex = shankRadius + height;
-
-    std::vector<std::pair<float, float>> corners = {
-        {-halfBase, rBase},
-        {0.0f, rVertex},
-        {halfBase, rBase},
-    };
+    std::vector<std::pair<float, float>> corners;
+    corners.push_back({-halfB, rInner});
+    if (hasRect && flared) corners.push_back({-halfB, rJunc});
+    corners.push_back({-halfA, rTip});
+    corners.push_back({halfA, rTip});
+    if (hasRect && flared) corners.push_back({halfB, rJunc});
+    corners.push_back({halfB, rInner});
     return revolveProfileX(corners, axisZ, slices, stacks, "grinding-wheel");
 }
 
@@ -402,16 +408,16 @@ TriangleMesh createShankMesh(float radius, float z0, float height, int slices)
     return mesh;
 }
 
-TriangleMesh createGrindingShankMesh(float wheelHeight, float shankRadius, float shankLength,
+TriangleMesh createGrindingShankMesh(float shoulderHeight, float shankRadius, float shankLength,
                                      int slices, int stacks)
 {
-    (void)wheelHeight;
     if (!(shankRadius > 0.0f) || !(shankLength > 0.0f)) return {};
     if (slices < 3) slices = 3;
     if (stacks < 1) stacks = 1;
 
+    const float h2 = (shoulderHeight > 0.0f) ? shoulderHeight : 0.0f;
     const float halfLen = 0.5f * shankLength;
-    const float axisZ = shankRadius;
+    const float axisZ = shankRadius + 0.5f * h2;
     const std::vector<std::pair<float, float>> corners = {
         {-halfLen, 0.0f},
         {-halfLen, shankRadius},
@@ -423,12 +429,14 @@ TriangleMesh createGrindingShankMesh(float wheelHeight, float shankRadius, float
 
 TriangleMesh createToolMesh(ToolType type, float radius, float height,
                             int slices, int stacks, int filletStacks,
-                            float vertexAngleDeg, float shankRadius, float shankLength)
+                            float vertexAngleDeg, float shankRadius, float shankLength,
+                            GrindingWheelProfile wheel)
 {
     if (slices < 3) slices = 3;
     if (stacks < 2) stacks = 2;
     if (filletStacks < 1) filletStacks = 1;
     (void)shankLength;
+    (void)vertexAngleDeg;
 
     switch (type)
     {
@@ -441,7 +449,8 @@ TriangleMesh createToolMesh(ToolType type, float radius, float height,
     case ToolType::BullNose:
         return bullNoseTool(radius, height, bullNoseFilletRadius(radius), slices, filletStacks);
     case ToolType::GrindingWheel:
-        return grindingWheelTool(radius, vertexAngleDeg, shankRadius, slices, stacks);
+        if (!wheel.valid()) wheel = GrindingWheelProfile{};
+        return grindingWheelTool(wheel, shankRadius, slices, stacks);
     case ToolType::None:
         break;
     }

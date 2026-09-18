@@ -26,7 +26,8 @@ vsg::dvec3 normalizeOr(const vsg::dvec3& v, const vsg::dvec3& fallback)
 
 void addOrientedTriangle(TriangleMesh& mesh,
                          vsg::dvec3 a, vsg::dvec3 b, vsg::dvec3 c,
-                         const vsg::dvec3& outwardHint)
+                         const vsg::dvec3& outwardHint,
+                         bool motionCap = false)
 {
     vsg::dvec3 n = vsg::cross(b - a, c - a);
     const double len = vsg::length(n);
@@ -43,6 +44,7 @@ void addOrientedTriangle(TriangleMesh& mesh,
     tri.v0 = vsg::vec3(static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.z));
     tri.v1 = vsg::vec3(static_cast<float>(b.x), static_cast<float>(b.y), static_cast<float>(b.z));
     tri.v2 = vsg::vec3(static_cast<float>(c.x), static_cast<float>(c.y), static_cast<float>(c.z));
+    if (motionCap) tri.flags = MeshTriangle::flagMotionCap;
     mesh.triangles.push_back(tri);
 }
 
@@ -56,18 +58,19 @@ double triangleArea(const vsg::dvec3& a, const vsg::dvec3& b, const vsg::dvec3& 
 void stitchOrientedQuad(TriangleMesh& mesh,
                         const vsg::dvec3& a00, const vsg::dvec3& a01,
                         const vsg::dvec3& a11, const vsg::dvec3& a10,
-                        const vsg::dvec3& outwardHint)
+                        const vsg::dvec3& outwardHint,
+                        bool motionCap = false)
 {
     const double splitA = std::min(triangleArea(a00, a01, a11), triangleArea(a00, a11, a10));
     const double splitB = std::min(triangleArea(a00, a01, a10), triangleArea(a01, a11, a10));
     if (splitB > splitA)
     {
-        addOrientedTriangle(mesh, a00, a01, a10, outwardHint);
-        addOrientedTriangle(mesh, a01, a11, a10, outwardHint);
+        addOrientedTriangle(mesh, a00, a01, a10, outwardHint, motionCap);
+        addOrientedTriangle(mesh, a01, a11, a10, outwardHint, motionCap);
         return;
     }
-    addOrientedTriangle(mesh, a00, a01, a11, outwardHint);
-    addOrientedTriangle(mesh, a00, a11, a10, outwardHint);
+    addOrientedTriangle(mesh, a00, a01, a11, outwardHint, motionCap);
+    addOrientedTriangle(mesh, a00, a11, a10, outwardHint, motionCap);
 }
 
 vsg::dvec3 sphereCentre(const ToolPose& tip, double radius)
@@ -227,7 +230,8 @@ void appendVerticalHemiCylinder(TriangleMesh& mesh,
                                 const vsg::dvec3& outward,
                                 double radius,
                                 double height,
-                                int segments)
+                                int segments,
+                                bool motionCap = true)
 {
     if (radius <= 0.0 || height <= 0.0 || segments < 2) return;
     const vsg::dvec3 top = tip + dir * height;
@@ -242,7 +246,7 @@ void appendVerticalHemiCylinder(TriangleMesh& mesh,
         const vsg::dvec3 r1 = (x * std::cos(a1) + y * std::sin(a1)) * radius;
         // Out of the hemi-cylinder: average of the two ring radii (in the ⊥dir plane).
         const vsg::dvec3 out = normalizeOr(r0 + r1, y);
-        stitchOrientedQuad(mesh, tip + r0, tip + r1, top + r1, top + r0, out);
+        stitchOrientedQuad(mesh, tip + r0, tip + r1, top + r1, top + r0, out, motionCap);
     }
 }
 
@@ -255,7 +259,9 @@ void appendStadiumPrism(TriangleMesh& mesh,
                         double radius,
                         double height,
                         int segments,
-                        bool includeBottom = true)
+                        bool includeBottom = true,
+                        bool includeStartCap = true,
+                        bool includeEndCap = true)
 {
     if (radius <= 0.0 || height <= 0.0) return;
     if (segments < 3) segments = 3;
@@ -287,8 +293,10 @@ void appendStadiumPrism(TriangleMesh& mesh,
         vsg::dvec3 side, axis;
         capsuleLateralFrame(dir, side, axis);
         loftRingPair(mesh, bottom, side, axis, top, side, axis, radius, segments);
-        if (includeBottom) appendFullDisk(mesh, bottom, side, axis, radius, segments, true);
-        appendFullDisk(mesh, top, side, axis, radius, segments, false);
+        const bool diskAtBottom = forward ? includeStartCap : includeEndCap;
+        const bool diskAtTop = forward ? includeEndCap : includeStartCap;
+        if (includeBottom && diskAtBottom) appendFullDisk(mesh, bottom, side, axis, radius, segments, true);
+        if (diskAtTop) appendFullDisk(mesh, top, side, axis, radius, segments, false);
         return;
     }
 
@@ -308,8 +316,10 @@ void appendStadiumPrism(TriangleMesh& mesh,
                        tipPosA - perp * radius, topA - perp * radius,
                        topB - perp * radius, tipPosB - perp * radius, -perp);
 
-    appendVerticalHemiCylinder(mesh, tipPosA, dirA, -alongPlanar, radius, height, segments);
-    appendVerticalHemiCylinder(mesh, tipPosB, dirB, alongPlanar, radius, height, segments);
+    if (includeStartCap)
+        appendVerticalHemiCylinder(mesh, tipPosA, dirA, -alongPlanar, radius, height, segments);
+    if (includeEndCap)
+        appendVerticalHemiCylinder(mesh, tipPosB, dirB, alongPlanar, radius, height, segments);
 }
 
 void appendFlatNoseSweep(TriangleMesh& mesh,
@@ -317,9 +327,12 @@ void appendFlatNoseSweep(TriangleMesh& mesh,
                          const ToolPose& tipB,
                          double radius,
                          double height,
-                         int segments)
+                         int segments,
+                         bool includeStartCap = true,
+                         bool includeEndCap = true)
 {
-    appendStadiumPrism(mesh, tipA, tipB, radius, height, segments);
+    appendStadiumPrism(mesh, tipA, tipB, radius, height, segments, true, includeStartCap,
+                       includeEndCap);
 }
 
 // Quarter-torus fillet loft between flat tip rim and outer shank rim.
@@ -433,7 +446,9 @@ void appendBullNoseSweep(TriangleMesh& mesh,
                          const ToolPose& tipB,
                          double radius,
                          double height,
-                         int segments)
+                         int segments,
+                         bool includeStartCap = true,
+                         bool includeEndCap = true)
 {
     if (radius <= 0.0) return;
     if (segments < 3) segments = 3;
@@ -461,7 +476,8 @@ void appendBullNoseSweep(TriangleMesh& mesh,
     const vsg::dvec3 dirB = normalizeOr(tipB.direction, vsg::dvec3(0.0, 0.0, 1.0));
     shankA.position = tipA.position + dirA * fillet;
     shankB.position = tipB.position + dirB * fillet;
-    appendStadiumPrism(mesh, shankA, shankB, radius, height, segments, false);
+    appendStadiumPrism(mesh, shankA, shankB, radius, height, segments, false, includeStartCap,
+                       includeEndCap);
 }
 
 void appendHemisphere(TriangleMesh& mesh,
@@ -471,7 +487,8 @@ void appendHemisphere(TriangleMesh& mesh,
                       const vsg::dvec3& axis,
                       double radius,
                       int azimuthSegments,
-                      int stacks)
+                      int stacks,
+                      bool motionCap = false)
 {
     if (radius <= 0.0 || azimuthSegments < 3 || stacks < 1) return;
 
@@ -511,7 +528,7 @@ void appendHemisphere(TriangleMesh& mesh,
                 const int k1 = (k + 1) % azimuthSegments;
                 addOrientedTriangle(mesh, a[static_cast<std::size_t>(k)],
                                     a[static_cast<std::size_t>(k1)], b[0],
-                                    a[static_cast<std::size_t>(k)] - centre);
+                                    a[static_cast<std::size_t>(k)] - centre, motionCap);
             }
         }
         else
@@ -522,7 +539,7 @@ void appendHemisphere(TriangleMesh& mesh,
                 stitchOrientedQuad(mesh,
                                    a[static_cast<std::size_t>(k)], a[static_cast<std::size_t>(k1)],
                                    b[static_cast<std::size_t>(k1)], b[static_cast<std::size_t>(k)],
-                                   a[static_cast<std::size_t>(k)] - centre);
+                                   a[static_cast<std::size_t>(k)] - centre, motionCap);
             }
         }
     }
@@ -544,7 +561,9 @@ void appendSphereCapsule(TriangleMesh& mesh,
                          const ToolPose& tipA,
                          const ToolPose& tipB,
                          double radius,
-                         int azimuthSegments)
+                         int azimuthSegments,
+                         bool includeStartCap = true,
+                         bool includeEndCap = true)
 {
     if (radius <= 0.0) return;
     if (azimuthSegments < 3) azimuthSegments = 3;
@@ -558,8 +577,10 @@ void appendSphereCapsule(TriangleMesh& mesh,
     capsuleLateralFrame(along, side, axis);
 
     appendCapsuleCylinder(mesh, cA, cB, side, axis, radius, azimuthSegments);
-    appendHemisphere(mesh, cA, -along, side, axis, radius, azimuthSegments, capRevolveSteps);
-    appendHemisphere(mesh, cB, along, side, axis, radius, azimuthSegments, capRevolveSteps);
+    if (includeStartCap)
+        appendHemisphere(mesh, cA, -along, side, axis, radius, azimuthSegments, capRevolveSteps, true);
+    if (includeEndCap)
+        appendHemisphere(mesh, cB, along, side, axis, radius, azimuthSegments, capRevolveSteps, true);
 }
 
 void appendTopDisc(TriangleMesh& mesh,
@@ -581,10 +602,11 @@ void appendLowerHemisphere(TriangleMesh& mesh,
                            const vsg::dvec3& toolDir,
                            double radius,
                            int azimuthSegments,
-                           int stacks)
+                           int stacks,
+                           bool motionCap = false)
 {
     TriangleMesh temp;
-    appendHemisphere(temp, centre, outward, side, axis, radius, azimuthSegments, stacks);
+    appendHemisphere(temp, centre, outward, side, axis, radius, azimuthSegments, stacks, motionCap);
     for (const MeshTriangle& tri : temp.triangles)
     {
         const vsg::dvec3 c(
@@ -601,7 +623,9 @@ void appendBallNoseSweep(TriangleMesh& mesh,
                          const ToolPose& tipB,
                          double radius,
                          double height,
-                         int azimuthSegments)
+                         int azimuthSegments,
+                         bool includeStartCap = true,
+                         bool includeEndCap = true)
 {
     if (radius <= 0.0) return;
     if (azimuthSegments < 3) azimuthSegments = 3;
@@ -629,20 +653,24 @@ void appendBallNoseSweep(TriangleMesh& mesh,
     if (std::abs(vsg::dot(along, midDir)) > 0.92)
     {
         appendCapsuleCylinder(mesh, cA, cB, side, axis, radius, azimuthSegments);
-        appendHemisphere(mesh, cA, -dirA, tipSideA, tipAxisA, radius, azimuthSegments,
-                         capRevolveSteps);
-        appendHemisphere(mesh, cB, -dirB, tipSideB, tipAxisB, radius, azimuthSegments,
-                         capRevolveSteps);
+        if (includeStartCap)
+            appendHemisphere(mesh, cA, -dirA, tipSideA, tipAxisA, radius, azimuthSegments,
+                             capRevolveSteps, true);
+        if (includeEndCap)
+            appendHemisphere(mesh, cB, -dirB, tipSideB, tipAxisB, radius, azimuthSegments,
+                             capRevolveSteps, true);
     }
     else
     {
         // Lower half of the motion capsule only. The upper half is inside the
         // shank and is a second Z-lid at the ball equator.
-        appendVerticalHemiCylinder(mesh, cA, along, -midDir, radius, span, azimuthSegments);
-        appendLowerHemisphere(mesh, cA, -along, side, axis, dirA, radius, azimuthSegments,
-                              capRevolveSteps);
-        appendLowerHemisphere(mesh, cB, along, side, axis, dirB, radius, azimuthSegments,
-                              capRevolveSteps);
+        appendVerticalHemiCylinder(mesh, cA, along, -midDir, radius, span, azimuthSegments, false);
+        if (includeStartCap)
+            appendLowerHemisphere(mesh, cA, -along, side, axis, dirA, radius, azimuthSegments,
+                                  capRevolveSteps, true);
+        if (includeEndCap)
+            appendLowerHemisphere(mesh, cB, along, side, axis, dirB, radius, azimuthSegments,
+                                  capRevolveSteps, true);
     }
 
     if (height <= 0.0) return;
@@ -650,8 +678,10 @@ void appendBallNoseSweep(TriangleMesh& mesh,
     const vsg::dvec3 topA = cA + dirA * height;
     const vsg::dvec3 topB = cB + dirB * height;
 
-    loftRingPair(mesh, cA, tipSideA, tipAxisA, topA, tipSideA, tipAxisA, radius, azimuthSegments);
-    loftRingPair(mesh, cB, tipSideB, tipAxisB, topB, tipSideB, tipAxisB, radius, azimuthSegments);
+    if (includeStartCap)
+        loftRingPair(mesh, cA, tipSideA, tipAxisA, topA, tipSideA, tipAxisA, radius, azimuthSegments);
+    if (includeEndCap)
+        loftRingPair(mesh, cB, tipSideB, tipAxisB, topB, tipSideB, tipAxisB, radius, azimuthSegments);
     appendStadiumFace(mesh, topA, topB, midDir, radius, azimuthSegments, false);
 }
 
@@ -695,34 +725,8 @@ void appendMeshAtPose(TriangleMesh& dest, const TriangleMesh& local, const ToolP
         const vsg::dvec3 b = xform(tri.v1);
         const vsg::dvec3 c = xform(tri.v2);
         const vsg::dvec3 n = xformN(tri.normal);
-        addOrientedTriangle(dest, a, b, c, n);
+        addOrientedTriangle(dest, a, b, c, n, tri.motionCap());
     }
-}
-
-// Grinding display/commit stores radial as pose.direction (local +Z). Rebuild the
-// tool frame: spindle (local +X) ≈ world +X projected into the plane ⊥ radial.
-void grindingWheelFrame(const ToolPose& pose, vsg::dvec3& x, vsg::dvec3& y, vsg::dvec3& z)
-{
-    z = normalizeOr(pose.direction, vsg::dvec3(0.0, 0.0, 1.0));
-    vsg::dvec3 prefer(1.0, 0.0, 0.0);
-    if (std::abs(vsg::dot(prefer, z)) > 0.95) prefer = vsg::dvec3(0.0, 1.0, 0.0);
-    x = normalizeOr(prefer - z * vsg::dot(prefer, z), vsg::dvec3(1.0, 0.0, 0.0));
-    y = normalizeOr(vsg::cross(z, x), vsg::dvec3(0.0, 1.0, 0.0));
-    x = normalizeOr(vsg::cross(y, z), x);
-    z = normalizeOr(vsg::cross(x, y), z);
-}
-
-// Local cutter triangle (origin = base mid / CL): base ±halfBase on +X, vertex
-// at (0,0,−H) toward −Z.
-void grindingWheelTriangleLocal(double height, double vertexAngleDeg, vsg::dvec3& baseL,
-                                vsg::dvec3& vertex, vsg::dvec3& baseR)
-{
-    const float hb = grindingWheelHalfBase(static_cast<float>(height),
-                                           static_cast<float>(vertexAngleDeg));
-    const double halfBase = static_cast<double>(hb);
-    baseL = vsg::dvec3(-halfBase, 0.0, 0.0);
-    vertex = vsg::dvec3(0.0, 0.0, -height);
-    baseR = vsg::dvec3(halfBase, 0.0, 0.0);
 }
 
 vsg::dvec3 grindingWheelXform(const vsg::dvec3& local, const vsg::dvec3& origin,
@@ -731,39 +735,54 @@ vsg::dvec3 grindingWheelXform(const vsg::dvec3& local, const vsg::dvec3& origin,
     return origin + x * local.x + y * local.y + z * local.z;
 }
 
-// Place the isosceles cutter triangle at each path station, connect matching
-// edges with ruled quads, and close with flat triangular caps only at the two
-// ends (no revolved caps, no mid-station caps).
+// One mill frame per pose (analytic feed, else neighbour chord). Dual
+// incoming/outgoing stations at the same tip were what twisted the 6-gon
+// when short helix steps made those chords disagree.
 void appendGrindingWheelPath(TriangleMesh& mesh,
                              const std::vector<ToolPose>& poses,
-                             double height,
-                             double vertexAngleDeg,
-                             double /*shankRadius*/,
-                             double /*shankLength*/,
-                             int /*segments*/)
+                             const GrindingWheelProfile& wheel)
 {
     if (poses.size() < 2) return;
-    if (!(height > 0.0)) return;
-    if (!(grindingWheelHalfBase(static_cast<float>(height),
-                                static_cast<float>(vertexAngleDeg)) > 0.0f))
-        return;
 
-    vsg::dvec3 localL, localV, localR;
-    grindingWheelTriangleLocal(height, vertexAngleDeg, localL, localV, localR);
+    vsg::dvec3 local[6];
+    const int n = grindingWheelLocalLoop(wheel, local);
+    if (n < 4) return;
 
-    struct Tri
+    struct Station
     {
-        vsg::dvec3 p0, p1, p2;
+        int n = 0;
+        vsg::dvec3 p[6];
+        vsg::dvec3 y{0.0, 1.0, 0.0};
     };
-    std::vector<Tri> stations;
-    stations.reserve(poses.size());
-    for (const ToolPose& pose : poses)
-    {
+
+    auto stationAlong = [&](std::size_t i) {
+        if (vsg::length(poses[i].feed) > 1.0e-12) return poses[i].feed;
+        if (i + 1 < poses.size()) return poses[i + 1].position - poses[i].position;
+        return poses[i].position - poses[i - 1].position;
+    };
+
+    auto place = [&](const ToolPose& pose, const vsg::dvec3& along,
+                     const vsg::dvec3* prevY) {
         vsg::dvec3 x, y, z;
-        grindingWheelFrame(pose, x, y, z);
-        stations.push_back({grindingWheelXform(localL, pose.position, x, y, z),
-                            grindingWheelXform(localV, pose.position, x, y, z),
-                            grindingWheelXform(localR, pose.position, x, y, z)});
+        grindingWheelMotionFrame(pose.direction, along, x, y, z, prevY);
+        Station s;
+        s.n = n;
+        s.y = y;
+        for (int i = 0; i < n; ++i)
+            s.p[i] = grindingWheelXform(local[i], pose.position, x, y, z);
+        return s;
+    };
+
+    std::vector<Station> stations;
+    stations.reserve(poses.size());
+    const vsg::dvec3* prevY = nullptr;
+    vsg::dvec3 prevYStorage(0.0, 1.0, 0.0);
+    for (std::size_t i = 0; i < poses.size(); ++i)
+    {
+        const Station s = place(poses[i], stationAlong(i), prevY);
+        stations.push_back(s);
+        prevYStorage = s.y;
+        prevY = &prevYStorage;
     }
 
     const vsg::dvec3 alongStart =
@@ -771,30 +790,38 @@ void appendGrindingWheelPath(TriangleMesh& mesh,
     const vsg::dvec3 alongEnd = normalizeOr(
         poses.back().position - poses[poses.size() - 2].position, alongStart);
 
-    auto triCentroid = [](const Tri& t) { return (t.p0 + t.p1 + t.p2) * (1.0 / 3.0); };
+    auto centroid = [](const Station& s) {
+        vsg::dvec3 c(0.0, 0.0, 0.0);
+        for (int i = 0; i < s.n; ++i) c += s.p[i];
+        return c / static_cast<double>(s.n);
+    };
 
-    // End caps: outward = away from the adjacent station (into free space).
+    auto fanCap = [&](const Station& s, const vsg::dvec3& outward) {
+        for (int i = 1; i + 1 < s.n; ++i)
+            addOrientedTriangle(mesh, s.p[0], s.p[i], s.p[i + 1], outward, true);
+    };
+
     {
-        const vsg::dvec3 c0 = triCentroid(stations.front());
-        const vsg::dvec3 c1 = triCentroid(stations[1]);
+        const vsg::dvec3 c0 = centroid(stations.front());
+        const vsg::dvec3 c1 = centroid(stations[1]);
         vsg::dvec3 startOut = c0 - c1;
         if (vsg::length(startOut) <= 1.0e-12) startOut = -alongStart;
-        addOrientedTriangle(mesh, stations.front().p0, stations.front().p1, stations.front().p2,
-                            startOut);
+        fanCap(stations.front(), startOut);
 
-        const vsg::dvec3 cN = triCentroid(stations.back());
-        const vsg::dvec3 cPrev = triCentroid(stations[stations.size() - 2]);
+        const vsg::dvec3 cN = centroid(stations.back());
+        const vsg::dvec3 cPrev = centroid(stations[stations.size() - 2]);
         vsg::dvec3 endOut = cN - cPrev;
         if (vsg::length(endOut) <= 1.0e-12) endOut = alongEnd;
-        addOrientedTriangle(mesh, stations.back().p0, stations.back().p2, stations.back().p1,
-                            endOut);
+        fanCap(stations.back(), endOut);
     }
 
     for (std::size_t i = 0; i + 1 < stations.size(); ++i)
     {
-        const Tri& a = stations[i];
-        const Tri& b = stations[i + 1];
-        const vsg::dvec3 localC = (a.p0 + a.p1 + a.p2 + b.p0 + b.p1 + b.p2) * (1.0 / 6.0);
+        const Station& a = stations[i];
+        const Station& b = stations[i + 1];
+        vsg::dvec3 localC(0.0, 0.0, 0.0);
+        for (int k = 0; k < a.n; ++k) localC += a.p[k] + b.p[k];
+        localC /= static_cast<double>(a.n * 2);
 
         auto sideOut = [&](const vsg::dvec3& p0, const vsg::dvec3& p1, const vsg::dvec3& q0,
                            const vsg::dvec3& q1) {
@@ -804,23 +831,13 @@ void appendGrindingWheelPath(TriangleMesh& mesh,
             return n;
         };
 
-        stitchOrientedQuad(mesh, a.p0, a.p1, b.p1, b.p0, sideOut(a.p0, a.p1, b.p0, b.p1));
-        stitchOrientedQuad(mesh, a.p1, a.p2, b.p2, b.p1, sideOut(a.p1, a.p2, b.p1, b.p2));
-        stitchOrientedQuad(mesh, a.p2, a.p0, b.p0, b.p2, sideOut(a.p2, a.p0, b.p2, b.p0));
+        for (int e = 0; e < a.n; ++e)
+        {
+            const int e1 = (e + 1) % a.n;
+            stitchOrientedQuad(mesh, a.p[e], a.p[e1], b.p[e1], b.p[e],
+                               sideOut(a.p[e], a.p[e1], b.p[e], b.p[e1]));
+        }
     }
-}
-
-void appendGrindingWheelSweep(TriangleMesh& mesh,
-                              const ToolPose& tipA,
-                              const ToolPose& tipB,
-                              double height,
-                              double vertexAngleDeg,
-                              double shankRadius,
-                              double shankLength,
-                              int segments)
-{
-    appendGrindingWheelPath(mesh, std::vector<ToolPose>{tipA, tipB}, height, vertexAngleDeg,
-                            shankRadius, shankLength, segments);
 }
 
 void SweptVolume::appendSegment(ToolType type,
@@ -831,10 +848,11 @@ void SweptVolume::appendSegment(ToolType type,
                                 int circleSegments,
                                 float vertexAngleDeg,
                                 float shankRadius,
-                                float shankLength)
+                                float shankLength,
+                                GrindingWheelProfile wheel)
 {
     appendPath(type, radius, height, std::vector<ToolPose>{tipA, tipB}, circleSegments,
-               vertexAngleDeg, shankRadius, shankLength);
+               vertexAngleDeg, shankRadius, shankLength, wheel);
 }
 
 void SweptVolume::appendPath(ToolType type,
@@ -844,9 +862,19 @@ void SweptVolume::appendPath(ToolType type,
                              int circleSegments,
                              float vertexAngleDeg,
                              float shankRadius,
-                             float shankLength)
+                             float shankLength,
+                             GrindingWheelProfile wheel)
 {
-    if (type == ToolType::None || radius <= 0.0f || poses.size() < 2) return;
+    (void)vertexAngleDeg;
+    (void)shankRadius;
+    (void)shankLength;
+    if (type == ToolType::None || poses.size() < 2) return;
+    if (type == ToolType::GrindingWheel)
+    {
+        if (!wheel.valid()) return;
+    }
+    else if (radius <= 0.0f)
+        return;
 
     const double R = static_cast<double>(radius);
     const double H = static_cast<double>(height);
@@ -854,9 +882,7 @@ void SweptVolume::appendPath(ToolType type,
 
     if (type == ToolType::GrindingWheel)
     {
-        appendGrindingWheelPath(_mesh, poses, R, static_cast<double>(vertexAngleDeg),
-                                static_cast<double>(shankRadius), static_cast<double>(shankLength),
-                                circleSegments);
+        appendGrindingWheelPath(_mesh, poses, wheel);
     }
     else
     {
@@ -864,19 +890,21 @@ void SweptVolume::appendPath(ToolType type,
         {
             const ToolPose& tipA = poses[i];
             const ToolPose& tipB = poses[i + 1];
+            const bool startCap = (i == 0);
+            const bool endCap = (i + 2 == poses.size());
             switch (type)
             {
             case ToolType::Sphere:
-                appendSphereCapsule(_mesh, tipA, tipB, R, circleSegments);
+                appendSphereCapsule(_mesh, tipA, tipB, R, circleSegments, startCap, endCap);
                 break;
             case ToolType::BallNose:
-                appendBallNoseSweep(_mesh, tipA, tipB, R, H, circleSegments);
+                appendBallNoseSweep(_mesh, tipA, tipB, R, H, circleSegments, startCap, endCap);
                 break;
             case ToolType::FlatNose:
-                appendFlatNoseSweep(_mesh, tipA, tipB, R, H, circleSegments);
+                appendFlatNoseSweep(_mesh, tipA, tipB, R, H, circleSegments, startCap, endCap);
                 break;
             case ToolType::BullNose:
-                appendBullNoseSweep(_mesh, tipA, tipB, R, H, circleSegments);
+                appendBullNoseSweep(_mesh, tipA, tipB, R, H, circleSegments, startCap, endCap);
                 break;
             case ToolType::GrindingWheel:
             case ToolType::None:

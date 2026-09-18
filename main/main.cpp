@@ -59,6 +59,7 @@
 #include "StlImporter.h"
 #include "ThreeMfImporter.h"
 #include "ToolManagerDialog.h"
+#include "UcamVsgGuard.h"
 #include "ToolTracker.h"
 #include "ToolType.h"
 #include "UcamDebug.h"
@@ -283,7 +284,7 @@ void useLightSpinArrows(QAbstractSpinBox* spin)
 int main(int argc, char* argv[])
 try
 {
-    QApplication application(argc, argv);
+    app::UcamApplication application(argc, argv);
 
     const QColor themeColor(0x19, 0x22, 0x3b);
     const QColor textColor(0xe8, 0xee, 0xf4);
@@ -446,12 +447,13 @@ try
     auto mainWindow = new QMainWindow();
     mainWindow->setWindowTitle("UCAM");
 
-    auto viewer = vsgQt::Viewer::create();
+    auto viewer = app::SafeViewer::create();
+    application.addViewer(viewer);
 
     // Create the vsgQt QWindow but do not initialize Vulkan yet. Embedding via
     // createWindowContainer recreates the native view; a surface created before
     // that is destroyed and the viewer then quits.
-    auto window = new vsgQt::Window(viewer, windowTraits);
+    auto window = new app::SafeVsgWindow(viewer, windowTraits);
     window->setTitle("UCAM");
 
     auto renderWidget = QWidget::createWindowContainer(window, mainWindow);
@@ -892,10 +894,13 @@ try
                      });
     QObject::connect(simPanel, &app::SimulationPanel::toolLibraryPreviewRequested,
                      [ensureToolManager](int toolType, double radius, double cuttingLength,
-                                         double shankLength, double shankRadius) {
+                                         double shankLength, double shankRadius, double tipWidth,
+                                         double shoulderWidth, double taperHeight,
+                                         double shoulderHeight) {
                          auto* manager = ensureToolManager();
                          manager->previewTool(static_cast<app::ToolType>(toolType), radius,
-                                              cuttingLength, shankLength, shankRadius);
+                                              cuttingLength, shankLength, shankRadius, tipWidth,
+                                              shoulderWidth, taperHeight, shoulderHeight);
                          manager->show();
                          manager->raise();
                          manager->activateWindow();

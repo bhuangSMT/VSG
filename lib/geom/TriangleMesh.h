@@ -22,6 +22,14 @@ struct MeshTriangle
     vsg::vec3 v0;
     vsg::vec3 v1;
     vsg::vec3 v2;
+    // bit0: motion-end cap (feed-direction hemi-cylinder / capsule hemi).
+    // Importers leave this 0. SweptVolume sets it so boolean stats can tell
+    // a cap hit from a side / cutting-face hit.
+    std::uint8_t flags = 0;
+
+    static constexpr std::uint8_t flagMotionCap = 1;
+
+    bool motionCap() const { return (flags & flagMotionCap) != 0; }
 };
 
 struct TriangleMesh

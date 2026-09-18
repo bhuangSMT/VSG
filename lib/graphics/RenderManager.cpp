@@ -51,6 +51,27 @@ bool skipCutSplatEnds(bool /*cutFaceLive*/)
     return cutMeshEnabled();
 }
 
+// Sub-cell overlap so consecutive closed sweeps are not coincident at the
+// shared pose. Stays below one grid tick and below a quarter of the segment.
+double backExtendEpsilon(const RayModel* model, double radius, double segmentLen)
+{
+    double eps = std::max(1.0e-6, radius * 1.0e-3);
+    if (model)
+    {
+        double unit = 0.0;
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            const RayGrid* g = model->grid(axis);
+            if (!g || !(g->unit > 0.0f)) continue;
+            const double u = static_cast<double>(g->unit);
+            if (unit <= 0.0 || u < unit) unit = u;
+        }
+        if (unit > 0.0) eps = std::min(eps, 0.25 * unit);
+    }
+    if (segmentLen > 0.0) eps = std::min(eps, 0.25 * segmentLen);
+    return eps;
+}
+
 // Patch / rebuild cut-face GPU overlay only while Cut mesh display is on.
 // Off means cut-tagged splat disks only — skip remesh entirely.
 void syncCutFaceOverlay(GaussianSplatCache& cache, const RayModel& rayModel, int cutStride,
@@ -1336,6 +1357,7 @@ void RenderManager::clear()
     _sweptVolume.reset();
     _cutSweep.reset();
     _lastToolPose.reset();
+    _lastWheelY.reset();
     clearTrajectory();
     _current.reset();
     clearRayModels();
@@ -1350,6 +1372,7 @@ void RenderManager::setToolType(ToolType type)
     if (type == ToolType::None)
     {
         _lastToolPose.reset();
+        _lastWheelY.reset();
         clearSweptVolume();
     }
     else
@@ -1397,6 +1420,17 @@ float RenderManager::worldToolLength() const
     double length = Parameter::instance().toolLength();
     if (length <= 0.0) length = static_cast<double>(worldToolRadius()) * 2.8;
     return worldFromModelLength(length);
+}
+
+GrindingWheelProfile RenderManager::worldGrindingWheelProfile() const
+{
+    const auto& store = Parameter::instance();
+    GrindingWheelProfile wheel;
+    wheel.tipWidth = worldFromModelLength(store.toolWheelTipWidth());
+    wheel.shoulderWidth = worldFromModelLength(store.toolWheelShoulderWidth());
+    wheel.taperHeight = worldFromModelLength(store.toolWheelTaperHeight());
+    wheel.shoulderHeight = worldFromModelLength(store.toolWheelShoulderHeight());
+    return wheel;
 }
 
 vsg::ref_ptr<vsg::Node> RenderManager::toolMeshNode(const TriangleMesh& mesh,
@@ -1467,7 +1501,8 @@ void RenderManager::rebuildTool(bool preservePose)
     const float shankLength =
         worldFromModelLength(Parameter::instance().toolShankLength());
     const TriangleMesh mesh = createToolMesh(_toolType, radius, height, 48, 24, 12,
-                                             vertexAngle, shankRadius, shankLength);
+                                             vertexAngle, shankRadius, shankLength,
+                                             worldGrindingWheelProfile());
     auto drawable = toolMeshNode(mesh, _toolColor);
     if (!drawable) return;
 
@@ -1481,7 +1516,8 @@ void RenderManager::rebuildTool(bool preservePose)
             drawnShankRadius = radius * 0.6f;
         TriangleMesh shankMesh;
         if (_toolType == ToolType::GrindingWheel)
-            shankMesh = createGrindingShankMesh(radius, drawnShankRadius, shankLength);
+            shankMesh = createGrindingShankMesh(worldGrindingWheelProfile().shoulderHeight,
+                                               drawnShankRadius, shankLength);
         else
         {
             const float z0 = (_toolType == ToolType::Sphere)
@@ -1535,10 +1571,22 @@ void RenderManager::setToolNodeAttached(bool attached)
     }
 }
 
-void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction)
+void RenderManager::setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction,
+                                const vsg::dvec3* alongHint)
 {
     vsg::dvec3 tip, x, y, z;
     if (!referencePoseToTipFrame(position, direction, tip, x, y, z)) return;
+    if (_toolType == ToolType::GrindingWheel)
+    {
+        vsg::dvec3 along(0.0, 0.0, 0.0);
+        if (alongHint && vsg::length(*alongHint) > 1.0e-12)
+            along = *alongHint;
+        else if (_lastToolPose)
+            along = tip - _lastToolPose->position;
+        const vsg::dvec3* prevY = _lastWheelY ? &*_lastWheelY : nullptr;
+        if (vsg::length(along) > 1.0e-12 || prevY)
+            grindingWheelMotionFrame(z, along, x, y, z, prevY);
+    }
     commitToolTip(tip, x, y, z);
 }
 
@@ -1555,9 +1603,9 @@ bool RenderManager::referencePoseToTipFrame(const vsg::dvec3& position, const vs
 
     if (_toolType == ToolType::GrindingWheel)
     {
-        // CL position is the triangle-base midpoint. `direction` is the spindle
-        // (parallel to the cylinder axis). Local +Z is radial from that axis
-        // through the CL point so the vertex points toward the stock.
+        // CL is the shoulder-rectangle midpoint. Table `direction` is the
+        // spindle; local +Z is radial from that axis through the CL so the
+        // outer rim points toward the stock. Feed yaw is applied afterwards.
         if (zLen <= 0.0) z = vsg::dvec3(1.0, 0.0, 0.0);
         x = z; // spindle = local +X
         BoundingBox world = worldStockAabb();
@@ -1628,7 +1676,20 @@ void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
     {
         if (!referencePoseToTipFrame(ref.position, ref.direction, tip, x, y, z)) return;
         // Grinding sweep stores radial as direction (local +Z); others store axis.
-        tipPoses.push_back(ToolPose{tip, z});
+        ToolPose tipPose{tip, z};
+        tipPose.feed = ref.feed;
+        tipPoses.push_back(tipPose);
+    }
+
+    if (_toolType == ToolType::GrindingWheel && tipPoses.size() >= 2)
+    {
+        const ToolPose& last = tipPoses.back();
+        const ToolPose& prev = tipPoses[tipPoses.size() - 2];
+        const vsg::dvec3 along = (vsg::length(last.feed) > 1.0e-12)
+                                     ? last.feed
+                                     : (last.position - prev.position);
+        const vsg::dvec3* prevY = _lastWheelY ? &*_lastWheelY : nullptr;
+        grindingWheelMotionFrame(z, along, x, y, z, prevY);
     }
 
     _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
@@ -1636,6 +1697,10 @@ void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
                                         z.x, z.y, z.z, 0.0,
                                         tip.x, tip.y, tip.z, 1.0);
     _lastToolPose = tipPoses.back();
+    if (_toolType == ToolType::GrindingWheel)
+        _lastWheelY = y;
+    else
+        _lastWheelY.reset();
     for (const ToolPose& p : tipPoses)
         appendToolTrajectory(p.position);
 
@@ -1840,6 +1905,10 @@ void RenderManager::commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, co
 
     const ToolPose pose{tip, z};
     _lastToolPose = pose;
+    if (_toolType == ToolType::GrindingWheel)
+        _lastWheelY = y;
+    else
+        _lastWheelY.reset();
     appendToolTrajectory(tip);
 
     if (Parameter::instance().booleanOp() == BooleanOp::Inspection)
@@ -1932,18 +2001,36 @@ bool RenderManager::recordSweepPath(const std::vector<ToolPose>& tipPoses)
 
     // Seed-only: remember the first station without cutting when nothing was
     // anchored yet and the caller only handed a path that starts here.
-    if (!sweep.lastPose())
+    const bool continuing = static_cast<bool>(sweep.lastPose());
+    if (!continuing)
         sweep.setLastPose(tipPoses.front());
 
     const float radius = worldToolRadius();
 
+    // Consecutive booleans share a pose. Offset the first station back along
+    // the incoming feed so this closed solid overlaps the previous leading cap
+    // instead of sitting on it. Caps stay; the operand stays watertight.
+    std::vector<ToolPose> path = tipPoses;
+    if (continuing && path.size() >= 2)
+    {
+        const vsg::dvec3 delta = path[1].position - path[0].position;
+        const double segLen = vsg::length(delta);
+        if (segLen > 1.0e-12)
+        {
+            const RayModel* model = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
+            const double eps = backExtendEpsilon(model, static_cast<double>(radius), segLen);
+            path[0].position -= (delta / segLen) * eps;
+        }
+    }
+
     // Boolean always uses this one path solid. Stock (_booleanRayModel) already
     // holds prior cuts; re-walking the whole history would only grow cost.
     SweptVolume step;
-    step.appendPath(_toolType, radius, worldToolLength(), tipPoses, 8,
+    step.appendPath(_toolType, radius, worldToolLength(), path, SweptVolume::kCircleSegments,
                     static_cast<float>(Parameter::instance().toolVertexAngleDeg()),
                     worldFromModelLength(Parameter::instance().toolShankRadius()),
-                    worldFromModelLength(Parameter::instance().toolShankLength()));
+                    worldFromModelLength(Parameter::instance().toolShankLength()),
+                    worldGrindingWheelProfile());
     if (step.empty())
     {
         sweep.setLastPose(tipPoses.back());
@@ -1981,7 +2068,8 @@ bool RenderManager::placeInspectionCutter(const ToolPose& pose, bool forceBoolea
         createToolMesh(_toolType, worldToolRadius(), worldToolLength(), 48, 24, 12,
                        static_cast<float>(Parameter::instance().toolVertexAngleDeg()),
                        worldFromModelLength(Parameter::instance().toolShankRadius()),
-                       worldFromModelLength(Parameter::instance().toolShankLength()));
+                       worldFromModelLength(Parameter::instance().toolShankLength()),
+                       worldGrindingWheelProfile());
     if (mesh.triangles.empty()) return false;
 
     transformTriangleMesh(mesh, _toolTransform->matrix);

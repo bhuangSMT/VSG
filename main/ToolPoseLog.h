@@ -22,6 +22,8 @@ struct ToolSample
     double a = 0.0;
     double b = 0.0;
     double c = 0.0;
+    bool hasFeed = false;
+    vsg::dvec3 feed{0.0, 0.0, 0.0};
 };
 
 // Same tool frame as RenderManager::setToolPose, then XYZ Tait-Bryan in degrees

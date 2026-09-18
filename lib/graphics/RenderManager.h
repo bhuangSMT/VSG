@@ -103,7 +103,8 @@ public:
     // Position is the sphere centre for ball nose / sphere, the fillet-torus
     // centre for bull nose, and the tip for flat nose. The sweep still uses
     // the tip (shifted down the axis by toolCenterOffset).
-    void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction);
+    void setToolPose(const vsg::dvec3& position, const vsg::dvec3& direction,
+                     const vsg::dvec3* alongHint = nullptr);
 
     // Advance along a polyline of reference poses (same convention as
     // setToolPose). Builds one swept solid through all stations (caps at the
@@ -260,6 +261,7 @@ private:
     float worldFromModelLength(double value) const;
     float worldToolRadius() const;
     float worldToolLength() const;
+    GrindingWheelProfile worldGrindingWheelProfile() const;
 
     vsg::ref_ptr<vsg::Node> toolMeshNode(const TriangleMesh& mesh,
                                          const vsg::vec4& color) const;
@@ -474,6 +476,8 @@ private:
     // Last tool tip / axis written by setToolPose, so Inspection can place a
     // cutter when the combo is selected without waiting for another move.
     std::optional<ToolPose> _lastToolPose;
+    // Last grinding-wheel +Y so a short / quantized step cannot flip the frame.
+    std::optional<vsg::dvec3> _lastWheelY;
 
     // What is drawn: _sourceRayModel, &_booleanRayModel, or &_inspectionRayModel.
     const RayModel* _rayModel = nullptr;

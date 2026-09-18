@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <QtCore/QPoint>
 #include <QtCore/QString>
@@ -52,8 +53,9 @@ public:
     // Match a Tool manager edit into the Simulation library table. Re-applies
     // the cutter when that row is the current selection.
     void updateLibraryEntry(int toolType, double radius, double cuttingLength,
-                            double shankLength, double shankRadius,
-                            double vertexAngleDeg = 0.0);
+                            double shankLength, double shankRadius, double tipWidth = 0.0,
+                            double shoulderWidth = 0.0, double taperHeight = 0.0,
+                            double shoulderHeight = 0.0);
 
     // Helix axis pick: Axis button in the Helix dialog arms this; ToolTracker
     // completes/cancels it and the dialog reopens.
@@ -68,7 +70,9 @@ signals:
     void unionOperationRequested();
     void inspectionOperationRequested();
     void toolLibraryPreviewRequested(int toolType, double radius, double cuttingLength,
-                                     double shankLength, double shankRadius);
+                                     double shankLength, double shankRadius, double tipWidth,
+                                     double shoulderWidth, double taperHeight,
+                                     double shoulderHeight);
     void toolLibraryApplied(int toolType, double radius, double cuttingLength, double shankLength,
                             double shankRadius);
 
@@ -136,6 +140,8 @@ private:
     double _helixHeight = 10.0;
     double _helixDt = 0.1;
     int _helixAxis = 0; // 0=X, 1=Y, 2=Z
+    // Analytic helix tangents, one per table row (nullopt for Interactive / APT).
+    std::vector<std::optional<vsg::dvec3>> _pathFeeds;
     QString _helixAxisStatus;
     bool _pickingHelixAxis = false;
     bool _reopenHelixDialog = false;

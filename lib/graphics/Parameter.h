@@ -67,9 +67,19 @@ public:
     double toolShankLength() const { return _toolShankLength; }
     void setToolShankLength(double length) { _toolShankLength = length; }
 
-    // Grinding wheel: isosceles-triangle vertex angle at the outer rim (degrees).
+    // Unused for current cutters; kept so older UI/session values still round-trip.
     double toolVertexAngleDeg() const { return _toolVertexAngleDeg; }
     void setToolVertexAngleDeg(double degrees) { _toolVertexAngleDeg = degrees; }
+
+    // Grinding wheel: tip width A, shoulder width B, taper height H1, rectangle H2.
+    double toolWheelTipWidth() const { return _toolWheelTipWidth; }
+    void setToolWheelTipWidth(double width) { _toolWheelTipWidth = width; }
+    double toolWheelShoulderWidth() const { return _toolWheelShoulderWidth; }
+    void setToolWheelShoulderWidth(double width) { _toolWheelShoulderWidth = width; }
+    double toolWheelTaperHeight() const { return _toolWheelTaperHeight; }
+    void setToolWheelTaperHeight(double height) { _toolWheelTaperHeight = height; }
+    double toolWheelShoulderHeight() const { return _toolWheelShoulderHeight; }
+    void setToolWheelShoulderHeight(double height) { _toolWheelShoulderHeight = height; }
 
     // Whether the swept-volume mesh is drawn in the scene. Generation always
     // runs while a tool is active; this only gates the VSG node.
@@ -113,6 +123,10 @@ private:
     double _toolShankRadius = 0.0;
     double _toolShankLength = 0.0;
     double _toolVertexAngleDeg = 60.0;
+    double _toolWheelTipWidth = 0.01;
+    double _toolWheelShoulderWidth = 0.06;
+    double _toolWheelTaperHeight = 0.035;
+    double _toolWheelShoulderHeight = 0.015;
     bool _sweptVolume = false;
     bool _showLastSweptVolumeOnly = true;
     bool _cutMeshDisplay = true;

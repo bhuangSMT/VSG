@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 #include <vector>
 
@@ -11,6 +13,7 @@
 
 #include "RayBoolean.h"
 #include "RayGrid.h"
+#include "UcamDebug.h"
 
 namespace app
 {
@@ -225,7 +228,7 @@ vsg::vec3 endpointNormal(const RayGrid& grid, std::size_t axis, std::uint32_t iu
 // neighbour cell. Returns false when the neighbour is empty / out of range.
 bool sampleNeighborNormal(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
                           std::uint32_t iv, int stride, bool enter, double along,
-                          vsg::vec3& outNormal)
+                          vsg::vec3& outNormal, double* outAlong = nullptr)
 {
     if (iu >= grid.width || iv >= grid.height) return false;
     const RaySlot& slot = grid.at(iu, iv);
@@ -252,6 +255,7 @@ bool sampleNeighborNormal(const RayGrid& grid, std::size_t axis, std::uint32_t i
     }
     if (!found) return false;
     outNormal = endpointNormal(grid, axis, iu, iv, stride, recorded, enter, bestAlong);
+    if (outAlong) *outAlong = bestAlong;
     return true;
 }
 
@@ -278,6 +282,18 @@ struct EdgeInfo
 {
     std::uint8_t mask = 0;
     float strength = 0.0f;
+    // The centre normal averaged with its non-crease neighbours. This is what
+    // the splat ships; mask and strength still describe the raw centre normal.
+    vsg::vec3 normal{0.0f, 0.0f, 0.0f};
+    // Unweighted mean of the same-face neighbours, and how many there were.
+    // Diagnostics only: unlike `normal` this ignores the crease ramp, so it
+    // still has a direction to compare against when the centre is an outlier.
+    vsg::vec3 neighborMean{0.0f, 0.0f, 0.0f};
+    int neighborCount = 0;
+    // How far this endpoint sits from the mean neighbour depth, in units of one
+    // strided cell. Diagnostics: tells a sub-resolution step apart from a real
+    // one, which is what decides whether merging it away is safe.
+    float stepCells = 0.0f;
 };
 
 EdgeInfo computeEdgeMask(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
@@ -290,29 +306,45 @@ EdgeInfo computeEdgeMask(const RayGrid& grid, std::size_t axis, std::uint32_t iu
     const std::size_t vAxis = (axis + 2) % 3;
 
     EdgeInfo info;
-    auto consider = [&](bool have, const vsg::vec3& neighborN, std::size_t worldAxis,
-                        bool positiveDir) {
+    info.normal = normal;
+
+    // Each cut records the cutter's surface normal, so where one bite's swept
+    // volume meets the next the stock face is stitched from two surfaces and
+    // the normal steps across the seam. Averaging in the neighbours weighted by
+    // 1 - strength smooths that step while a neighbour past the crease ramp
+    // contributes nothing, leaving real edges as sharp as before.
+    vsg::vec3 blended = normal;
+    double alongSum = 0.0;
+    auto consider = [&](bool have, const vsg::vec3& neighborN, double neighborAlong,
+                        std::size_t worldAxis, bool positiveDir, bool blendable) {
         if (!have) return;
         const float strength = edgeStrengthFromDot(vsg::dot(normal, neighborN));
         info.strength = std::max(info.strength, strength);
         if (strength > kEdgeBitMin) setWorldAxisBit(info.mask, worldAxis, positiveDir);
+        if (!blendable) return;
+        if (strength < 1.0f) blended += neighborN * (1.0f - strength);
+        info.neighborMean += neighborN;
+        alongSum += neighborAlong;
+        ++info.neighborCount;
     };
 
     vsg::vec3 nL, nR, nU, nD;
-    const bool hasL =
-        iu >= su && sampleNeighborNormal(grid, axis, iu - su, iv, stride, enter, along, nL);
-    const bool hasR = iu + su < grid.width &&
-                      sampleNeighborNormal(grid, axis, iu + su, iv, stride, enter, along, nR);
-    const bool hasU =
-        iv >= su && sampleNeighborNormal(grid, axis, iu, iv - su, stride, enter, along, nU);
-    const bool hasD = iv + su < grid.height &&
-                      sampleNeighborNormal(grid, axis, iu, iv + su, stride, enter, along, nD);
+    double aL = along, aR = along, aU = along, aD = along;
+    const bool hasL = iu >= su && sampleNeighborNormal(grid, axis, iu - su, iv, stride, enter,
+                                                       along, nL, &aL);
+    const bool hasR = iu + su < grid.width && sampleNeighborNormal(grid, axis, iu + su, iv,
+                                                                   stride, enter, along, nR, &aR);
+    const bool hasU = iv >= su && sampleNeighborNormal(grid, axis, iu, iv - su, stride, enter,
+                                                       along, nU, &aU);
+    const bool hasD = iv + su < grid.height && sampleNeighborNormal(grid, axis, iu, iv + su,
+                                                                    stride, enter, along, nD, &aD);
 
-    // UV steps map to world ±uAxis / ±vAxis.
-    consider(hasL, nL, uAxis, false);
-    consider(hasR, nR, uAxis, true);
-    consider(hasU, nU, vAxis, false);
-    consider(hasD, nD, vAxis, true);
+    // UV steps map to world ±uAxis / ±vAxis. These four sit on the same face,
+    // so they are the ones worth averaging with.
+    consider(hasL, nL, aL, uAxis, false, true);
+    consider(hasR, nR, aR, uAxis, true, true);
+    consider(hasU, nU, aU, vAxis, false, true);
+    consider(hasD, nD, aD, vAxis, true, true);
 
     // Along-axis: compare with the opposite face endpoint on the same ray when
     // it lies close enough to count as a sharp feature (thin wall / cut).
@@ -331,12 +363,175 @@ EdgeInfo computeEdgeMask(const RayGrid& grid, std::size_t axis, std::uint32_t iu
             const Normal3f& rec = enter ? span.endNormal : span.beginNormal;
             const vsg::vec3 otherN =
                 endpointNormal(grid, axis, iu, iv, stride, rec, !enter, other);
-            // Discontinuity toward the other end along the ray axis.
-            consider(true, otherN, axis, enter);
+            // Discontinuity toward the other end along the ray axis. This is
+            // the far side of a thin wall facing back at us, so it feeds the
+            // mask but must stay out of the average.
+            consider(true, otherN, other, axis, enter, false);
             break;
         }
     }
+
+    if (info.neighborCount > 0)
+    {
+        const double cell =
+            static_cast<double>(s) * std::max(grid.spacingU, grid.spacingV);
+        const double mean = alongSum / static_cast<double>(info.neighborCount);
+        if (cell > 1.0e-12)
+            info.stepCells = static_cast<float>(std::abs(along - mean) / cell);
+    }
+
+    // Every contributor has dot > kSharpDot with the centre, so the sum cannot
+    // cancel; the guard only covers a degenerate centre normal.
+    const float len2 =
+        blended.x * blended.x + blended.y * blended.y + blended.z * blended.z;
+    if (len2 >= 1.0e-12f) info.normal = blended * (1.0f / std::sqrt(len2));
     return info;
+}
+
+// UCAM_NORMAL_STATS accounting. An endpoint counts as an outlier when its
+// normal disagrees with the mean of its same-face neighbours by more than
+// kOutlierDeg while those neighbours agree with each other: a real crease keeps
+// the centre aligned with its own side, so only a lone bad normal trips this.
+constexpr float kOutlierDeg = 60.0f;
+constexpr float kNeighborAgreeDot = 0.80f;
+
+struct NormalStats
+{
+    std::atomic<std::uint64_t> total{0};
+    std::atomic<std::uint64_t> tested{0};
+    std::atomic<std::uint64_t> outliers{0};
+    std::atomic<std::uint64_t> outlierRecorded{0};
+    std::atomic<std::uint64_t> outlierEstimated{0};
+    std::atomic<std::uint64_t> outlierCut{0};
+    // |dot(normal, ray axis)| < 0.34 means the face is within ~20 degrees of
+    // parallel to the ray: the cast grazed it and the recorded normal is the
+    // least trustworthy there.
+    std::atomic<std::uint64_t> outlierGrazing{0};
+    std::atomic<std::uint64_t> outlierCap{0};
+    std::atomic<std::uint64_t> capAll{0};
+    std::atomic<std::uint64_t> grazingAll{0};
+    // Depth step between the outlier and its neighbours, in strided cells.
+    // Sub-cell steps are below what a disc can resolve and are the ones a
+    // merge could safely erase; anything past a cell is real relief.
+    std::atomic<std::uint64_t> stepUnder25{0};
+    std::atomic<std::uint64_t> stepUnder50{0};
+    std::atomic<std::uint64_t> stepUnder100{0};
+    std::atomic<std::uint64_t> stepOver100{0};
+
+    void reset()
+    {
+        total = 0;
+        tested = 0;
+        outliers = 0;
+        outlierRecorded = 0;
+        outlierEstimated = 0;
+        outlierCut = 0;
+        outlierGrazing = 0;
+        outlierCap = 0;
+        capAll = 0;
+        grazingAll = 0;
+        stepUnder25 = 0;
+        stepUnder50 = 0;
+        stepUnder100 = 0;
+        stepOver100 = 0;
+    }
+
+    void report(const char* phase) const
+    {
+        const auto t = total.load();
+        if (t == 0)
+        {
+            std::printf("normal stats [%s]: no endpoints written\n", phase);
+            std::fflush(stdout);
+            return;
+        }
+        const auto o = outliers.load();
+        const auto te = tested.load();
+        std::printf("normal stats [%s]: %llu endpoints, %llu testable, %llu outliers >%.0f deg "
+                    "(%.2f%%)\n",
+                    phase, static_cast<unsigned long long>(t),
+                    static_cast<unsigned long long>(te),
+                    static_cast<unsigned long long>(o), static_cast<double>(kOutlierDeg),
+                    te ? 100.0 * static_cast<double>(o) / static_cast<double>(te) : 0.0);
+        if (o == 0)
+        {
+            std::fflush(stdout);
+            return;
+        }
+        const auto rec = outlierRecorded.load();
+        std::printf("  source: %llu recorded (%.1f%%), %llu estimated (%.1f%%)\n",
+                    static_cast<unsigned long long>(rec),
+                    100.0 * static_cast<double>(rec) / static_cast<double>(o),
+                    static_cast<unsigned long long>(outlierEstimated.load()),
+                    100.0 * static_cast<double>(outlierEstimated.load()) /
+                        static_cast<double>(o));
+        std::printf("  cut ends: %llu (%.1f%%)   grazing: %llu (%.1f%%) vs %.1f%% overall\n"
+                    "  motion caps: %llu (%.1f%%) vs %.1f%% overall\n",
+                    static_cast<unsigned long long>(outlierCut.load()),
+                    100.0 * static_cast<double>(outlierCut.load()) / static_cast<double>(o),
+                    static_cast<unsigned long long>(outlierGrazing.load()),
+                    100.0 * static_cast<double>(outlierGrazing.load()) / static_cast<double>(o),
+                    100.0 * static_cast<double>(grazingAll.load()) / static_cast<double>(t),
+                    static_cast<unsigned long long>(outlierCap.load()),
+                    100.0 * static_cast<double>(outlierCap.load()) / static_cast<double>(o),
+                    100.0 * static_cast<double>(capAll.load()) / static_cast<double>(t));
+        const double od = static_cast<double>(o);
+        std::printf("  depth step vs neighbours: <0.25 cell %.1f%%, <0.5 %.1f%%, <1.0 %.1f%%, "
+                    ">=1.0 %.1f%%\n",
+                    100.0 * static_cast<double>(stepUnder25.load()) / od,
+                    100.0 * static_cast<double>(stepUnder50.load()) / od,
+                    100.0 * static_cast<double>(stepUnder100.load()) / od,
+                    100.0 * static_cast<double>(stepOver100.load()) / od);
+        std::fflush(stdout);
+    }
+};
+
+NormalStats& normalStats()
+{
+    static NormalStats stats;
+    return stats;
+}
+
+// Classify one endpoint against its neighbours. Cheap enough to inline, but
+// only called when the env gate is on.
+void recordNormalStat(const vsg::vec3& normal, const EdgeInfo& edge, std::size_t axis,
+                      bool recorded, bool cutEnd, bool motionCap)
+{
+    NormalStats& s = normalStats();
+    s.total.fetch_add(1, std::memory_order_relaxed);
+
+    const float axisDot = std::abs(normal[static_cast<int>(axis)]);
+    const bool grazing = axisDot < 0.34f;
+    if (grazing) s.grazingAll.fetch_add(1, std::memory_order_relaxed);
+    if (motionCap) s.capAll.fetch_add(1, std::memory_order_relaxed);
+
+    if (edge.neighborCount < 2) return;
+    const vsg::vec3 mean = edge.neighborMean;
+    const float len2 = mean.x * mean.x + mean.y * mean.y + mean.z * mean.z;
+    if (len2 < 1.0e-12f) return;
+    const vsg::vec3 meanN = mean * (1.0f / std::sqrt(len2));
+
+    // Neighbours must agree with each other, otherwise the centre sits on a
+    // genuine feature and disagreeing with the mean says nothing.
+    const float spread = std::sqrt(len2) / static_cast<float>(edge.neighborCount);
+    if (spread < kNeighborAgreeDot) return;
+    s.tested.fetch_add(1, std::memory_order_relaxed);
+
+    const float d = std::clamp(vsg::dot(normal, meanN), -1.0f, 1.0f);
+    if (d > std::cos(kOutlierDeg * 3.14159265f / 180.0f)) return;
+
+    s.outliers.fetch_add(1, std::memory_order_relaxed);
+    if (recorded) s.outlierRecorded.fetch_add(1, std::memory_order_relaxed);
+    else s.outlierEstimated.fetch_add(1, std::memory_order_relaxed);
+    if (cutEnd) s.outlierCut.fetch_add(1, std::memory_order_relaxed);
+    if (grazing) s.outlierGrazing.fetch_add(1, std::memory_order_relaxed);
+    if (motionCap) s.outlierCap.fetch_add(1, std::memory_order_relaxed);
+
+    const float step = edge.stepCells;
+    if (step < 0.25f) s.stepUnder25.fetch_add(1, std::memory_order_relaxed);
+    else if (step < 0.50f) s.stepUnder50.fetch_add(1, std::memory_order_relaxed);
+    else if (step < 1.00f) s.stepUnder100.fetch_add(1, std::memory_order_relaxed);
+    else s.stepOver100.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint32_t sampledCount(std::uint32_t extent, int stride)
@@ -1113,12 +1308,15 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                                                         span.beginNormal, true, start[axis]);
                 const EdgeInfo edgeStart =
                     computeEdgeMask(*grid, axis, iu, iv, stride, true, start[axis], nStart);
+                if (ucamNormalStatsEnabled())
+                    recordNormalStat(nStart, edgeStart, axis, normalValid(span.beginNormal),
+                                     span.cutBegin(), span.capBegin());
                 _set.set(base,
                          {vsg::vec3(static_cast<float>(start[0]),
                                     static_cast<float>(start[1]),
                                     static_cast<float>(start[2])),
-                          nStart, span.cutBegin() ? tool : stock, spanRadius, edgeStart.mask,
-                          edgeStart.strength});
+                          edgeStart.normal, span.cutBegin() ? tool : stock, spanRadius,
+                          edgeStart.mask, edgeStart.strength});
                 ++written;
             }
             if (!skipEnd)
@@ -1129,12 +1327,15 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                                                       false, end[axis]);
                 const EdgeInfo edgeEnd =
                     computeEdgeMask(*grid, axis, iu, iv, stride, false, end[axis], nEnd);
+                if (ucamNormalStatsEnabled())
+                    recordNormalStat(nEnd, edgeEnd, axis, normalValid(span.endNormal),
+                                     span.cutEnd(), span.capEnd());
                 _set.set(base,
                          {vsg::vec3(static_cast<float>(end[0]),
                                     static_cast<float>(end[1]),
                                     static_cast<float>(end[2])),
-                          nEnd, span.cutEnd() ? tool : stock, spanRadius, edgeEnd.mask,
-                          edgeEnd.strength});
+                          edgeEnd.normal, span.cutEnd() ? tool : stock, spanRadius,
+                          edgeEnd.mask, edgeEnd.strength});
                 ++written;
             }
         }
@@ -1334,6 +1535,9 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     for (std::size_t i = 0; i < _capacity; ++i)
         _set.clearSlot(i);
 
+    const bool statsOn = ucamNormalStatsEnabled();
+    if (statsOn) normalStats().reset();
+
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
         if (!_axes[axis].present) continue;
@@ -1361,6 +1565,8 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
         });
     }
 
+    if (statsOn) normalStats().report("rebuild");
+
     // Unused tail is not submitted. Do not walk it: the draw count is `live`.
     if (_capacity > live)
     {
@@ -1386,6 +1592,9 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
     if (!modelAabb.valid()) return PatchResult::LayoutChanged;
     _skipCutSplats = skipCutSplats;
     _viewCull = viewCull;
+
+    const bool statsOn = ucamNormalStatsEnabled();
+    if (statsOn) normalStats().reset();
 
     auto lock = rayModel.lockChains();
     const BoundingBox stockBounds = rayModel.bounds();
@@ -1438,6 +1647,7 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
     // ranges; do not dirty() the whole set.
     _set.setDrawCount(_allocEnd);
     _set.flushDirty();
+    if (statsOn) normalStats().report("patch");
     return PatchResult::Ok;
 }
 

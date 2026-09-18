@@ -2,8 +2,12 @@
 #include "RayBoolean.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 #include <tuple>
@@ -36,6 +40,16 @@ struct WorldSweep
     vsg::dmat4 modelToWorld{};
     vsg::dmat4 worldToModel{};
 };
+
+bool repairCutNormalsEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("UCAM_REPAIR_CUT_NORMALS");
+        if (!value || *value == '\0') return true;
+        return std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 Normal3f toNormal3f(const vsg::dvec3& n)
 {
@@ -259,7 +273,9 @@ void collectHits(const WorldSweep& sweep,
         const vsg::dvec4 nModel4 =
             sweep.worldToModel * vsg::dvec4(nWorld.x, nWorld.y, nWorld.z, 0.0);
 
-        hits.push_back(RayHit{modelHit[axis], toNormal3f(vsg::dvec3(nModel4.x, nModel4.y, nModel4.z))});
+        hits.push_back(RayHit{modelHit[axis],
+                              toNormal3f(vsg::dvec3(nModel4.x, nModel4.y, nModel4.z)),
+                              tri.motionCap()});
     });
 }
 
@@ -285,6 +301,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
                 // Stock cavity face: opposite of tool-outward at the cutter enter.
                 left.endNormal = negateNormal(cut.beginNormal);
                 left.setCutEnd(true);
+                left.setCapEnd(cut.capBegin());
                 if (left.hasSolidLength()) next.push_back(left);
             }
             if (cut.end < piece.end)
@@ -295,6 +312,7 @@ std::vector<Interval> subtractTicks(const std::vector<Interval>& solid,
                 right.beginNormal = negateNormal(cut.endNormal);
                 right.setFromBoolean(true);
                 right.setCutBegin(true);
+                right.setCapBegin(cut.capEnd());
                 if (right.hasSolidLength()) next.push_back(right);
             }
         }
@@ -326,16 +344,19 @@ std::vector<Interval> unionTicks(const std::vector<Interval>& solid,
                 cur.end = nxt.end;
                 cur.endNormal = nxt.endNormal;
                 cur.setCutEnd(nxt.cutEnd());
+                cur.setCapEnd(nxt.capEnd());
             }
             else if (nxt.end == cur.end && nxt.cutEnd())
             {
                 cur.setCutEnd(true);
                 cur.endNormal = nxt.endNormal;
+                if (nxt.capEnd()) cur.setCapEnd(true);
             }
             if (nxt.begin == cur.begin && nxt.cutBegin())
             {
                 cur.setCutBegin(true);
                 cur.beginNormal = nxt.beginNormal;
+                if (nxt.capBegin()) cur.setCapBegin(true);
             }
             if (nxt.fromBoolean()) cur.setFromBoolean(true);
         }
@@ -377,16 +398,19 @@ std::vector<Interval> consolidateIntervals(std::vector<Interval> spans)
                 cur.end = nxt.end;
                 cur.endNormal = nxt.endNormal;
                 cur.setCutEnd(nxt.cutEnd());
+                cur.setCapEnd(nxt.capEnd());
             }
             else if (nxt.end == cur.end && nxt.cutEnd())
             {
                 cur.setCutEnd(true);
                 cur.endNormal = nxt.endNormal;
+                if (nxt.capEnd()) cur.setCapEnd(true);
             }
             if (nxt.begin == cur.begin && nxt.cutBegin())
             {
                 cur.setCutBegin(true);
                 cur.beginNormal = nxt.beginNormal;
+                if (nxt.capBegin()) cur.setCapBegin(true);
             }
             if (nxt.fromBoolean()) cur.setFromBoolean(true);
         }
@@ -899,6 +923,182 @@ RayModel applyBoolean(const RayModel& source,
     return result;
 }
 
+namespace
+{
+
+// Nearest solid endpoint on one side of a ray, with the normal the cut left
+// there. Skips degenerate normals: they carry no direction to vote with.
+struct EndpointSample
+{
+    Normal3f normal{0.0f, 0.0f, 0.0f};
+    double along = 0.0;
+    bool valid = false;
+};
+
+EndpointSample sampleEndpoint(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv,
+                              bool enter, double alongTarget, double maxDelta)
+{
+    EndpointSample out;
+    if (iu >= grid.width || iv >= grid.height) return out;
+    const RaySlot& slot = grid.at(iu, iv);
+    if (slot.empty()) return out;
+
+    double best = maxDelta;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        if (!span.hasSolidLength()) continue;
+        const double a = enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+        const double d = std::abs(a - alongTarget);
+        if (d > best) continue;
+        const Normal3f& n = enter ? span.beginNormal : span.endNormal;
+        if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] < 1.0e-12f) continue;
+        best = d;
+        out.normal = n;
+        out.along = a;
+        out.valid = true;
+    }
+    return out;
+}
+
+// A subtract works one ray at a time, so it cannot tell a cut end that turned a
+// real corner from one that merely clipped the sweep's end cap. The second kind
+// keeps a normal up to 90 degrees off its lateral neighbours while sitting
+// flush with them, and shades as an isolated dark disc. Measurement over ~4500
+// such endpoints put 98% within one cell of the neighbourhood depth, so those
+// are below what the display can resolve and take the consensus normal instead.
+// Anything standing a full cell proud is real relief and keeps its own.
+constexpr float kRepairOutlierDot = 0.5f; // more than 60 degrees out
+constexpr float kRepairAgreeDot = 0.8f;   // neighbours must first agree with each other
+
+struct NormalRepair
+{
+    std::uint32_t iu = 0;
+    std::uint32_t iv = 0;
+    std::uint32_t index = 0;
+    bool enter = false;
+    Normal3f normal{0.0f, 0.0f, 0.0f};
+};
+
+void repairCutEndNormals(RayGrid& grid, const BoundingBox& modelAabb)
+{
+    if (grid.empty() || !modelAabb.valid()) return;
+
+    std::uint32_t iu0 = 0, iu1 = 0, iv0 = 0, iv1 = 0;
+    if (!gridWindowFromModelAabb(grid, modelAabb, iu0, iu1, iv0, iv1)) return;
+    // One cell of margin so a cut end on the window edge still sees neighbours.
+    if (iu0 > 0) --iu0;
+    if (iv0 > 0) --iv0;
+    if (iu1 + 1 < grid.width) ++iu1;
+    if (iv1 + 1 < grid.height) ++iv1;
+
+    const double cell = std::max(static_cast<double>(grid.spacingU),
+                                 static_cast<double>(grid.spacingV));
+    if (!(cell > 0.0)) return;
+    const double maxDelta = 3.0 * cell;
+
+    // Decisions all read pre-repair normals, so the outcome does not depend on
+    // the order rows are visited and the rows can run in parallel.
+    const auto rows = static_cast<std::size_t>(iv1 - iv0 + 1);
+    std::vector<std::vector<NormalRepair>> perRow(rows);
+
+    const RayGrid& src = grid;
+    tbb::parallel_for(std::size_t{0}, rows, [&](std::size_t row) {
+        const auto iv = static_cast<std::uint32_t>(iv0 + row);
+        std::vector<NormalRepair>& out = perRow[row];
+        for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
+        {
+            const RaySlot& slot = src.at(iu, iv);
+            if (slot.empty()) continue;
+            const ConstIntervalSpan spans = src.pool.span(slot);
+            for (std::uint32_t k = 0; k < spans.count; ++k)
+            {
+                const Interval& span = spans.data()[k];
+                if (!span.hasSolidLength()) continue;
+
+                for (int side = 0; side < 2; ++side)
+                {
+                    const bool enter = side == 0;
+                    // Only ends the boolean wrote: original cast normals are
+                    // not what this is correcting.
+                    if (enter ? !span.cutBegin() : !span.cutEnd()) continue;
+
+                    const Normal3f& n = enter ? span.beginNormal : span.endNormal;
+                    const float len2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+                    if (len2 < 1.0e-12f) continue;
+                    const float inv = 1.0f / std::sqrt(len2);
+                    const vsg::vec3 unitN(n[0] * inv, n[1] * inv, n[2] * inv);
+
+                    const double along =
+                        enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+
+                    vsg::vec3 sum(0.0f, 0.0f, 0.0f);
+                    double alongSum = 0.0;
+                    int count = 0;
+                    const EndpointSample around[4] = {
+                        sampleEndpoint(grid, iu - 1, iv, enter, along, maxDelta),
+                        sampleEndpoint(grid, iu + 1, iv, enter, along, maxDelta),
+                        sampleEndpoint(grid, iu, iv - 1, enter, along, maxDelta),
+                        sampleEndpoint(grid, iu, iv + 1, enter, along, maxDelta)};
+                    for (const EndpointSample& s : around)
+                    {
+                        if (!s.valid) continue;
+                        const float l2 = s.normal[0] * s.normal[0] + s.normal[1] * s.normal[1] +
+                                         s.normal[2] * s.normal[2];
+                        if (l2 < 1.0e-12f) continue;
+                        const float si = 1.0f / std::sqrt(l2);
+                        sum += vsg::vec3(s.normal[0] * si, s.normal[1] * si, s.normal[2] * si);
+                        alongSum += s.along;
+                        ++count;
+                    }
+                    if (count < 2) continue;
+
+                    const float sumLen =
+                        std::sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+                    // Neighbours that disagree among themselves mean this
+                    // endpoint sits on a real feature, not a stray cap.
+                    if (sumLen / static_cast<float>(count) < kRepairAgreeDot) continue;
+
+                    const vsg::vec3 meanN = sum * (1.0f / sumLen);
+                    if (vsg::dot(unitN, meanN) > kRepairOutlierDot) continue;
+                    if (std::abs(along - alongSum / static_cast<double>(count)) >= cell) continue;
+
+                    out.push_back(NormalRepair{iu, iv, k, enter,
+                                               Normal3f{meanN.x, meanN.y, meanN.z}});
+                }
+            }
+        }
+    });
+
+    std::atomic<std::uint64_t> repaired{0};
+    for (const std::vector<NormalRepair>& row : perRow)
+    {
+        for (const NormalRepair& r : row)
+        {
+            IntervalSpan spans = grid.pool.span(grid.at(r.iu, r.iv));
+            if (r.index >= spans.count) continue;
+            Interval& span = spans.begin()[r.index];
+            if (r.enter) span.beginNormal = r.normal;
+            else span.endNormal = r.normal;
+            repaired.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (repaired.load() > 0)
+    {
+        static const bool logRepairs = [] {
+            const char* value = std::getenv("UCAM_NORMAL_STATS");
+            return value && *value != '\0' && std::strcmp(value, "0") != 0;
+        }();
+        if (logRepairs)
+        {
+            std::printf("repairCutEndNormals axis %zu: %llu endpoints replaced\n", grid.axis,
+                        static_cast<unsigned long long>(repaired.load()));
+            std::fflush(stdout);
+        }
+    }
+}
+
+} // namespace
+
 void applyBooleanInPlace(RayModel& model,
                          const SweptVolume& sweep,
                          BooleanOp op,
@@ -947,6 +1147,16 @@ void applyBooleanInPlace(RayModel& model,
         if (RayGrid* g = model.grid(axis))
             processAxisGrid(*g, worldSweep, adjacency, op, mergeTol, model._bounds,
                             model._pairingStats, model._lastDirtyCellCount);
+    }
+
+    // Lateral pass: the per-ray subtract above cannot see across rays, so it
+    // is the only place a stray cap normal can be recognised and replaced.
+    if (repairCutNormalsEnabled() && sweepModelAabb.valid())
+    {
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            if (RayGrid* g = model.grid(axis)) repairCutEndNormals(*g, sweepModelAabb);
+        }
     }
 }
 
@@ -1030,6 +1240,7 @@ void RayModel::shellInPlace(double thickness)
                     entryWall.setCutBegin(true);
                     entryWall.setCutEnd(true);
                 }
+                if (it->capBegin()) entryWall.setCapBegin(true);
 
                 Interval exitWall;
                 exitWall.begin = innerBegin;
@@ -1044,6 +1255,7 @@ void RayModel::shellInPlace(double thickness)
                     exitWall.setCutEnd(true);
                     exitWall.setCutBegin(true);
                 }
+                if (it->capEnd()) exitWall.setCapEnd(true);
 
                 if (entryWall.hasSolidLength()) walls.push_back(entryWall);
                 if (exitWall.hasSolidLength()) walls.push_back(exitWall);

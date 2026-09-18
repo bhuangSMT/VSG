@@ -64,6 +64,8 @@ void intervalsFromHits(std::vector<RayHit>& hits,
         iv.end = grid.toTick(hits[h + 1].along);
         iv.beginNormal = hits[h].normal;
         iv.endNormal = hits[h + 1].normal;
+        if (hits[h].motionCap) iv.setCapBegin(true);
+        if (hits[h + 1].motionCap) iv.setCapEnd(true);
         if (fromBoolean)
         {
             iv.setFromBoolean(true);
