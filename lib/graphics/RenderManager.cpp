@@ -44,22 +44,20 @@ bool cutMeshEnabled()
     return Parameter::instance().cutMeshDisplay();
 }
 
-bool skipCutSplatEnds(bool cutFaceLive)
+bool skipCutSplatEnds(bool /*cutFaceLive*/)
 {
-    // Skip interior cut-tagged Gaussians when the orange overlay should cover
-    // them: mesh display on, or a GPU cut face already live (playback turns
-    // cutMeshDisplay off to avoid remesh, but keeps the uploaded overlay).
-    return cutMeshEnabled() || cutFaceLive;
+    // Skip interior cut-tagged Gaussians only while the orange mesh overlay is
+    // the intended cut surface. Display off → keep cut disks.
+    return cutMeshEnabled();
 }
 
-// Keep / patch / build cut-face GPU overlay. Never clear just because
-// cutMeshDisplay is temporarily false during Re run.
+// Patch / rebuild cut-face GPU overlay only while Cut mesh display is on.
+// Off means cut-tagged splat disks only — skip remesh entirely.
 void syncCutFaceOverlay(GaussianSplatCache& cache, const RayModel& rayModel, int cutStride,
                         const vsg::vec4& color, BooleanOp op, const BoundingBox& dirtyModelAabb,
                         bool allowPatch)
 {
-    const bool wantMesh = cutMeshEnabled() || cache.hasCutFace();
-    if (!wantMesh) return;
+    if (!cutMeshEnabled()) return;
 
     if (accumulatesCutMesh(op))
     {
@@ -719,8 +717,33 @@ float RenderManager::splatRadius(const RayModel& rayModel, std::size_t axis) con
 
 std::array<float, 3> RenderManager::splatRadii(const RayModel& rayModel, int stride) const
 {
-    // Extra 1.4× so soft rims still seal after stride sampling (was 1.15).
-    const float s = static_cast<float>(stride < 1 ? 1 : stride) * 1.4f;
+    const float strideF = static_cast<float>(stride < 1 ? 1 : stride);
+    if (_viewMode == ViewMode::Disk)
+    {
+        // Hard disks seal with the circular footprint — sized above half-cellDiag
+        // so grazing angles and thinned-out rim endpoints still cover stride gaps.
+        const Point3d& resolution = rayModel.resolution();
+        double fit = 1.0;
+        if (_fitToUnitBox && rayModel.bounds().valid())
+        {
+            const BoundingBox& bounds = rayModel.bounds();
+            const double maxExtent =
+                std::max({bounds.extent(0), bounds.extent(1), bounds.extent(2)});
+            if (maxExtent > 0.0) fit = maxExtent;
+        }
+        auto diskRadius = [&](std::size_t axis) -> float {
+            const double du = resolution[(axis + 1) % 3];
+            const double dv = resolution[(axis + 2) % 3];
+            const double cellDiag = std::sqrt(du * du + dv * dv);
+            // 1.75× half-diag covers grazing views / edge-clipped discs without
+            // restoring the full Gaussian ×2×1.4 footprint that overdrew.
+            return static_cast<float>(0.5 * cellDiag * static_cast<double>(strideF) * 1.75 / fit);
+        };
+        return {diskRadius(0), diskRadius(1), diskRadius(2)};
+    }
+
+    // Extra 1.4× so soft Gaussian rims still seal after stride sampling.
+    const float s = strideF * 1.4f;
     return {splatRadius(rayModel, 0) * s, splatRadius(rayModel, 1) * s,
             splatRadius(rayModel, 2) * s};
 }
@@ -730,13 +753,17 @@ SplatStyle RenderManager::splatStyle() const
     SplatStyle style;
     style.stockColor = _splatColor;
     style.toolColor = _toolColor;
-    style.opacity = _splatOpacity;
+    // Hard disks should read as a solid metal sheet; Gaussian keeps soft opacity.
+    style.opacity = (_viewMode == ViewMode::Disk) ? 1.0f : _splatOpacity;
     return style;
 }
 
 void RenderManager::rebuildSplatCache()
 {
     if (!_rayModel || _rayModel->rayCount() == 0) return;
+
+    _splatCache.setPointRenderMode(_viewMode == ViewMode::Disk ? PointRenderMode::HardDiskWithAA
+                                                               : PointRenderMode::Gaussian);
 
     const BooleanOp op = Parameter::instance().booleanOp();
     const SplatViewCull viewCull = splatViewCull();
@@ -745,31 +772,34 @@ void RenderManager::rebuildSplatCache()
     const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
     _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
                         skipCutSplats, viewCull);
-    // Cut-face GPU buffers stay put once uploaded. Zoom densify / playback
-    // only refills stock dots; remesh only when the overlay is still empty.
     if (op == BooleanOp::Inspection)
         syncInspectionSectionGrid(_inspectionPrevAabb);
-    else if (cutMeshEnabled() || _splatCache.hasCutFace())
+    else if (cutMeshEnabled())
     {
         if (!_splatCache.hasCutFace())
             _splatCache.rebuildCutFace(*_rayModel, cutStride, splatStyle().toolColor);
         else
             _splatCache.showCutFace();
     }
+    else if (_splatCache.hasCutFace())
+    {
+        // Display off: drop overlay so cut-tagged disks show through.
+        _splatCache.clearCutFace();
+        _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
+                            /*skipCutSplats=*/false, viewCull);
+    }
     presentSplatCache();
 }
 
 void RenderManager::refreshCutMeshDisplay()
 {
-    if (_viewMode != ViewMode::RayGS) return;
-    // Playback toggles cutMeshDisplay off to skip remesh — do not destroy a
-    // live GPU overlay or fall back to rebuilding the cut face from dots.
+    if (!usesSplatView(_viewMode)) return;
     rebuildSplatCache();
 }
 
 void RenderManager::refreshSplatViewForCamera()
 {
-    if (_viewMode != ViewMode::RayGS || !_rayModel || _rayModel->rayCount() == 0) return;
+    if (!usesSplatView(_viewMode) || !_rayModel || _rayModel->rayCount() == 0) return;
     // Stock densify only — never remesh an already-uploaded cut face.
     const BooleanOp op = Parameter::instance().booleanOp();
     const SplatViewCull viewCull = splatViewCull();
@@ -967,7 +997,7 @@ void RenderManager::setCamera(vsg::ref_ptr<vsg::Camera> camera)
 
 void RenderManager::noteCameraMoved()
 {
-    if (_viewMode != ViewMode::RayGS || !_camera) return;
+    if (!usesSplatView(_viewMode) || !_camera) return;
     if (!_splatViewDebounce) setCamera(_camera);
     if (_splatViewDebounce) _splatViewDebounce->start();
 }
@@ -1016,8 +1046,13 @@ void RenderManager::presentSplatCache()
     if (!_splatCache.node() || !_rayModel) return;
     if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
     {
-        attach(applyFit(_splatCache.node(), _rayModel->bounds()), true);
-        _splatCache.noteCompiled();
+        // Only drop the compile flag once the arrays really are on the device.
+        // Clearing it after a failed compile lets the next frame record a draw
+        // with unbacked BufferInfos, and flushDirty() copy into them.
+        if (attach(applyFit(_splatCache.node(), _rayModel->bounds()), true))
+            _splatCache.noteCompiled();
+        else if (_viewer)
+            _viewer->request();
         return;
     }
     _splatCache.markDirty();
@@ -1026,7 +1061,7 @@ void RenderManager::presentSplatCache()
 
 void RenderManager::syncInspectionSectionGrid(const BoundingBox& sectionAabb)
 {
-    if (_viewMode != ViewMode::RayGS || !_rayModel ||
+    if (!usesSplatView(_viewMode) || !_rayModel ||
         Parameter::instance().booleanOp() != BooleanOp::Inspection || !sectionAabb.valid())
     {
         _splatCache.clearSectionGrid();
@@ -1247,7 +1282,7 @@ void RenderManager::rebuild()
     // so the viewport never goes blank.
     if (usesRayModel(_viewMode) && _rayModel && _rayModel->rayCount() > 0)
     {
-        if (_viewMode == ViewMode::RayGS)
+        if (usesSplatView(_viewMode))
         {
             rebuildSplatCache();
             return;
@@ -1262,7 +1297,7 @@ void RenderManager::rebuild()
 
 void RenderManager::refreshRayViewsAfterStockEdit()
 {
-    if (_viewMode == ViewMode::RayGS)
+    if (usesSplatView(_viewMode))
     {
         if (_rayModel && _rayModel->rayCount() > 0)
             rebuildSplatCache();
@@ -2243,7 +2278,7 @@ void RenderManager::setBooleanOp(BooleanOp op)
     {
         // Keep whatever RayModel is on screen; only stop applying new cuts.
         _rayModel = _booleanRayModel ? &*_booleanRayModel : _sourceRayModel;
-        if (_viewMode == ViewMode::RayGS && _rayModel && _rayModel->rayCount() > 0)
+        if (usesSplatView(_viewMode) && _rayModel && _rayModel->rayCount() > 0)
             rebuildSplatCache();
         else if (_viewer)
             _viewer->request();
@@ -2254,7 +2289,7 @@ void RenderManager::setBooleanOp(BooleanOp op)
     // No new segment: still drop/restore the overlay and cut-end splat skip
     // for the op we just entered.
     if ((op == BooleanOp::Subtraction || op == BooleanOp::Union) &&
-        (!_cutSweep || _cutSweep->empty()) && _viewMode == ViewMode::RayGS && _rayModel &&
+        (!_cutSweep || _cutSweep->empty()) && usesSplatView(_viewMode) && _rayModel &&
         _rayModel->rayCount() > 0)
         rebuildSplatCache();
 }
@@ -2379,8 +2414,10 @@ void RenderManager::applyBooleanToRayModel()
         return;
     }
 
-    if (_viewMode == ViewMode::RayGS && _rayModel && haveDirtyRegion && !_splatCache.empty())
+    if (usesSplatView(_viewMode) && _rayModel && haveDirtyRegion && !_splatCache.empty())
     {
+        _splatCache.setPointRenderMode(_viewMode == ViewMode::Disk ? PointRenderMode::HardDiskWithAA
+                                                                   : PointRenderMode::Gaussian);
         const int stride = displayStride();
         const int cutStride = cutFaceStride();
         const SplatViewCull viewCull = splatViewCull();
@@ -2413,10 +2450,15 @@ void RenderManager::applyBooleanToRayModel()
                                    dirtyModelAabb, /*allowPatch=*/true);
             const double sectionMs = millisSince(sectionStart);
             logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
+            // flushDirty already mapped dirty spans; also markDirty so a partial
+            // host upload cannot leave the previous GPU frame until the next rebuild.
             if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
                 presentSplatCache();
-            else if (_viewer)
-                _viewer->request();
+            else
+            {
+                _splatCache.markDirty();
+                if (_viewer) _viewer->request();
+            }
             return;
         }
         if (_profiling)
@@ -2436,8 +2478,11 @@ void RenderManager::applyBooleanToRayModel()
         }
 
         const auto rebuildStart = ProfileClock::now();
-        if (_viewMode == ViewMode::RayGS)
+        if (usesSplatView(_viewMode))
         {
+            _splatCache.setPointRenderMode(_viewMode == ViewMode::Disk
+                                               ? PointRenderMode::HardDiskWithAA
+                                               : PointRenderMode::Gaussian);
             const int stride = displayStride();
             const int cutStride = cutFaceStride();
             const SplatViewCull viewCull = splatViewCull();
@@ -2494,11 +2539,11 @@ void RenderManager::logCutProfile(double booleanMs, const char* drawPath, double
     const std::size_t sweepTris = _cutSweep ? _cutSweep->mesh().triangles.size() : 0;
 
     std::printf("cut %-4lld total %7.2f ms  clone %6.2f ms  boolean %7.2f ms  %-7s %6.2f ms"
-                "  section %6.2f ms  window %9zu cells  sweep %6zu tris"
+                "  section %6.2f ms  cutMesh %s  window %9zu cells  sweep %6zu tris"
                 "  intervals %8zu  pool x%.2f  splat %8zu/%-8zu %3.0f%%\n",
                 _cutIndex, cloneMs + booleanMs + drawMs + sectionMs, cloneMs, booleanMs,
-                drawPath, drawMs, sectionMs, windowCells, sweepTris, liveIntervals, poolRatio,
-                splatLive, splatCap, splatFill * 100.0);
+                drawPath, drawMs, sectionMs, cutMeshEnabled() ? "on" : "off", windowCells,
+                sweepTris, liveIntervals, poolRatio, splatLive, splatCap, splatFill * 100.0);
     if (_rayModel)
     {
         const PairingStats& s = _rayModel->pairingStats();
@@ -2587,16 +2632,20 @@ bool RenderManager::pickToolPlacement(const vsg::Camera& camera, int32_t x, int3
     return projectToViewPlane(focus);
 }
 
-void RenderManager::attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting)
+bool RenderManager::attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting)
 {
-    if (!node) return;
+    if (!node) return false;
 
     // The viewer is already running, so the new subgraph has to be compiled
     // before it can be recorded. compileManager is set up by Viewer::compile().
     if (_viewer && _viewer->compileManager)
     {
         auto compileResult = _viewer->compileManager->compile(node);
-        if (compileResult) vsg::updateViewer(*_viewer, compileResult);
+        // Recording a subgraph whose compile failed dereferences BufferInfos
+        // that carry no vk buffer. Leave it detached and report the failure so
+        // the caller keeps its dirty flag and retries on a later frame.
+        if (!compileResult) return false;
+        vsg::updateViewer(*_viewer, compileResult);
     }
 
     if (replaceExisting)
@@ -2613,6 +2662,7 @@ void RenderManager::attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting)
     _scene->addChild(node);
 
     if (_viewer) _viewer->request();
+    return true;
 }
 
 } // namespace app

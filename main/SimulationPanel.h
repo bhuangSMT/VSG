@@ -96,8 +96,7 @@ private:
     void stopPlayback();
     void pausePlayback();
     void finishPlayback();
-    // Rerun playing → false (skip remesh; keep live GPU cut mesh).
-    // Pause / stop / done → true (show mesh; build if empty).
+    // Ensure mesh display matches showMesh (used on pause/stop to keep remesh on).
     void setCutMeshDisplayForPlayback(bool showMesh);
     void updateRerunButton();
     void beginHelixAxisPick();

@@ -1,15 +1,13 @@
-// Draws a point set as view-facing Gaussian splats.
+// Draws a point set as view-facing Gaussian splats (or opaque hard disks).
 //
 // Each point becomes a quad that is turned to face the camera in the vertex
-// shader; the fragment shader evaluates an isotropic Gaussian across it and
-// fades the splat out towards the edge.
+// shader; the fragment shader evaluates a Gaussian or a circular hard-disk
+// mask across it.
 //
-// The set is drawn twice: a depth-only pass fixes the near surface, then a
-// blended pass composites the Gaussians against it without writing depth. That
-// hides the far side of the model while still letting every splat on the near
-// surface contribute, which is what makes a dense set read as a continuous
-// sheet. Compositing is order dependent, and the order is not corrected by a
-// per-frame sort, but it only matters between splats sampling the same surface.
+// Gaussians are drawn twice: a depth-only pass fixes the near surface, then a
+// blended pass composites without writing depth. Hard disks use a single
+// opaque depth-writing pass with a full circular footprint, letting the depth
+// test pick the winner where discs overlap.
 #pragma once
 
 #include <cstddef>
@@ -20,6 +18,14 @@
 
 namespace app
 {
+
+// How each endpoint quad is shaded. Gaussian soft-blends; HardDiskWithAA is a
+// nearly opaque disk with a 1–2 px smoothstep rim (interactive surfel look).
+enum class PointRenderMode
+{
+    Gaussian,
+    HardDiskWithAA
+};
 
 // A single splat. The alpha of colour sets the Gaussian's peak opacity.
 //
@@ -40,7 +46,14 @@ struct Splat
     vsg::vec3 position;
     vsg::vec3 normal;
     vsg::vec4 color;
-    float radius;
+    float radius = 0.0f;
+    // bit0=+X bit1=-X bit2=+Y bit3=-Y bit4=+Z bit5=-Z normal discontinuity.
+    // The set bits sum into one eye-space direction. Narrowing the disc toward
+    // it reopens rim slivers, so this now only feeds the debug views.
+    std::uint8_t edgeMask = 0;
+    // 0 = smooth, 1 = unmistakable crease.
+    // Quantised to 8 bits and packed with edgeMask into GPU normal.w.
+    float edgeStrength = 0.0f;
 };
 
 // cellRadius is already in the space applyFit() maps into (and includes
@@ -77,6 +90,11 @@ public:
     // Section triangle mesh (Inspection cut face) parented under the same Group.
     void setOverlay(vsg::ref_ptr<vsg::Node> overlay);
 
+    // Swaps fragment falloff (Gaussian vs hard AA disk). Triggers recompile when
+    // pipelines already exist.
+    void setPointRenderMode(PointRenderMode mode);
+    PointRenderMode pointRenderMode() const { return _pointRenderMode; }
+
     std::size_t capacity() const { return _capacity; }
     vsg::ref_ptr<vsg::Node> node() const { return _root; }
     bool empty() const { return !_root || _capacity == 0; }
@@ -91,6 +109,7 @@ private:
     };
 
     void ensurePipelines();
+    void rebindPipelines();
     void initSlotGeometry(std::size_t beginSplat, std::size_t endSplat);
     void zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat);
     void bindDrawArrays();
@@ -101,11 +120,13 @@ private:
     std::size_t _capacity = 0;
     std::size_t _drawCount = 0;
     bool _needsCompile = false;
+    PointRenderMode _pointRenderMode = PointRenderMode::Gaussian;
     std::vector<DirtySpan> _dirtySpans;
     vsg::ref_ptr<vsg::vec4Array> _centerRadius;
     vsg::ref_ptr<vsg::vec2Array> _corners;
     vsg::ref_ptr<vsg::vec4Array> _colors;
-    vsg::ref_ptr<vsg::vec3Array> _normals;
+    // xyz = surface normal, w = edgeMask bits | (edgeStrength << 6) as float.
+    vsg::ref_ptr<vsg::vec4Array> _normals;
     vsg::ref_ptr<vsg::uintArray> _indices;
     vsg::ref_ptr<vsg::VertexIndexDraw> _draw;
     vsg::ref_ptr<vsg::Group> _root;

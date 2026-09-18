@@ -400,10 +400,12 @@ try
             startupViewModeValue = app::ViewMode::Ray;
         else if (startupViewMode == "ray-gs")
             startupViewModeValue = app::ViewMode::RayGS;
+        else if (startupViewMode == "disk")
+            startupViewModeValue = app::ViewMode::Disk;
         else
         {
             std::cerr << "unknown --view-mode '" << startupViewMode
-                      << "', expected facet, wireframe, ray or ray-gs" << std::endl;
+                      << "', expected facet, wireframe, ray, ray-gs or disk" << std::endl;
             return 1;
         }
         if (*startupViewModeValue == app::ViewMode::Ray && !debugUi)
@@ -513,6 +515,7 @@ try
     if (debugUi)
         viewModeCombo->addItem("Ray", static_cast<int>(app::ViewMode::Ray));
     viewModeCombo->addItem("Simulation", static_cast<int>(app::ViewMode::RayGS));
+    viewModeCombo->addItem("Disk", static_cast<int>(app::ViewMode::Disk));
     addWidget(viewModeCombo);
 
     int startupViewModeIndex = 0;
@@ -642,6 +645,12 @@ try
                 "Subtraction: %3\nUnion: %4\nInspection: %5")
             .arg(noneKeys, probeKeys, subtractKeys, unionKeys, inspectKeys));
     addWidget(booleanCombo);
+
+    auto cutMeshDisplayCheck = new QCheckBox("Cut mesh display");
+    cutMeshDisplayCheck->setChecked(app::Parameter::instance().cutMeshDisplay());
+    cutMeshDisplayCheck->setToolTip(
+        "When on, draw cut faces as a quad mesh. When off, show cut-tagged splat dots only.");
+    addWidget(cutMeshDisplayCheck);
 
     addDivider();
     column->addSpacing(20);
@@ -918,6 +927,10 @@ try
                          renderManager->setBooleanOp(op);
                          simPanel->notifyBooleanOp(op);
                      });
+    QObject::connect(cutMeshDisplayCheck, &QCheckBox::toggled, [renderManager](bool on) {
+        app::Parameter::instance().setCutMeshDisplay(on);
+        renderManager->refreshCutMeshDisplay();
+    });
 
     auto selectBooleanOp = [booleanCombo](app::BooleanOp op) {
         const int want = static_cast<int>(op);

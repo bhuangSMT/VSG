@@ -29,6 +29,316 @@ vsg::vec3 normalOrAxis(const Normal3f& n, std::size_t axis, bool enter)
     return vsg::vec3(n[0], n[1], n[2]);
 }
 
+bool normalValid(const Normal3f& n)
+{
+    return n[0] * n[0] + n[1] * n[1] + n[2] * n[2] >= 1.0e-12f;
+}
+
+// Closest solid endpoint on the enter (begin) or exit (end) side of a ray cell,
+// plus the normal the cast recorded there (degenerate when it recorded none).
+bool sampleFaceEndpoint(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
+                        std::uint32_t iv, bool enter, double alongTarget, double maxAlongDelta,
+                        Point3d& out, Normal3f* outNormal = nullptr)
+{
+    if (iu >= grid.width || iv >= grid.height) return false;
+    const RaySlot& slot = grid.at(iu, iv);
+    if (slot.empty()) return false;
+
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    const double u0 = grid.sampleU(iu);
+    const double v0 = grid.sampleV(iv);
+
+    double best = maxAlongDelta;
+    bool found = false;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        if (!span.hasSolidLength()) continue;
+        const double along = enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+        const double d = std::abs(along - alongTarget);
+        if (d > best) continue;
+        best = d;
+        out = Point3d{0.0, 0.0, 0.0};
+        out[axis] = along;
+        out[u] = u0;
+        out[v] = v0;
+        if (outNormal) *outNormal = enter ? span.beginNormal : span.endNormal;
+        found = true;
+    }
+    return found;
+}
+
+// Nearest endpoint in a cell that carries a usable recorded normal. Separate
+// from sampleFaceEndpoint because inheriting a direction tolerates a far looser
+// distance than fitting a plane does, and because the nearest endpoint of all
+// may be a sliver with no normal while one just behind it has a good one.
+bool sampleRecordedNormal(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
+                          std::uint32_t iv, bool enter, double alongTarget,
+                          double maxAlongDelta, Normal3f& out)
+{
+    if (iu >= grid.width || iv >= grid.height) return false;
+    const RaySlot& slot = grid.at(iu, iv);
+    if (slot.empty()) return false;
+
+    double best = maxAlongDelta;
+    bool found = false;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        const Normal3f& rec = enter ? span.beginNormal : span.endNormal;
+        if (!normalValid(rec)) continue;
+        const double at = enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+        const double d = std::abs(at - alongTarget);
+        if (d > best) continue;
+        best = d;
+        out = rec;
+        found = true;
+    }
+    return found;
+}
+
+vsg::vec3 estimateNormalFromNeighbors(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
+                                      std::uint32_t iv, int stride, bool enter, double along)
+{
+    const int s = stride < 1 ? 1 : stride;
+    const double maxDelta = 3.0 * static_cast<double>(s) *
+                            std::max(grid.spacingU, grid.spacingV);
+    Point3d left, right, up, down;
+    Normal3f recL{}, recR{}, recU{}, recD{};
+    const bool hasL =
+        iu >= static_cast<std::uint32_t>(s) &&
+        sampleFaceEndpoint(grid, axis, iu - static_cast<std::uint32_t>(s), iv, enter, along,
+                           maxDelta, left, &recL);
+    const bool hasR =
+        iu + static_cast<std::uint32_t>(s) < grid.width &&
+        sampleFaceEndpoint(grid, axis, iu + static_cast<std::uint32_t>(s), iv, enter, along,
+                           maxDelta, right, &recR);
+    const bool hasU =
+        iv >= static_cast<std::uint32_t>(s) &&
+        sampleFaceEndpoint(grid, axis, iu, iv - static_cast<std::uint32_t>(s), enter, along,
+                           maxDelta, up, &recU);
+    const bool hasD =
+        iv + static_cast<std::uint32_t>(s) < grid.height &&
+        sampleFaceEndpoint(grid, axis, iu, iv + static_cast<std::uint32_t>(s), enter, along,
+                           maxDelta, down, &recD);
+
+    vsg::vec3 axisDir(0.0f, 0.0f, 0.0f);
+    axisDir[static_cast<int>(axis)] = enter ? -1.0f : 1.0f;
+
+    // This endpoint, from the cell's own sample position. Lets a one-sided
+    // difference stand in where a neighbour is missing, which is the normal
+    // case along a surface edge: losing a neighbour should cost accuracy, not
+    // the whole normal. Snapping to axisDir instead leaves the disc with a
+    // normal lying flat in the surface, which shades as a dark speck.
+    Point3d centre{0.0, 0.0, 0.0};
+    centre[axis] = along;
+    centre[(axis + 1) % 3] = grid.sampleU(iu);
+    centre[(axis + 2) % 3] = grid.sampleV(iv);
+
+    auto delta = [](const Point3d& a, const Point3d& b) {
+        return vsg::vec3(static_cast<float>(a[0] - b[0]), static_cast<float>(a[1] - b[1]),
+                         static_cast<float>(a[2] - b[2]));
+    };
+
+    vsg::vec3 dx, dy;
+    bool haveDx = true;
+    bool haveDy = true;
+    if (hasL && hasR) dx = delta(right, left);
+    else if (hasR) dx = delta(right, centre);
+    else if (hasL) dx = delta(centre, left);
+    else haveDx = false;
+
+    if (hasU && hasD) dy = delta(down, up);
+    else if (hasD) dy = delta(down, centre);
+    else if (hasU) dy = delta(centre, up);
+    else haveDy = false;
+
+    if (haveDx && haveDy)
+    {
+        vsg::vec3 n = vsg::cross(dx, dy);
+        const float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
+        if (len2 >= 1.0e-12f)
+        {
+            n *= 1.0f / std::sqrt(len2);
+            // Match axis-fallback orientation (enter → -axis, exit → +axis).
+            if (vsg::dot(n, axisDir) < 0.0f) n = -n;
+            return n;
+        }
+    }
+
+    // No plane to fit: inherit the neighbours' recorded normals. Only recorded
+    // ones — an estimate would recurse back into here through endpointNormal.
+    // Signs are aligned to the first contributor rather than to axisDir, which
+    // coin-flips on a face the rays grazed.
+    //
+    // The window widens here: maxDelta is sized to keep a plane fit honest, but
+    // on a face the rays graze the neighbouring endpoint sits far along the ray,
+    // so that window rejects every neighbour and leaves nothing to inherit.
+    // A direction stays useful over a much longer reach than a position does.
+    const double inheritDelta = 4.0 * maxDelta;
+    const auto su = static_cast<std::uint32_t>(s);
+    vsg::vec3 accum(0.0f, 0.0f, 0.0f);
+    float accumLen2 = 0.0f;
+    auto inherit = [&](bool inRange, std::uint32_t nu, std::uint32_t nv,
+                       bool have, const Normal3f& rec) {
+        Normal3f use = rec;
+        if (!have || !normalValid(use))
+        {
+            if (!inRange) return;
+            if (!sampleRecordedNormal(grid, axis, nu, nv, enter, along, inheritDelta, use))
+                return;
+        }
+        vsg::vec3 n(use[0], use[1], use[2]);
+        if (accumLen2 > 0.0f && vsg::dot(n, accum) < 0.0f) n = -n;
+        accum += n;
+        accumLen2 = accum.x * accum.x + accum.y * accum.y + accum.z * accum.z;
+    };
+    inherit(iu >= su, iu >= su ? iu - su : 0u, iv, hasL, recL);
+    inherit(iu + su < grid.width, iu + su, iv, hasR, recR);
+    inherit(iv >= su, iu, iv >= su ? iv - su : 0u, hasU, recU);
+    inherit(iv + su < grid.height, iu, iv + su, hasD, recD);
+    if (accumLen2 >= 1.0e-12f) return accum * (1.0f / std::sqrt(accumLen2));
+
+    // Last resort before the axis: this cell's own other endpoints. A sliver
+    // with no normal often shares a ray with a span that has one.
+    Normal3f own{};
+    if (sampleRecordedNormal(grid, axis, iu, iv, enter, along, inheritDelta, own) ||
+        sampleRecordedNormal(grid, axis, iu, iv, !enter, along, inheritDelta, own))
+    {
+        vsg::vec3 n(own[0], own[1], own[2]);
+        const float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
+        if (len2 >= 1.0e-12f) return n * (1.0f / std::sqrt(len2));
+    }
+
+    // Genuinely isolated endpoint: nothing better than the ray axis.
+    return normalOrAxis(Normal3f{}, axis, enter);
+}
+
+vsg::vec3 endpointNormal(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
+                         std::uint32_t iv, int stride, const Normal3f& recorded, bool enter,
+                         double along)
+{
+    if (normalValid(recorded)) return normalOrAxis(recorded, axis, enter);
+    return estimateNormalFromNeighbors(grid, axis, iu, iv, stride, enter, along);
+}
+
+// Sample the normal of the nearest solid endpoint on the same face side in a
+// neighbour cell. Returns false when the neighbour is empty / out of range.
+bool sampleNeighborNormal(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
+                          std::uint32_t iv, int stride, bool enter, double along,
+                          vsg::vec3& outNormal)
+{
+    if (iu >= grid.width || iv >= grid.height) return false;
+    const RaySlot& slot = grid.at(iu, iv);
+    if (slot.empty()) return false;
+
+    const int s = stride < 1 ? 1 : stride;
+    const double maxDelta = 3.0 * static_cast<double>(s) *
+                            std::max(grid.spacingU, grid.spacingV);
+
+    double best = maxDelta;
+    bool found = false;
+    Normal3f recorded{};
+    double bestAlong = along;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        if (!span.hasSolidLength()) continue;
+        const double a = enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+        const double d = std::abs(a - along);
+        if (d > best) continue;
+        best = d;
+        recorded = enter ? span.beginNormal : span.endNormal;
+        bestAlong = a;
+        found = true;
+    }
+    if (!found) return false;
+    outNormal = endpointNormal(grid, axis, iu, iv, stride, recorded, enter, bestAlong);
+    return true;
+}
+
+// bit0=+X bit1=-X bit2=+Y bit3=-Y bit4=+Z bit5=-Z
+// Strength ramp: 0 while the neighbour normal is still near-parallel, 1 once
+// the crease is unmistakable. A direction bit only fires past kEdgeBitMin so
+// that gentle curvature leaves the disc perfectly round.
+constexpr float kSmoothDot = 0.95f;
+constexpr float kSharpDot = 0.20f;
+constexpr float kEdgeBitMin = 0.10f;
+
+float edgeStrengthFromDot(float d)
+{
+    return std::clamp((kSmoothDot - d) / (kSmoothDot - kSharpDot), 0.0f, 1.0f);
+}
+
+void setWorldAxisBit(std::uint8_t& mask, std::size_t worldAxis, bool positive)
+{
+    const unsigned bit = static_cast<unsigned>(worldAxis) * 2u + (positive ? 0u : 1u);
+    mask = static_cast<std::uint8_t>(mask | (1u << bit));
+}
+
+struct EdgeInfo
+{
+    std::uint8_t mask = 0;
+    float strength = 0.0f;
+};
+
+EdgeInfo computeEdgeMask(const RayGrid& grid, std::size_t axis, std::uint32_t iu,
+                         std::uint32_t iv, int stride, bool enter, double along,
+                         const vsg::vec3& normal)
+{
+    const int s = stride < 1 ? 1 : stride;
+    const auto su = static_cast<std::uint32_t>(s);
+    const std::size_t uAxis = (axis + 1) % 3;
+    const std::size_t vAxis = (axis + 2) % 3;
+
+    EdgeInfo info;
+    auto consider = [&](bool have, const vsg::vec3& neighborN, std::size_t worldAxis,
+                        bool positiveDir) {
+        if (!have) return;
+        const float strength = edgeStrengthFromDot(vsg::dot(normal, neighborN));
+        info.strength = std::max(info.strength, strength);
+        if (strength > kEdgeBitMin) setWorldAxisBit(info.mask, worldAxis, positiveDir);
+    };
+
+    vsg::vec3 nL, nR, nU, nD;
+    const bool hasL =
+        iu >= su && sampleNeighborNormal(grid, axis, iu - su, iv, stride, enter, along, nL);
+    const bool hasR = iu + su < grid.width &&
+                      sampleNeighborNormal(grid, axis, iu + su, iv, stride, enter, along, nR);
+    const bool hasU =
+        iv >= su && sampleNeighborNormal(grid, axis, iu, iv - su, stride, enter, along, nU);
+    const bool hasD = iv + su < grid.height &&
+                      sampleNeighborNormal(grid, axis, iu, iv + su, stride, enter, along, nD);
+
+    // UV steps map to world ±uAxis / ±vAxis.
+    consider(hasL, nL, uAxis, false);
+    consider(hasR, nR, uAxis, true);
+    consider(hasU, nU, vAxis, false);
+    consider(hasD, nD, vAxis, true);
+
+    // Along-axis: compare with the opposite face endpoint on the same ray when
+    // it lies close enough to count as a sharp feature (thin wall / cut).
+    const RaySlot& slot = grid.at(iu, iv);
+    if (!slot.empty())
+    {
+        const double maxDelta = 3.0 * static_cast<double>(s) *
+                                std::max(grid.spacingU, grid.spacingV);
+        for (const Interval& span : grid.pool.span(slot))
+        {
+            if (!span.hasSolidLength()) continue;
+            const double a = enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+            if (std::abs(a - along) > 1.0e-9) continue;
+            const double other = enter ? grid.fromTick(span.end) : grid.fromTick(span.begin);
+            if (std::abs(other - along) > maxDelta) continue;
+            const Normal3f& rec = enter ? span.endNormal : span.beginNormal;
+            const vsg::vec3 otherN =
+                endpointNormal(grid, axis, iu, iv, stride, rec, !enter, other);
+            // Discontinuity toward the other end along the ray axis.
+            consider(true, otherN, axis, enter);
+            break;
+        }
+    }
+    return info;
+}
+
 std::uint32_t sampledCount(std::uint32_t extent, int stride)
 {
     if (extent == 0 || stride <= 0) return 0;
@@ -222,12 +532,22 @@ std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t 
         bool skipEnd = false;
         skipSplatEnds(span, modelLength, hide, bleedHideLength(grid, stride), skipCutSplats,
                       onRim, skipStart, skipEnd);
-        applyViewEndPolicy(start, end, iu, iv, viewCull, skipStart, skipEnd);
+        // Cut disks are the cut surface when mesh is off — never view-cull them.
+        const bool protectStart = span.cutBegin() && !skipCutSplats;
+        const bool protectEnd = span.cutEnd() && !skipCutSplats;
+        if (!protectStart || !protectEnd)
+        {
+            bool vs = skipStart;
+            bool ve = skipEnd;
+            applyViewEndPolicy(start, end, iu, iv, viewCull, vs, ve);
+            if (!protectStart) skipStart = vs;
+            if (!protectEnd) skipEnd = ve;
+        }
         if (!skipStart &&
-            endpointInViewCull(grid, iu, iv, start[axis], viewCull))
+            (protectStart || endpointInViewCull(grid, iu, iv, start[axis], viewCull)))
             ++n;
         if (!skipEnd &&
-            endpointInViewCull(grid, iu, iv, end[axis], viewCull))
+            (protectEnd || endpointInViewCull(grid, iu, iv, end[axis], viewCull)))
             ++n;
     }
     return n;
@@ -299,25 +619,26 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
                      const std::vector<SectionPoint>& east,
                      const std::vector<SectionPoint>& north,
                      const std::vector<SectionPoint>& northEast,
-                     float maxEdge,
+                     float maxAlong,
+                     float maxLink,
                      std::vector<std::array<SectionVert, 3>>& tris)
 {
-    if (here.empty() || maxEdge <= 0.0f) return;
-    const float maxE2 = maxEdge * maxEdge;
+    if (here.empty() || maxAlong <= 0.0f || maxLink <= 0.0f) return;
+    const float maxLink2 = maxLink * maxLink;
 
     auto dist2 = [](const vsg::vec3& a, const vsg::vec3& b) {
         const vsg::vec3 d = a - b;
         return d.x * d.x + d.y * d.y + d.z * d.z;
     };
-    // Same cut sheet (top with top, bottom with bottom). 3D-nearest alone
-    // stitches a shallow union's top to its bottom and leaves holes.
+    // Same cut sheet (top with top, bottom with bottom). along uses a looser
+    // band; 3D links stay tight so hollow openings do not grow bridge quads.
     auto nearestOnSheet = [&](const std::vector<SectionPoint>& pts,
                               const SectionPoint& src) -> const SectionPoint* {
         const SectionPoint* best = nullptr;
-        float bestD = maxE2;
+        float bestD = maxLink2;
         for (const SectionPoint& p : pts)
         {
-            if (std::abs(p.along - src.along) > static_cast<double>(maxEdge)) continue;
+            if (std::abs(p.along - src.along) > static_cast<double>(maxAlong)) continue;
             const float d2 = dist2(p.pos, src.pos);
             if (d2 <= bestD)
             {
@@ -345,15 +666,15 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
     {
         const SectionPoint* e = nearestOnSheet(east, h);
         const SectionPoint* n = nearestOnSheet(north, h);
-        if (!e || !n || dist2(e->pos, n->pos) > maxE2) continue;
+        if (!e || !n || dist2(e->pos, n->pos) > maxLink2) continue;
 
         const vsg::vec3 predict = e->pos + n->pos - h.pos;
         const SectionPoint* ne = nullptr;
-        float bestNe = maxE2;
+        float bestNe = maxLink2;
         for (const SectionPoint& p : northEast)
         {
-            if (std::abs(p.along - h.along) > static_cast<double>(maxEdge)) continue;
-            if (dist2(p.pos, e->pos) > maxE2 || dist2(p.pos, n->pos) > maxE2) continue;
+            if (std::abs(p.along - h.along) > static_cast<double>(maxAlong)) continue;
+            if (dist2(p.pos, e->pos) > maxLink2 || dist2(p.pos, n->pos) > maxLink2) continue;
             const float d2 = dist2(p.pos, predict);
             if (d2 <= bestNe)
             {
@@ -363,10 +684,16 @@ void emitSectionQuad(const std::vector<SectionPoint>& here,
         }
         if (!ne) continue;
 
-        // Orient winding from the four corner normals (stock/cut face normals
-        // carried on the interval ends), not from positions alone.
+        // Opposite-hemisphere only: noisy rim / axis-fallback normals still
+        // form quads; strongly flipped sheets do not.
         vsg::vec3 hint = h.normal + e->normal + n->normal + ne->normal;
-        if (vsg::length(hint) < 1.0e-12f) hint = h.normal;
+        const float hintLen = vsg::length(hint);
+        if (hintLen < 1.0e-12f) hint = h.normal;
+        else hint /= hintLen;
+        if (vsg::dot(h.normal, hint) < 0.0f || vsg::dot(e->normal, hint) < 0.0f ||
+            vsg::dot(n->normal, hint) < 0.0f || vsg::dot(ne->normal, hint) < 0.0f)
+            continue;
+
         emitOriented(h.pos, h.normal, e->pos, e->normal, n->pos, n->normal, hint);
         emitOriented(e->pos, e->normal, ne->pos, ne->normal, n->pos, n->normal, hint);
     }
@@ -396,9 +723,13 @@ double vecComponent(const vsg::vec3& p, std::size_t axis)
     return static_cast<double>(p.z);
 }
 
+// Halo pads dirty UV windows so multi-row CL Re-run patches do not leave
+// seams between steps. Link scale must cover adjacent cut samples at
+// cutFaceStride without reopening hollow-bridge stitches (those are >> 3 cells).
 constexpr int kCutFaceHaloCells = 6;
 constexpr float kInspectionMaxEdgeScale = 2.5f;
-constexpr float kCutFaceMaxEdgeScale = 8.0f;
+constexpr float kCutFaceMaxEdgeScale = 3.5f;
+constexpr float kCutFaceMaxLinkScale = 2.5f;
 
 void growGridWindowByStride(const RayGrid& grid, int stride, int haloCells,
                             std::uint32_t& iu0, std::uint32_t& iu1,
@@ -490,8 +821,11 @@ void collectSectionTris(const RayModel& rayModel, int stride, const BoundingBox&
 
         const double du = grid->spacingU * static_cast<double>(stride);
         const double dv = grid->spacingV * static_cast<double>(stride);
-        const float edgeScale = clipToAabb ? kInspectionMaxEdgeScale : kCutFaceMaxEdgeScale;
-        const float maxEdge = edgeScale * static_cast<float>(std::sqrt(du * du + dv * dv));
+        const float cellStep = static_cast<float>(std::sqrt(du * du + dv * dv));
+        const float maxAlong =
+            (clipToAabb ? kInspectionMaxEdgeScale : kCutFaceMaxEdgeScale) * cellStep;
+        const float maxLink =
+            (clipToAabb ? kInspectionMaxEdgeScale : kCutFaceMaxLinkScale) * cellStep;
 
         std::vector<std::array<SectionVert, 3>> quads;
         const auto axisByte = static_cast<std::uint8_t>(axis);
@@ -506,7 +840,7 @@ void collectSectionTris(const RayModel& rayModel, int stride, const BoundingBox&
                 const auto northEast = north + 1;
                 const auto before = quads.size();
                 emitSectionQuad(cells[flat], cells[east], cells[north], cells[northEast],
-                                maxEdge, quads);
+                                maxAlong, maxLink, quads);
                 for (auto q = before; q < quads.size(); ++q)
                     tris.push_back({quads[q], axisByte, su, sv});
             }
@@ -752,12 +1086,22 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
             skipSplatEnds(span, modelLength, leftoverHideLength(*grid, stride),
                           bleedHideLength(*grid, stride), _skipCutSplats, onRim, skipStart,
                           skipEnd);
-            applyViewEndPolicy(start, end, iu, iv, _viewCull, skipStart, skipEnd);
+            // Cut disks are the cut surface when mesh is off — never view-cull them.
+            const bool protectStart = span.cutBegin() && !_skipCutSplats;
+            const bool protectEnd = span.cutEnd() && !_skipCutSplats;
+            if (!protectStart || !protectEnd)
+            {
+                bool vs = skipStart;
+                bool ve = skipEnd;
+                applyViewEndPolicy(start, end, iu, iv, _viewCull, vs, ve);
+                if (!protectStart) skipStart = vs;
+                if (!protectEnd) skipEnd = ve;
+            }
 
-            if (!skipStart &&
+            if (!skipStart && !protectStart &&
                 !endpointInViewCull(*grid, iu, iv, start[axis], _viewCull))
                 skipStart = true;
-            if (!skipEnd &&
+            if (!skipEnd && !protectEnd &&
                 !endpointInViewCull(*grid, iu, iv, end[axis], _viewCull))
                 skipEnd = true;
 
@@ -765,24 +1109,32 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
             {
                 if (written + 1 > ref.block) break;
                 const auto base = static_cast<std::size_t>(ref.first + written);
+                const vsg::vec3 nStart = endpointNormal(*grid, axis, iu, iv, stride,
+                                                        span.beginNormal, true, start[axis]);
+                const EdgeInfo edgeStart =
+                    computeEdgeMask(*grid, axis, iu, iv, stride, true, start[axis], nStart);
                 _set.set(base,
                          {vsg::vec3(static_cast<float>(start[0]),
                                     static_cast<float>(start[1]),
                                     static_cast<float>(start[2])),
-                          normalOrAxis(span.beginNormal, axis, true),
-                          span.cutBegin() ? tool : stock, spanRadius});
+                          nStart, span.cutBegin() ? tool : stock, spanRadius, edgeStart.mask,
+                          edgeStart.strength});
                 ++written;
             }
             if (!skipEnd)
             {
                 if (written + 1 > ref.block) break;
                 const auto base = static_cast<std::size_t>(ref.first + written);
+                const vsg::vec3 nEnd = endpointNormal(*grid, axis, iu, iv, stride, span.endNormal,
+                                                      false, end[axis]);
+                const EdgeInfo edgeEnd =
+                    computeEdgeMask(*grid, axis, iu, iv, stride, false, end[axis], nEnd);
                 _set.set(base,
                          {vsg::vec3(static_cast<float>(end[0]),
                                     static_cast<float>(end[1]),
                                     static_cast<float>(end[2])),
-                          normalOrAxis(span.endNormal, axis, false),
-                          span.cutEnd() ? tool : stock, spanRadius});
+                          nEnd, span.cutEnd() ? tool : stock, spanRadius, edgeEnd.mask,
+                          edgeEnd.strength});
                 ++written;
             }
         }
@@ -930,7 +1282,8 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
             const auto sv = flat / layout.sampledW;
             const auto iu = static_cast<std::uint32_t>(su) * static_cast<std::uint32_t>(stride);
             const auto iv = static_cast<std::uint32_t>(sv) * static_cast<std::uint32_t>(stride);
-            if (!cellInViewCull(*grid, iu, iv, stockBounds, viewCull))
+            if (!cellInViewCull(*grid, iu, iv, stockBounds, viewCull) &&
+                (skipCutSplats || !cellHasCutTag(*grid, iu, iv)))
             {
                 needs[axis][flat] = 0;
                 return;
@@ -1054,7 +1407,8 @@ PatchResult GaussianSplatCache::updateRegion(const RayModel& rayModel,
             for (std::uint32_t iu = iu0; iu <= iu1; ++iu)
             {
                 if (static_cast<int>(iu) % _stride != 0) continue;
-                if (!cellInViewCull(*grid, iu, iv, stockBounds, viewCull))
+                if (!cellInViewCull(*grid, iu, iv, stockBounds, viewCull) &&
+                    (skipCutSplats || !cellHasCutTag(*grid, iu, iv)))
                 {
                     const auto su = iu / static_cast<std::uint32_t>(_stride);
                     const auto sv = iv / static_cast<std::uint32_t>(_stride);
@@ -1295,9 +1649,10 @@ bool GaussianSplatCache::writeCutFaceCell(std::size_t axis, std::uint32_t su, st
     CellRef& ref = cutFaceRef(axis, su, sv);
     freeCutFaceCell(ref);
     if (tris.empty()) return true;
-    if (tris.size() > static_cast<std::size_t>(maxCutFaceTrisPerCell)) return false;
-
-    const auto n = static_cast<std::uint32_t>(tris.size());
+    // Dense cells used to return false → patchCutFace full-rebuild (minutes).
+    // Keep a capped local surface instead of freezing the UI.
+    const auto n = static_cast<std::uint32_t>(
+        std::min(tris.size(), static_cast<std::size_t>(maxCutFaceTrisPerCell)));
     std::uint32_t first = 0;
     if (!allocCutFaceBlock(n, &first)) return false;
     ref.first = first;

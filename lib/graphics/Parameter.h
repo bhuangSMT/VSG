@@ -82,7 +82,7 @@ public:
     void setShowLastSweptVolumeOnly(bool enabled) { _showLastSweptVolumeOnly = enabled; }
 
     // Ray-GS cut face: quad mesh overlay when true; cut-tagged splat dots only
-    // when false (default).
+    // when false. Default on so Interactive / Re run remesh cut faces.
     bool cutMeshDisplay() const { return _cutMeshDisplay; }
     void setCutMeshDisplay(bool enabled) { _cutMeshDisplay = enabled; }
 
@@ -115,7 +115,7 @@ private:
     double _toolVertexAngleDeg = 60.0;
     bool _sweptVolume = false;
     bool _showLastSweptVolumeOnly = true;
-    bool _cutMeshDisplay = false;
+    bool _cutMeshDisplay = true;
     BooleanOp _booleanOp = BooleanOp::None;
     SimulationMode _simulationMode = SimulationMode::Interactive;
     std::string _lastImportPath;

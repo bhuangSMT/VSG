@@ -334,7 +334,8 @@ private:
 
     // Compile a subgraph against the running viewer, then attach it.
     // replaceExisting swaps the model node only; the tool transform is kept.
-    void attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting);
+    // False when the subgraph could not be compiled; it is then left detached.
+    bool attach(vsg::ref_ptr<vsg::Node> node, bool replaceExisting);
 
     // Move a resolution to the front of the reuse order, evicting the least
     // recently used models if that puts the cache over its limit.

@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "UcamDebug.h"
+
 namespace app
 {
 
@@ -27,6 +29,9 @@ namespace
 
 // The quad is built around the splat centre in eye space, so it always faces
 // the camera. inCenterRadius.w carries the eye-space half-width.
+// inNormal.xyz is the surface normal; inNormal.w packs edgeMask bits
+// (bit0=+X … bit5=-Z) plus an 8-bit edge strength above them, which describe
+// how close the endpoint sits to a crease.
 const char* const splatVertexBody = R"(
 layout(push_constant) uniform PushConstants
 {
@@ -37,12 +42,16 @@ layout(push_constant) uniform PushConstants
 layout(location = 0) in vec4 inCenterRadius;
 layout(location = 1) in vec2 inCorner;
 layout(location = 2) in vec4 inColor;
-layout(location = 3) in vec3 inNormal;
+layout(location = 3) in vec4 inNormal;
 
 layout(location = 0) out vec2 corner;
 layout(location = 1) out vec4 color;
 layout(location = 2) out vec3 normalEye;
 layout(location = 3) out float bell;
+#ifdef HARD_DISK_AA
+layout(location = 4) flat out float edgeStrength;
+layout(location = 5) flat out vec2 edgeDirDisc;
+#endif
 
 void main()
 {
@@ -55,11 +64,19 @@ void main()
         color = vec4(0.0);
         normalEye = vec3(0.0, 0.0, 1.0);
         bell = 2.77;
+#ifdef HARD_DISK_AA
+        edgeStrength = 0.0;
+        edgeDirDisc = vec2(0.0);
+#endif
         return;
     }
 
     vec4 centerEye = pc.modelView * vec4(inCenterRadius.xyz, 1.0);
 
+#ifdef HARD_DISK_AA
+    // Hard disks keep a fixed eye-space radius (no Gaussian bell widening).
+    bell = 1.0;
+#else
     // Zoom proxy from eye depth only — not packed radius. Stride densify scales
     // radius ∝ stride while z shrinks on zoom-in, so radius/z stayed flat and
     // bell never moved. Soft when far (fit-to-unit eye ~3–4), sharp when close.
@@ -73,14 +90,20 @@ void main()
     // Sharper falloff shrinks the visible core; grow the eye-space radius so
     // the half-intensity footprint still meets the neighbour (≈ √(bell/bellMin)).
     radius *= mix(1.0, sqrt(bellMax / bellMin), t);
+#endif
     centerEye.xy += inCorner * radius;
 
 #ifdef SPLAT_DEPTH_PREPASS
+#ifdef HARD_DISK_AA
+    // Slight bias so the colour pass AA rim still passes the depth test.
+    centerEye.z -= radius * 0.05;
+#else
     // The depth-only pass lays down the near surface half a splat further away
     // than it really is. Every splat sampling that same surface then still
     // passes the depth test in the colour pass and can blend, while the far
     // side of the model is still rejected.
     centerEye.z -= radius * 0.5;
+#endif
 #endif
 
     gl_Position = pc.projection * centerEye;
@@ -90,7 +113,28 @@ void main()
 
     // The model-view transform carries a uniform scale at most, so its upper
     // 3x3 rotates the normal without shearing it.
-    normalEye = mat3(pc.modelView) * inNormal;
+    mat3 mv = mat3(pc.modelView);
+    normalEye = mv * inNormal.xyz;
+
+#ifdef HARD_DISK_AA
+    uint packed = uint(inNormal.w + 0.5);
+    uint mask = packed & 63u;
+    edgeStrength = float(packed >> 6) / 255.0;
+
+    // Disc corner space matches eye XY. Sum the set axes into one direction so
+    // a rim with two creases narrows along their diagonal instead of twice.
+    vec2 ax = (mv * vec3(1.0, 0.0, 0.0)).xy;
+    vec2 ay = (mv * vec3(0.0, 1.0, 0.0)).xy;
+    vec2 az = (mv * vec3(0.0, 0.0, 1.0)).xy;
+    vec2 dir = vec2(0.0);
+    if ((mask & 1u) != 0u) dir += ax;
+    if ((mask & 2u) != 0u) dir -= ax;
+    if ((mask & 4u) != 0u) dir += ay;
+    if ((mask & 8u) != 0u) dir -= ay;
+    if ((mask & 16u) != 0u) dir += az;
+    if ((mask & 32u) != 0u) dir -= az;
+    edgeDirDisc = dir;
+#endif
 }
 )";
 
@@ -108,30 +152,78 @@ layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 color;
 layout(location = 2) in vec3 normalEye;
 layout(location = 3) in float bell;
+#ifdef HARD_DISK_AA
+layout(location = 4) flat in float edgeStrength;
+layout(location = 5) flat in vec2 edgeDirDisc;
+#endif
 
 layout(location = 0) out vec4 outColor;
 
 void main()
 {
-    float radiusSquared = dot(corner, corner);
-    if (radiusSquared > 1.0) discard;
+#ifdef HARD_DISK_AA
+    // Cheap AABB reject, then the full circular footprint. Nothing is clipped
+    // or narrowed near a discontinuity: the radius carries a 1.75x margin over
+    // half-cellDiag precisely because endpoints thin out at rims and grazing
+    // views, so every disc rasterizes and the depth test picks the winner.
+    if (max(abs(corner.x), abs(corner.y)) > 1.0) discard;
+
+    float r = length(corner);
+#ifdef SPLAT_DEBUG_SHRINK
+    // Opt-in A/B: narrow the crease-facing side to sharpen convex corners.
+    // Costs coverage along the crease it sharpens, which reopens rim slivers.
+    if (edgeStrength > 0.0 && dot(edgeDirDisc, edgeDirDisc) > 1e-12)
+    {
+        vec2 e = normalize(edgeDirDisc);
+        float along = dot(corner, e);                 // positive = toward crease
+        float across = dot(corner, vec2(-e.y, e.x));  // along crease, full width
+        float a = (along > 0.0) ? along / mix(1.0, 0.65, edgeStrength) : along;
+        r = sqrt(a * a + across * across);
+    }
+#endif
+    if (r > 1.0) discard;
+
+#ifdef SPLAT_DEBUG_EDGE
+    // Red = how sharp this endpoint thinks it is, green = narrowing is active.
+    outColor = vec4(edgeStrength, dot(edgeDirDisc, edgeDirDisc) > 1e-12 ? 1.0 : 0.0, 0.0, 1.0);
+    return;
+#endif
+#ifdef SPLAT_DEBUG_DEPTH
+    // Banded ramp: a mark on a different band sits on a farther surface.
+    outColor = vec4(fract(gl_FragCoord.z * 512.0), 0.0, 0.0, 1.0);
+    return;
+#endif
+#else
+    float r = length(corner);
+    if (r > 1.0) discard;
+#endif
 
 #ifdef SPLAT_DEPTH_PREPASS
+#ifdef HARD_DISK_AA
+    // Opaque disk core writes depth; leave the AA rim out of the depth buffer.
+    if (r > 0.95) discard;
+#else
     // Only the splat's core takes part in the depth pass. The core still
     // reaches the corners of its grid cell, so the near surface stays sealed,
     // but the soft rim is kept out of the depth buffer instead of stamping a
     // hard disc over the splats beside it.
-    if (radiusSquared > 0.3) discard;
+    if (dot(corner, corner) > 0.3) discard;
+#endif
 
     outColor = vec4(0.0);
+#else
+#ifdef HARD_DISK_AA
+    float falloff = 1.0 - smoothstep(0.95, 1.0, r);
 #else
     // Windowed Gaussian: subtracting the falloff's value at the quad's edge and
     // rescaling takes it to exactly zero there, so the splat fades out rather
     // than ending on a visible rim. bell comes from the vertex stage (2.77 far
     // → 10 close, from eye depth) so zoomed-in disks read sharper while overlaps
     // still blend.
+    float radiusSquared = r * r;
     float edge = exp(-bell);
     float falloff = max(exp(-bell * radiusSquared) - edge, 0.0) / (1.0 - edge);
+#endif
 
     // Eye space: the camera looks down -z, so the view direction is +z and the
     // key light is fixed relative to the viewer.
@@ -154,7 +246,6 @@ void main()
 
     float diffuse = max(dot(normal, lightDir), 0.0);
     vec3 halfway = normalize(lightDir + viewDir);
-    float specular = pow(max(dot(normal, halfway), 0.0), 70.0);
 
     // Polished steel: a dark body with a tight highlight hot enough to clip,
     // tinted by the albedo rather than white, since a metal reflects its own
@@ -164,40 +255,87 @@ void main()
     //
     // No rim term either — a splat's edge is not a silhouette, so lighting it
     // just outlines every splat and frosts the whole surface.
+#ifdef HARD_DISK_AA
+    // A blended Gaussian averages many splats per pixel, which hides a narrow
+    // highlight lobe; one hard disk owns the pixel outright, so exponent 70
+    // turned a few degrees of normal difference into full-contrast speckle
+    // (specular spanned 0–1.40 against diffuse's 0.12–0.67). Wider lobe, and
+    // diffuse carries the form. Still clips on axis, so it reads as metal.
+    float specular = pow(max(dot(normal, halfway), 0.0), 24.0);
+    vec3 lit = color.rgb * (0.12 + 0.70 * diffuse)
+             + color.rgb * (0.45 * specular);
+#else
+    float specular = pow(max(dot(normal, halfway), 0.0), 70.0);
     vec3 lit = color.rgb * (0.12 + 0.55 * diffuse)
              + color.rgb * (1.40 * specular);
+#endif
 
+#ifdef HARD_DISK_AA
+    // Opaque replace blend: coverage via discard, not alpha.
+    if (falloff < 0.01) discard;
+#ifdef SPLAT_DEBUG_FLAT
+    // Albedo only: if the dark marks survive this, they are coverage or depth,
+    // not shading.
+    outColor = vec4(color.rgb, 1.0);
+#elif defined(SPLAT_DEBUG_NORMAL)
+    outColor = vec4(normal * 0.5 + 0.5, 1.0);
+#elif defined(SPLAT_DEBUG_DIFFUSE)
+    outColor = vec4(vec3(diffuse), 1.0);
+#else
+    outColor = vec4(lit, 1.0);
+#endif
+#else
     float alpha = color.a * falloff;
+    if (alpha < 0.01) discard;
 
     // Premultiplied, to match the blend set up on the pipeline.
     outColor = vec4(lit * alpha, alpha);
+#endif
 #endif
 }
 )";
 
 const vsg::vec2 cornerOffsets[4] = {{-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
 
-// Both stages branch on SPLAT_DEPTH_PREPASS, so both are built from the same
-// body with the define prepended.
-std::string shaderSource(const char* body, bool depthPrepass)
+// Both stages branch on SPLAT_DEPTH_PREPASS / HARD_DISK_AA, so stages are built
+// from the same body with the defines prepended. UCAM_SPLAT_DEBUG adds one more
+// define for the diagnostic outputs; unset leaves the source unchanged.
+std::string shaderSource(const char* body, bool depthPrepass, bool hardDisk = false)
 {
     std::string source = "#version 450\n#extension GL_ARB_separate_shader_objects : enable\n";
     if (depthPrepass) source += "#define SPLAT_DEPTH_PREPASS 1\n";
+    if (hardDisk) source += "#define HARD_DISK_AA 1\n";
+    if (const char* debug = ucamSplatDebugDefine())
+    {
+        source += "#define ";
+        source += debug;
+        source += " 1\n";
+    }
     return source + body;
 }
 
-// Splats are drawn twice. The first pass writes only depth, so that the far
-// side of the model is hidden; the second blends the Gaussians without touching
-// depth, so that neighbouring splats on the near surface all contribute instead
-// of the closest one masking the rest. Drawing them in one pass instead leaves
-// each splat's soft rim blocking its neighbours, which shows up as dark
-// scalloped edges rather than a continuous sheet.
-vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
+enum class SplatPipelineKind
 {
-    auto vertexShader = vsg::ShaderStage::create(VK_SHADER_STAGE_VERTEX_BIT, "main",
-                                                 shaderSource(splatVertexBody, depthPrepass));
-    auto fragmentShader = vsg::ShaderStage::create(VK_SHADER_STAGE_FRAGMENT_BIT, "main",
-                                                   shaderSource(splatFragmentBody, depthPrepass));
+    DepthPrepass,
+    ColorBlend,
+    OpaqueHardDisk
+};
+
+// Splats are drawn twice for Gaussians. The first pass writes only depth, so
+// that the far side of the model is hidden; the second blends without touching
+// depth. Hard disks are opaque and use a single depth-writing colour pass.
+vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(SplatPipelineKind kind, PointRenderMode mode)
+{
+    const bool hardDisk = (mode == PointRenderMode::HardDiskWithAA);
+    const bool depthPrepass = (kind == SplatPipelineKind::DepthPrepass);
+    const bool opaqueHard = (kind == SplatPipelineKind::OpaqueHardDisk);
+
+    auto vertexShader = vsg::ShaderStage::create(
+        VK_SHADER_STAGE_VERTEX_BIT, "main",
+        shaderSource(splatVertexBody, depthPrepass && !opaqueHard, hardDisk));
+    auto fragmentShader = vsg::ShaderStage::create(
+        VK_SHADER_STAGE_FRAGMENT_BIT, "main",
+        shaderSource(splatFragmentBody, depthPrepass && !opaqueHard, hardDisk));
 
     // VSG records the projection and model-view matrices into the first 128
     // bytes of push constant space for whichever pipeline is bound.
@@ -208,13 +346,13 @@ vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
         VkVertexInputBindingDescription{0, 16, VK_VERTEX_INPUT_RATE_VERTEX},
         VkVertexInputBindingDescription{1, 8, VK_VERTEX_INPUT_RATE_VERTEX},
         VkVertexInputBindingDescription{2, 16, VK_VERTEX_INPUT_RATE_VERTEX},
-        VkVertexInputBindingDescription{3, 12, VK_VERTEX_INPUT_RATE_VERTEX}};
+        VkVertexInputBindingDescription{3, 16, VK_VERTEX_INPUT_RATE_VERTEX}};
 
     vsg::VertexInputState::Attributes vertexAttributes{
         VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0},
         VkVertexInputAttributeDescription{1, 1, VK_FORMAT_R32G32_SFLOAT, 0},
         VkVertexInputAttributeDescription{2, 2, VK_FORMAT_R32G32B32A32_SFLOAT, 0},
-        VkVertexInputAttributeDescription{3, 3, VK_FORMAT_R32G32B32_SFLOAT, 0}};
+        VkVertexInputAttributeDescription{3, 3, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
 
     // The quads face the camera, but which way round their winding comes out
     // depends on the view, so neither face can be culled.
@@ -222,13 +360,23 @@ vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
     rasterizationState->cullMode = VK_CULL_MODE_NONE;
 
     auto colorBlendState = vsg::ColorBlendState::create();
-    if (depthPrepass)
+    if (depthPrepass && !opaqueHard)
     {
         colorBlendState->attachments = vsg::ColorBlendState::ColorBlendAttachments{
             {VK_FALSE,
              VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
              VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
              0}};
+    }
+    else if (opaqueHard)
+    {
+        // Replace; hard disks do not soft-blend with neighbours.
+        colorBlendState->attachments = vsg::ColorBlendState::ColorBlendAttachments{
+            {VK_FALSE,
+             VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+             VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+             VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                 VK_COLOR_COMPONENT_A_BIT}};
     }
     else
     {
@@ -245,7 +393,8 @@ vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
 
     auto depthStencilState = vsg::DepthStencilState::create();
     depthStencilState->depthTestEnable = VK_TRUE;
-    depthStencilState->depthWriteEnable = depthPrepass ? VK_TRUE : VK_FALSE;
+    depthStencilState->depthWriteEnable =
+        (depthPrepass || opaqueHard) ? VK_TRUE : VK_FALSE;
 
     // The multisample state is deliberately left out so that the viewer's own
     // sample count is picked up from the compile context.
@@ -265,8 +414,60 @@ vsg::ref_ptr<vsg::GraphicsPipeline> createPipeline(bool depthPrepass)
 
 void GaussianSplatSet::ensurePipelines()
 {
-    if (!_depthPipeline) _depthPipeline = createPipeline(true);
-    if (!_colorPipeline) _colorPipeline = createPipeline(false);
+    if (_pointRenderMode == PointRenderMode::HardDiskWithAA)
+    {
+        if (!_colorPipeline)
+            _colorPipeline = createPipeline(SplatPipelineKind::OpaqueHardDisk, _pointRenderMode);
+        _depthPipeline = nullptr;
+        return;
+    }
+    if (!_depthPipeline)
+        _depthPipeline = createPipeline(SplatPipelineKind::DepthPrepass, _pointRenderMode);
+    if (!_colorPipeline)
+        _colorPipeline = createPipeline(SplatPipelineKind::ColorBlend, _pointRenderMode);
+}
+
+void GaussianSplatSet::rebindPipelines()
+{
+    if (!_root || !_colorPipeline) return;
+
+    // Drop existing pass groups (keep overlay if present).
+    vsg::ref_ptr<vsg::Node> overlay = _overlay;
+    _root->children.clear();
+
+    if (_pointRenderMode == PointRenderMode::HardDiskWithAA)
+    {
+        auto colorGroup = vsg::StateGroup::create();
+        colorGroup->add(vsg::BindGraphicsPipeline::create(_colorPipeline));
+        if (_draw) colorGroup->addChild(_draw);
+        _root->addChild(colorGroup);
+    }
+    else
+    {
+        if (!_depthPipeline) ensurePipelines();
+        auto depthGroup = vsg::StateGroup::create();
+        depthGroup->add(vsg::BindGraphicsPipeline::create(_depthPipeline));
+        if (_draw) depthGroup->addChild(_draw);
+        _root->addChild(depthGroup);
+
+        auto colorGroup = vsg::StateGroup::create();
+        colorGroup->add(vsg::BindGraphicsPipeline::create(_colorPipeline));
+        if (_draw) colorGroup->addChild(_draw);
+        _root->addChild(colorGroup);
+    }
+    if (overlay) _root->addChild(overlay);
+    _needsCompile = true;
+}
+
+void GaussianSplatSet::setPointRenderMode(PointRenderMode mode)
+{
+    if (mode == _pointRenderMode) return;
+    _pointRenderMode = mode;
+    _depthPipeline = nullptr;
+    _colorPipeline = nullptr;
+    if (!_root) return;
+    ensurePipelines();
+    rebindPipelines();
 }
 
 void GaussianSplatSet::initSlotGeometry(std::size_t beginSplat, std::size_t endSplat)
@@ -298,7 +499,7 @@ void GaussianSplatSet::zeroDynamicRange(std::size_t beginSplat, std::size_t endS
     {
         (*_centerRadius)[i] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
         (*_colors)[i] = vsg::vec4(0.0f, 0.0f, 0.0f, 0.0f);
-        (*_normals)[i] = vsg::vec3(0.0f, 0.0f, 1.0f);
+        (*_normals)[i] = vsg::vec4(0.0f, 0.0f, 1.0f, 0.0f);
     }
 }
 
@@ -329,17 +530,7 @@ void GaussianSplatSet::bindDrawArrays()
     {
         ensurePipelines();
         _root = vsg::Group::create();
-
-        auto depthGroup = vsg::StateGroup::create();
-        depthGroup->add(vsg::BindGraphicsPipeline::create(_depthPipeline));
-        depthGroup->addChild(_draw);
-        _root->addChild(depthGroup);
-
-        auto colorGroup = vsg::StateGroup::create();
-        colorGroup->add(vsg::BindGraphicsPipeline::create(_colorPipeline));
-        colorGroup->addChild(_draw);
-        _root->addChild(colorGroup);
-        _needsCompile = true;
+        rebindPipelines();
     }
     else
     {
@@ -371,7 +562,7 @@ void GaussianSplatSet::ensureCapacity(std::size_t needed)
     auto centerRadius = vsg::vec4Array::create(vertexCount);
     auto corners = vsg::vec2Array::create(vertexCount);
     auto colors = vsg::vec4Array::create(vertexCount);
-    auto normals = vsg::vec3Array::create(vertexCount);
+    auto normals = vsg::vec4Array::create(vertexCount);
     auto indices = vsg::uintArray::create(indexCount);
 
     centerRadius->properties.dataVariance = vsg::DYNAMIC_DATA;
@@ -438,7 +629,7 @@ void GaussianSplatSet::resize(std::size_t splatCount)
         _centerRadius = vsg::vec4Array::create(vertexCount);
         _corners = vsg::vec2Array::create(vertexCount);
         _colors = vsg::vec4Array::create(vertexCount);
-        _normals = vsg::vec3Array::create(vertexCount);
+        _normals = vsg::vec4Array::create(vertexCount);
         _indices = vsg::uintArray::create(indexCount);
 
         _centerRadius->properties.dataVariance = vsg::DYNAMIC_DATA;
@@ -462,12 +653,18 @@ void GaussianSplatSet::set(std::size_t index, const Splat& splat)
     if (!_centerRadius || index >= _capacity) return;
 
     const auto base = index * 4;
+    // normal.w carries the 6 direction bits plus an 8-bit strength above them.
+    // Peak 63 + 255*64 = 16383, exact in float32.
+    const auto strengthQ = static_cast<std::uint32_t>(
+        std::lround(std::clamp(splat.edgeStrength, 0.0f, 1.0f) * 255.0f));
+    const vsg::vec4 packedNormal(splat.normal.x, splat.normal.y, splat.normal.z,
+                                 static_cast<float>(splat.edgeMask | (strengthQ << 6)));
     for (std::size_t k = 0; k < 4; ++k)
     {
         (*_centerRadius)[base + k] =
             vsg::vec4(splat.position.x, splat.position.y, splat.position.z, splat.radius);
         (*_colors)[base + k] = splat.color;
-        (*_normals)[base + k] = splat.normal;
+        (*_normals)[base + k] = packedNormal;
     }
 }
 
@@ -476,6 +673,8 @@ void GaussianSplatSet::clearSlot(std::size_t index)
     Splat empty{};
     empty.radius = 0.0f;
     empty.normal = vsg::vec3(0.0f, 0.0f, 1.0f);
+    empty.edgeMask = 0;
+    empty.edgeStrength = 0.0f;
     set(index, empty);
 }
 

@@ -503,8 +503,14 @@ void SimulationPanel::onHelixClicked()
     if (std::fabs(_helixPitch) < 1.0e-12) return;
     if (_helixDt < 1.0e-12) return;
 
-    // Reset table, then fill helix samples and draw the path.
+    // Reset table, then restore pristine cast / cut face so a new helix is not
+    // drawn over leftover cuts (same stock wipe as Re-run start).
     onReset();
+    if (_renderManager)
+    {
+        _renderManager->resetBooleanStock();
+        _renderManager->resetSweepAnchor();
+    }
 
     const double dt = _helixDt;
     const double r = _helixRadius;
@@ -729,7 +735,8 @@ void SimulationPanel::stopPlayback()
     _playRow = 0;
     if (_playTimer) _playTimer->stop();
     updateRerunButton();
-    setCutMeshDisplayForPlayback(true);
+    // Do not force cut-mesh display on — that overwrote the checkbox and kept
+    // patchCutFace running while the UI still looked unchecked.
 }
 
 void SimulationPanel::pausePlayback()
@@ -738,7 +745,6 @@ void SimulationPanel::pausePlayback()
     _paused = true;
     if (_playTimer) _playTimer->stop();
     updateRerunButton();
-    setCutMeshDisplayForPlayback(true);
 }
 
 void SimulationPanel::finishPlayback()
@@ -768,7 +774,7 @@ void SimulationPanel::onRerun()
     {
         _paused = false;
         _playing = true;
-        setCutMeshDisplayForPlayback(false);
+        // Keep cut-mesh remesh on (same patchCutFace path as Interactive).
         updateRerunButton();
         if (_playRow + 1 >= _table->rowCount())
         {
@@ -788,7 +794,7 @@ void SimulationPanel::onRerun()
     _renderManager->resetSweepAnchor();
     _paused = false;
     _playing = true;
-    setCutMeshDisplayForPlayback(false);
+    // Keep cut-mesh remesh on (same patchCutFace path as Interactive).
     _playRow = 0;
     updateRerunButton();
     applyRow(0);
@@ -813,7 +819,12 @@ void SimulationPanel::onPlayStep()
         return;
     }
 
-    const int stride = rowsPerStepFromSlider();
+    // With cut-mesh remesh on, keep steps Interactive-sized: one row per tick.
+    // Large multi-row batches inflate dirty UV windows and hang in patchCutFace.
+    // Slider batching stays available for dots-only (mesh off) fast replay.
+    const int stride = Parameter::instance().cutMeshDisplay()
+                           ? 1
+                           : rowsPerStepFromSlider();
     const int toRow = std::min(_playRow + stride, n - 1);
     applyRowRange(_playRow, toRow);
     _playRow = toRow;

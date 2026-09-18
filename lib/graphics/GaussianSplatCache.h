@@ -110,6 +110,8 @@ public:
     bool hasCutFace() const { return _cutFaceLive > 0; }
 
     vsg::ref_ptr<vsg::Node> node() const { return _set.node(); }
+    void setPointRenderMode(PointRenderMode mode) { _set.setPointRenderMode(mode); }
+    PointRenderMode pointRenderMode() const { return _set.pointRenderMode(); }
     void markDirty();
     // True when rebuild allocated or grew GPU arrays; the viewer must compile.
     bool gpuNeedsCompile() const

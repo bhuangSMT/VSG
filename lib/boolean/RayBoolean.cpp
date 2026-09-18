@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <iterator>
 #include <stdexcept>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <tbb/blocked_range.h>
@@ -48,7 +51,158 @@ Normal3f negateNormal(const Normal3f& n)
     return Normal3f{-n[0], -n[1], -n[2]};
 }
 
+// Quantized mesh vertex for adjacency maps (world-space positions on the sweep).
+struct VertKey
+{
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
+
+    bool operator==(const VertKey& o) const
+    {
+        return x == o.x && y == o.y && z == o.z;
+    }
+};
+
+struct VertKeyHash
+{
+    std::size_t operator()(const VertKey& k) const
+    {
+        std::size_t h = static_cast<std::size_t>(static_cast<std::uint32_t>(k.x));
+        h ^= static_cast<std::size_t>(static_cast<std::uint32_t>(k.y)) + 0x9e3779b9u + (h << 6) +
+             (h >> 2);
+        h ^= static_cast<std::size_t>(static_cast<std::uint32_t>(k.z)) + 0x9e3779b9u + (h << 6) +
+             (h >> 2);
+        return h;
+    }
+};
+
+using EdgeKey = std::pair<VertKey, VertKey>;
+
+struct EdgeKeyHash
+{
+    std::size_t operator()(const EdgeKey& e) const
+    {
+        VertKeyHash vh;
+        std::size_t h = vh(e.first);
+        h ^= vh(e.second) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+VertKey quantizeVert(const vsg::vec3& p)
+{
+    constexpr double scale = 1.0e5;
+    return VertKey{static_cast<std::int32_t>(std::llround(static_cast<double>(p.x) * scale)),
+                   static_cast<std::int32_t>(std::llround(static_cast<double>(p.y) * scale)),
+                   static_cast<std::int32_t>(std::llround(static_cast<double>(p.z) * scale))};
+}
+
+EdgeKey makeEdgeKey(VertKey a, VertKey b)
+{
+    if (std::tie(b.x, b.y, b.z) < std::tie(a.x, a.y, a.z)) std::swap(a, b);
+    return {a, b};
+}
+
+struct MeshAdjacency
+{
+    std::unordered_map<VertKey, std::vector<std::uint32_t>, VertKeyHash> vertTris;
+    std::unordered_map<EdgeKey, std::vector<std::uint32_t>, EdgeKeyHash> edgeTris;
+};
+
+void buildMeshAdjacency(const TriangleMesh& mesh, MeshAdjacency& adj)
+{
+    adj.vertTris.clear();
+    adj.edgeTris.clear();
+    const auto& tris = mesh.triangles;
+    adj.vertTris.reserve(tris.size());
+    adj.edgeTris.reserve(tris.size() * 2);
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(tris.size()); ++i)
+    {
+        const MeshTriangle& t = tris[i];
+        const VertKey k0 = quantizeVert(t.v0);
+        const VertKey k1 = quantizeVert(t.v1);
+        const VertKey k2 = quantizeVert(t.v2);
+        adj.vertTris[k0].push_back(i);
+        adj.vertTris[k1].push_back(i);
+        adj.vertTris[k2].push_back(i);
+        adj.edgeTris[makeEdgeKey(k0, k1)].push_back(i);
+        adj.edgeTris[makeEdgeKey(k1, k2)].push_back(i);
+        adj.edgeTris[makeEdgeKey(k2, k0)].push_back(i);
+    }
+}
+
+vsg::dvec3 triangleWorldNormal(const MeshTriangle& tri)
+{
+    vsg::dvec3 nWorld(tri.normal.x, tri.normal.y, tri.normal.z);
+    if (vsg::length(nWorld) > 1.0e-12) return nWorld;
+    const vsg::dvec3 e1(tri.v1.x - tri.v0.x, tri.v1.y - tri.v0.y, tri.v1.z - tri.v0.z);
+    const vsg::dvec3 e2(tri.v2.x - tri.v0.x, tri.v2.y - tri.v0.y, tri.v2.z - tri.v0.z);
+    return vsg::cross(e1, e2);
+}
+
+vsg::dvec3 averageTriangleNormals(const TriangleMesh& mesh,
+                                  const std::vector<std::uint32_t>& indices)
+{
+    vsg::dvec3 sum(0.0, 0.0, 0.0);
+    for (std::uint32_t i : indices)
+    {
+        if (i >= mesh.triangles.size()) continue;
+        vsg::dvec3 n = triangleWorldNormal(mesh.triangles[i]);
+        const double len = vsg::length(n);
+        if (len > 1.0e-12) sum += n / len;
+    }
+    return sum;
+}
+
+// Face / edge / vertex shading normal from barycentrics. Prefer vertex over edge.
+vsg::dvec3 hitShadingNormal(const TriangleMesh& mesh, const MeshAdjacency& adj,
+                            std::size_t faceIndex, double w0, double w1, double w2)
+{
+    const MeshTriangle& tri = mesh.triangles[faceIndex];
+    vsg::dvec3 faceN = triangleWorldNormal(tri);
+
+    constexpr double kVert = 0.999;
+    constexpr double kEdge = 1.0e-3;
+
+    if (w0 >= kVert || w1 >= kVert || w2 >= kVert)
+    {
+        const VertKey key = (w0 >= kVert)   ? quantizeVert(tri.v0)
+                            : (w1 >= kVert) ? quantizeVert(tri.v1)
+                                            : quantizeVert(tri.v2);
+        const auto it = adj.vertTris.find(key);
+        if (it != adj.vertTris.end() && !it->second.empty())
+        {
+            const vsg::dvec3 avg = averageTriangleNormals(mesh, it->second);
+            if (vsg::length(avg) > 1.0e-12) return avg;
+        }
+        return faceN;
+    }
+
+    if (w0 <= kEdge || w1 <= kEdge || w2 <= kEdge)
+    {
+        // Small weight is opposite the edge formed by the other two vertices.
+        EdgeKey edge;
+        if (w0 <= kEdge)
+            edge = makeEdgeKey(quantizeVert(tri.v1), quantizeVert(tri.v2));
+        else if (w1 <= kEdge)
+            edge = makeEdgeKey(quantizeVert(tri.v0), quantizeVert(tri.v2));
+        else
+            edge = makeEdgeKey(quantizeVert(tri.v0), quantizeVert(tri.v1));
+
+        const auto it = adj.edgeTris.find(edge);
+        if (it != adj.edgeTris.end() && it->second.size() >= 2)
+        {
+            const vsg::dvec3 avg = averageTriangleNormals(mesh, it->second);
+            if (vsg::length(avg) > 1.0e-12) return avg;
+        }
+    }
+
+    return faceN;
+}
+
 void collectHits(const WorldSweep& sweep,
+                 const MeshAdjacency& adjacency,
                  std::size_t axis, std::size_t u, std::size_t v,
                  double u0, double v0,
                  std::vector<RayHit>& hits)
@@ -100,15 +254,7 @@ void collectHits(const WorldSweep& sweep,
         worldHit[axis] = alongWorld;
         const vsg::dvec3 modelHit = sweep.worldToModel * worldHit;
 
-        // Prefer the stored outward mesh normal (set at sweep emit); fall back to
-        // winding cross when the facet normal is missing / degenerate.
-        vsg::dvec3 nWorld(tri.normal.x, tri.normal.y, tri.normal.z);
-        if (vsg::length(nWorld) <= 1.0e-12)
-        {
-            const vsg::dvec3 e1(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
-            const vsg::dvec3 e2(c[0] - a[0], c[1] - a[1], c[2] - a[2]);
-            nWorld = vsg::cross(e1, e2);
-        }
+        const vsg::dvec3 nWorld = hitShadingNormal(sweep.mesh, adjacency, f, w0, w1, w2);
         // w=0 so translation in worldToModel does not affect the normal.
         const vsg::dvec4 nModel4 =
             sweep.worldToModel * vsg::dvec4(nWorld.x, nWorld.y, nWorld.z, 0.0);
@@ -496,6 +642,7 @@ std::vector<CellUv> markCellsFromTriangles(const RayGrid& grid,
 
 void processAxisGrid(RayGrid& grid,
                      const WorldSweep& sweep,
+                     const MeshAdjacency& adjacency,
                      BooleanOp op,
                      double mergeTol,
                      const BoundingBox& stockBounds,
@@ -567,7 +714,7 @@ void processAxisGrid(RayGrid& grid,
                 // before paying for BVH triangle tests.
                 if (op == BooleanOp::Subtraction && overlap.empty()) continue;
 
-                collectHits(sweep, axis, u, v, u0, v0, local.hits);
+                collectHits(sweep, adjacency, axis, u, v, u0, v0, local.hits);
                 if (local.hits.size() < 2) continue;
 
                 std::vector<Interval> sweepSolid;
@@ -768,6 +915,9 @@ void applyBooleanInPlace(RayModel& model,
                                 modelToWorld, vsg::inverse(modelToWorld)};
     if (!worldSweep.worldBounds.valid()) return;
 
+    MeshAdjacency adjacency;
+    buildMeshAdjacency(sweep.mesh(), adjacency);
+
     const double mergeTol = std::max(1.0e-9, worldSweep.worldBounds.diagonal() * 1.0e-9);
 
     model._pairingStats = {};
@@ -795,7 +945,7 @@ void applyBooleanInPlace(RayModel& model,
     for (std::size_t axis = 0; axis < 3; ++axis)
     {
         if (RayGrid* g = model.grid(axis))
-            processAxisGrid(*g, worldSweep, op, mergeTol, model._bounds,
+            processAxisGrid(*g, worldSweep, adjacency, op, mergeTol, model._bounds,
                             model._pairingStats, model._lastDirtyCellCount);
     }
 }
