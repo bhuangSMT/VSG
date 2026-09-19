@@ -94,6 +94,10 @@ public:
     void setToolType(ToolType type);
     ToolType toolType() const { return _toolType; }
 
+    // Cutting-body color for the live cutter, cut-face overlay, and splats.
+    void setToolColor(const vsg::vec4& color);
+    const vsg::vec4& toolColor() const { return _toolColor; }
+
     // Rebuild the cutter (and display shank, if Parameter has shank size)
     // from Parameter. Swept volume still uses the cutter only. Keeps the
     // existing pose when the tool was already on screen.

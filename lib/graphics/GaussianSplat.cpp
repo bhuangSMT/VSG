@@ -503,45 +503,91 @@ void GaussianSplatSet::zeroDynamicRange(std::size_t beginSplat, std::size_t endS
     }
 }
 
+void GaussianSplatSet::replaceLiveDraw(vsg::ref_ptr<vsg::VertexIndexDraw> next)
+{
+    if (!_root) return;
+    for (auto& child : _root->children)
+    {
+        if (child == _overlay) continue;
+        auto* sg = dynamic_cast<vsg::StateGroup*>(child.get());
+        if (!sg) continue;
+        auto& kids = sg->children;
+        const bool had =
+            _draw && std::find(kids.begin(), kids.end(), _draw) != kids.end();
+        if (!had) continue;
+        kids.erase(std::remove(kids.begin(), kids.end(), _draw), kids.end());
+        if (next) sg->addChild(next);
+    }
+    _draw = next;
+}
+
 void GaussianSplatSet::bindDrawArrays()
 {
     // assignArrays/assignIndices allocate fresh BufferInfos with no vk buffers.
     // Reusing a VertexIndexDraw that CompileManager already visited leaves
     // record() calling indices->buffer->vk() on a null buffer (SIGSEGV at ~0x30).
-    if (_draw && _root)
-    {
-        for (auto& child : _root->children)
-        {
-            auto* sg = dynamic_cast<vsg::StateGroup*>(child.get());
-            if (!sg) continue;
-            auto& kids = sg->children;
-            kids.erase(std::remove(kids.begin(), kids.end(), _draw), kids.end());
-        }
-        _draw = nullptr;
-    }
-
-    _draw = vsg::VertexIndexDraw::create();
-    _draw->assignArrays(vsg::DataList{_centerRadius, _corners, _colors, _normals});
-    _draw->assignIndices(_indices);
-    applyDrawCount();
-    _draw->instanceCount = 1;
+    auto newDraw = vsg::VertexIndexDraw::create();
+    newDraw->assignArrays(vsg::DataList{_centerRadius, _corners, _colors, _normals});
+    newDraw->assignIndices(_indices);
+    const auto n = (_drawCount < _capacity) ? _drawCount : _capacity;
+    newDraw->indexCount = static_cast<std::uint32_t>(n * 6);
+    newDraw->instanceCount = 1;
 
     if (!_root)
     {
+        _draw = newDraw;
         ensurePipelines();
         _root = vsg::Group::create();
         rebindPipelines();
+        attachOverlay();
+        return;
     }
-    else
+
+    // Live graph: keep the compiled draw on screen until compile succeeds.
+    if (_draw)
     {
-        for (auto& child : _root->children)
-        {
-            auto* sg = dynamic_cast<vsg::StateGroup*>(child.get());
-            if (sg) sg->addChild(_draw);
-        }
+        _pendingDraw = newDraw;
+        _retiredDraw = nullptr;
         _needsCompile = true;
+        applyDrawCount();
+        return;
     }
+
+    _draw = newDraw;
+    for (auto& child : _root->children)
+    {
+        auto* sg = dynamic_cast<vsg::StateGroup*>(child.get());
+        if (sg) sg->addChild(_draw);
+    }
+    _needsCompile = true;
     attachOverlay();
+}
+
+void GaussianSplatSet::prepareForCompile()
+{
+    if (!_pendingDraw) return;
+    _retiredDraw = _draw;
+    replaceLiveDraw(_pendingDraw);
+    _pendingDraw = nullptr;
+    applyDrawCount();
+}
+
+void GaussianSplatSet::revertFailedCompile()
+{
+    if (!_retiredDraw) return;
+    _pendingDraw = _draw;
+    replaceLiveDraw(_retiredDraw);
+    _retiredDraw = nullptr;
+    _needsCompile = true;
+    applyDrawCount();
+}
+
+void GaussianSplatSet::noteCompiled()
+{
+    _needsCompile = false;
+    _pendingDraw = nullptr;
+    _retiredDraw = nullptr;
+    _compiledCapacity = _capacity;
 }
 
 void GaussianSplatSet::ensureCapacity(std::size_t needed)
@@ -552,9 +598,7 @@ void GaussianSplatSet::ensureCapacity(std::size_t needed)
     ensurePipelines();
 
     const std::size_t oldCap = _capacity;
-    std::size_t newCap = needed;
-    if (oldCap > 0)
-        newCap = std::max(needed, oldCap + oldCap / 2);
+    const std::size_t newCap = needed;
 
     const auto vertexCount = newCap * 4;
     const auto indexCount = newCap * 6;
@@ -610,6 +654,9 @@ void GaussianSplatSet::resize(std::size_t splatCount)
         _normals = nullptr;
         _indices = nullptr;
         _draw = nullptr;
+        _pendingDraw = nullptr;
+        _retiredDraw = nullptr;
+        _compiledCapacity = 0;
         _root = nullptr;
         // Keep cached pipelines for the next ensureCapacity.
         return;
@@ -726,7 +773,10 @@ void GaussianSplatSet::setDrawCount(std::size_t splatCount)
 void GaussianSplatSet::applyDrawCount()
 {
     if (!_draw) return;
-    const auto n = (_drawCount < _capacity) ? _drawCount : _capacity;
+    std::size_t n = (_drawCount < _capacity) ? _drawCount : _capacity;
+    // Pending grow: the live draw still covers only the last compiled prefix.
+    if (_pendingDraw && _compiledCapacity > 0 && n > _compiledCapacity)
+        n = _compiledCapacity;
     _draw->indexCount = static_cast<std::uint32_t>(n * 6);
 }
 

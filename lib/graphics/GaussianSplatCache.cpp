@@ -1200,9 +1200,24 @@ void GaussianSplatCache::freeBlock(std::uint32_t first, std::uint32_t length)
     else _live = 0;
 }
 
-// Free-list only. Growing GPU capacity here would rebind the live VertexIndexDraw
-// with uncompiled BufferInfos, so exhaustion has to fall back to a full rebuild.
-bool GaussianSplatCache::allocBlock(std::uint32_t length, std::uint32_t* outFirst)
+bool GaussianSplatCache::growCapacity(std::uint32_t minExtra)
+{
+    if (minExtra == 0) minExtra = 1;
+    const std::size_t oldCap = _set.capacity();
+    const std::size_t quarter = oldCap / 4;
+    const std::size_t extra =
+        std::max(static_cast<std::size_t>(minExtra), quarter > 0 ? quarter : static_cast<std::size_t>(minExtra));
+    _set.ensureCapacity(oldCap + extra);
+    const std::size_t newCap = _set.capacity();
+    if (newCap <= oldCap) return false;
+    addFreeRange(static_cast<std::uint32_t>(oldCap),
+                 static_cast<std::uint32_t>(newCap - oldCap));
+    _capacity = newCap;
+    _gpuNeedsCompile = true;
+    return true;
+}
+
+bool GaussianSplatCache::takeFreeBlock(std::uint32_t length, std::uint32_t* outFirst)
 {
     if (length == 0 || !outFirst) return false;
 
@@ -1227,6 +1242,13 @@ bool GaussianSplatCache::allocBlock(std::uint32_t length, std::uint32_t* outFirs
         return true;
     }
     return false;
+}
+
+bool GaussianSplatCache::allocBlock(std::uint32_t length, std::uint32_t* outFirst)
+{
+    if (takeFreeBlock(length, outFirst)) return true;
+    if (!growCapacity(length)) return false;
+    return takeFreeBlock(length, outFirst);
 }
 
 bool GaussianSplatCache::fillCell(const RayModel& rayModel,
@@ -1514,12 +1536,14 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
 
     // Reuse the compiled arrays when they already hold the packed prefix.
     // Growing (or the first alloc) rebinds BufferInfos and needs compile.
-    // 2x headroom is only reserved when we have to allocate anyway, so a
-    // later patch can grow cells without a new GPU buffer.
+    // Slack is a small tail, not 2x live — patch grows in place after this.
     const std::size_t capBefore = _set.capacity();
     const bool hadNode = _set.node() != nullptr;
     if (capBefore < live)
-        _set.ensureCapacity(live * 2);
+    {
+        const std::size_t slack = std::max<std::size_t>(live / 16, 4096);
+        _set.ensureCapacity(live + slack);
+    }
     // Capacity growth rebinds BufferInfos (needs compile). Also honour any
     // needsCompile already set on the set/section overlays.
     _gpuNeedsCompile = !hadNode || _set.capacity() != capBefore || _set.needsCompile() ||
@@ -1530,10 +1554,8 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     if (live > 0)
         _allocEnd = static_cast<std::uint32_t>(live);
 
-    // Reused arrays still hold the previous packed/patched discs. Zero them
-    // before refill so skipped leftovers cannot linger in old GPU slots.
-    for (std::size_t i = 0; i < _capacity; ++i)
-        _set.clearSlot(i);
+    // Refill overwrites [0, live). The unused tail is not submitted, so do
+    // not walk or upload _capacity.
 
     const bool statsOn = ucamNormalStatsEnabled();
     if (statsOn) normalStats().reset();
@@ -1575,7 +1597,13 @@ vsg::ref_ptr<vsg::Node> GaussianSplatCache::rebuild(const RayModel& rayModel,
     }
 
     _set.setDrawCount(live);
-    _set.markDirty();
+    if (_gpuNeedsCompile)
+        _set.markDirty();
+    else if (live > 0)
+    {
+        _set.noteDirtySlots(0, static_cast<std::uint32_t>(live));
+        _set.flushDirty();
+    }
     presentCutFace();
     return _set.node();
 }
@@ -1664,6 +1692,16 @@ void GaussianSplatCache::noteCompiled()
     _set.noteCompiled();
     _section.noteCompiled();
     _inspectionSection.noteCompiled();
+}
+
+void GaussianSplatCache::prepareGpuCompile()
+{
+    _set.prepareForCompile();
+}
+
+void GaussianSplatCache::revertFailedGpuCompile()
+{
+    _set.revertFailedCompile();
 }
 
 void GaussianSplatCache::clearSectionGrid()

@@ -129,7 +129,7 @@ private:
     double _toolWheelShoulderHeight = 0.015;
     bool _sweptVolume = false;
     bool _showLastSweptVolumeOnly = true;
-    bool _cutMeshDisplay = true;
+    bool _cutMeshDisplay = false;
     BooleanOp _booleanOp = BooleanOp::None;
     SimulationMode _simulationMode = SimulationMode::Interactive;
     std::string _lastImportPath;

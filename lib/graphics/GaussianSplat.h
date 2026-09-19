@@ -76,7 +76,7 @@ class GaussianSplatSet
 public:
     // Exact size (or clear when 0). Prefer ensureCapacity for rebuild/grow paths.
     void resize(std::size_t splatCount);
-    // Grow-only with hysteresis; no-op when needed <= capacity. Keeps pipelines.
+    // Grow-only to `needed`; no-op when needed <= capacity. Keeps pipelines.
     void ensureCapacity(std::size_t needed);
 
     void set(std::size_t index, const Splat& splat);
@@ -101,8 +101,10 @@ public:
     std::size_t capacity() const { return _capacity; }
     vsg::ref_ptr<vsg::Node> node() const { return _root; }
     bool empty() const { return !_root || _capacity == 0; }
-    bool needsCompile() const { return _needsCompile; }
-    void noteCompiled() { _needsCompile = false; }
+    bool needsCompile() const { return _needsCompile || _pendingDraw; }
+    void prepareForCompile();
+    void revertFailedCompile();
+    void noteCompiled();
 
 private:
     struct DirtySpan
@@ -117,11 +119,13 @@ private:
     void zeroDynamicRange(std::size_t beginSplat, std::size_t endSplat);
     void bindDrawArrays();
     void applyDrawCount();
+    void replaceLiveDraw(vsg::ref_ptr<vsg::VertexIndexDraw> next);
     void attachOverlay();
     bool copyDirtySpan(const DirtySpan& span);
 
     std::size_t _capacity = 0;
     std::size_t _drawCount = 0;
+    std::size_t _compiledCapacity = 0;
     bool _needsCompile = false;
     PointRenderMode _pointRenderMode = PointRenderMode::Gaussian;
     std::vector<DirtySpan> _dirtySpans;
@@ -132,6 +136,8 @@ private:
     vsg::ref_ptr<vsg::vec4Array> _normals;
     vsg::ref_ptr<vsg::uintArray> _indices;
     vsg::ref_ptr<vsg::VertexIndexDraw> _draw;
+    vsg::ref_ptr<vsg::VertexIndexDraw> _pendingDraw;
+    vsg::ref_ptr<vsg::VertexIndexDraw> _retiredDraw;
     vsg::ref_ptr<vsg::Group> _root;
     vsg::ref_ptr<vsg::GraphicsPipeline> _depthPipeline;
     vsg::ref_ptr<vsg::GraphicsPipeline> _colorPipeline;

@@ -821,10 +821,13 @@ void RenderManager::refreshCutMeshDisplay()
 void RenderManager::refreshSplatViewForCamera()
 {
     if (!usesSplatView(_viewMode) || !_rayModel || _rayModel->rayCount() == 0) return;
-    // Stock densify only — never remesh an already-uploaded cut face.
-    const BooleanOp op = Parameter::instance().booleanOp();
-    const SplatViewCull viewCull = splatViewCull();
     const int stride = displayStride();
+    // Same stride: discs already on the GPU stay. Packed rebuild only when
+    // densify actually changes the sample grid.
+    if (!_splatCache.empty() && _splatCache.stride() == stride) return;
+
+    // Stock densify only — never remesh an already-uploaded cut face.
+    const SplatViewCull viewCull = splatViewCull();
     const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
     _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
                         skipCutSplats, viewCull);
@@ -1069,14 +1072,14 @@ void RenderManager::presentSplatCache()
     {
         // Only drop the compile flag once the arrays really are on the device.
         // Clearing it after a failed compile lets the next frame record a draw
-        // with unbacked BufferInfos, and flushDirty() copy into them.
+        // with unbacked BufferInfos (SIGSEGV at BufferInfo::buffer + 0x30).
+        _splatCache.prepareGpuCompile();
         if (attach(applyFit(_splatCache.node(), _rayModel->bounds()), true))
             _splatCache.noteCompiled();
-        else if (_viewer)
-            _viewer->request();
+        else
+            _splatCache.revertFailedGpuCompile();
         return;
     }
-    _splatCache.markDirty();
     if (_viewer) _viewer->request();
 }
 
@@ -1386,6 +1389,14 @@ void RenderManager::setToolType(ToolType type)
 void RenderManager::updateToolGeometry()
 {
     rebuildTool(true);
+}
+
+void RenderManager::setToolColor(const vsg::vec4& color)
+{
+    if (_toolColor == color) return;
+    _toolColor = color;
+    if (_toolType != ToolType::None)
+        rebuildTool(true);
 }
 
 float RenderManager::worldFromModelLength(double value) const
@@ -1781,10 +1792,29 @@ void RenderManager::resetBooleanStock()
     _inspectionBooleanPose.reset();
     _rayModel = _sourceRayModel;
     _splatCache.clearCutFace();
-    if (usesRayModel(_viewMode) && _rayModel && _rayModel->rayCount() > 0)
-        rebuild();
-    else if (_viewer)
-        _viewer->request();
+
+    if (!usesRayModel(_viewMode) || !_rayModel || _rayModel->rayCount() == 0)
+    {
+        if (_viewer) _viewer->request();
+        return;
+    }
+
+    // Packed rebuild of the source cast. Do not updateRegion the stock AABB:
+    // that keeps _allocEnd at the cut high-water mark and submits holes.
+    // Do not rebuildCutFace: the source has no cut overlay.
+    if (usesSplatView(_viewMode))
+    {
+        const int stride = displayStride();
+        _splatCache.setPointRenderMode(_viewMode == ViewMode::Disk
+                                           ? PointRenderMode::HardDiskWithAA
+                                           : PointRenderMode::Gaussian);
+        _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
+                            skipCutSplatEnds(false), splatViewCull());
+        presentSplatCache();
+        return;
+    }
+
+    rebuild();
 }
 
 bool RenderManager::shellStock(double thickness)
@@ -2527,6 +2557,24 @@ void RenderManager::applyBooleanToRayModel()
             patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii, style,
                                                skipCutSplats, viewCull);
         }
+        if (patched == PatchResult::OutOfSpace)
+        {
+            // Grow is in-place now; retry the same dirty window. Packed rebuild
+            // only if the sample grid itself changed (LayoutChanged below).
+            if (restoreAabb.valid())
+            {
+                patched = _splatCache.updateRegion(*_rayModel, restoreAabb, stride, radii, style,
+                                                   skipCutSplats, viewCull);
+                if (patched == PatchResult::Ok && dirtyModelAabb.valid())
+                    patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii,
+                                                       style, skipCutSplats, viewCull);
+            }
+            else
+            {
+                patched = _splatCache.updateRegion(*_rayModel, dirtyModelAabb, stride, radii,
+                                                   style, skipCutSplats, viewCull);
+            }
+        }
         if (patched == PatchResult::Ok)
         {
             const double splatMs = millisSince(patchStart);
@@ -2538,20 +2586,23 @@ void RenderManager::applyBooleanToRayModel()
                                    dirtyModelAabb, /*allowPatch=*/true);
             const double sectionMs = millisSince(sectionStart);
             logCutProfile(booleanMs, "patch", splatMs, dirtyModelAabb, cloneMs, sectionMs);
-            // flushDirty already mapped dirty spans; also markDirty so a partial
-            // host upload cannot leave the previous GPU frame until the next rebuild.
             if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
                 presentSplatCache();
-            else
-            {
-                _splatCache.markDirty();
-                if (_viewer) _viewer->request();
-            }
+            else if (_viewer)
+                _viewer->request();
             return;
         }
         if (_profiling)
             std::printf("  splat patch failed (%s) after %.2f ms\n",
                         toString(patched), millisSince(patchStart));
+        if (patched != PatchResult::LayoutChanged)
+        {
+            if (_splatCache.gpuNeedsCompile() || !splatOnScreen())
+                presentSplatCache();
+            else if (_viewer)
+                _viewer->request();
+            return;
+        }
     }
 
     if (usesRayModel(_viewMode))

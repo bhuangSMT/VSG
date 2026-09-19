@@ -887,8 +887,23 @@ void SimulationPanel::clearLibrarySelection()
     _toolTable->blockSignals(false);
 }
 
-void SimulationPanel::updateLibraryEntry(int toolType, double radius, double cuttingLength,
-                                         double shankLength, double shankRadius, double tipWidth,
+int SimulationPanel::libraryRowForId(int toolId) const
+{
+    if (!_toolTable || toolId <= 0) return -1;
+    for (int row = 0; row < _toolTable->rowCount(); ++row)
+    {
+        QTableWidgetItem* idItem = _toolTable->item(row, 0);
+        if (!idItem) continue;
+        const int stored = idItem->data(Qt::UserRole + 6).toInt();
+        if (stored == toolId) return row;
+        if (stored == 0 && idItem->text().toInt() == toolId) return row;
+    }
+    return -1;
+}
+
+void SimulationPanel::updateLibraryEntry(int toolId, int toolType, double radius,
+                                         double cuttingLength, double shankLength,
+                                         double shankRadius, double tipWidth,
                                          double shoulderWidth, double taperHeight,
                                          double shoulderHeight)
 {
@@ -897,50 +912,149 @@ void SimulationPanel::updateLibraryEntry(int toolType, double radius, double cut
         !(shankRadius > 0.0))
         return;
 
-    int matchRow = -1;
-    const bool blocked = _toolTable->blockSignals(true);
-    for (int row = 0; row < _toolTable->rowCount(); ++row)
+    const auto type = static_cast<ToolType>(toolType);
+    if (type == ToolType::GrindingWheel)
     {
-        QTableWidgetItem* idItem = _toolTable->item(row, 0);
-        if (!idItem || idItem->data(Qt::UserRole).toInt() != toolType) continue;
-        matchRow = row;
-        if (toolType == static_cast<int>(ToolType::GrindingWheel))
+        const double totalH = taperHeight + shoulderHeight;
+        if (totalH > 0.0)
         {
-            if (tipWidth > 0.0) idItem->setData(Qt::UserRole + 1, tipWidth);
-            if (shoulderWidth > 0.0) idItem->setData(Qt::UserRole + 2, shoulderWidth);
-            if (taperHeight > 0.0) idItem->setData(Qt::UserRole + 3, taperHeight);
-            if (shoulderHeight >= 0.0) idItem->setData(Qt::UserRole + 4, shoulderHeight);
-            const double totalH =
-                idItem->data(Qt::UserRole + 3).toDouble() + idItem->data(Qt::UserRole + 4).toDouble();
-            if (totalH > 0.0)
+            radius = totalH;
+            cuttingLength = totalH;
+        }
+    }
+
+    int matchRow = libraryRowForId(toolId);
+    const bool blocked = _toolTable->blockSignals(true);
+    if (matchRow < 0)
+    {
+        matchRow = _toolTable->rowCount();
+        for (int row = 0; row < _toolTable->rowCount(); ++row)
+        {
+            QTableWidgetItem* idItem = _toolTable->item(row, 0);
+            if (!idItem) continue;
+            int existing = idItem->data(Qt::UserRole + 6).toInt();
+            if (existing <= 0) existing = idItem->text().toInt();
+            if (existing > toolId)
             {
-                radius = totalH;
-                cuttingLength = totalH;
+                matchRow = row;
+                break;
             }
         }
-        auto setNumber = [this, row](int col, double value) {
-            QTableWidgetItem* cell = _toolTable->item(row, col);
-            if (!cell)
-            {
-                cell = makeEditableCell(value, 6);
-                _toolTable->setItem(row, col, cell);
-            }
-            else
-            {
-                cell->setText(QString::number(value, 'f', 6));
-            }
-        };
-        setNumber(2, radius);
-        setNumber(3, cuttingLength);
-        setNumber(4, shankLength);
-        setNumber(5, shankRadius);
-        break;
+        _toolTable->insertRow(matchRow);
+        _toolTable->setItem(matchRow, 0, makeTextCell(QString::number(toolId)));
+        _toolTable->setItem(matchRow, 1, makeTextCell(QString::fromLatin1(toolTypeLabel(type)),
+                                                      Qt::AlignLeft));
+        _toolTable->setItem(matchRow, 2, makeEditableCell(radius, 6));
+        _toolTable->setItem(matchRow, 3, makeEditableCell(cuttingLength, 6));
+        _toolTable->setItem(matchRow, 4, makeEditableCell(shankLength, 6));
+        _toolTable->setItem(matchRow, 5, makeEditableCell(shankRadius, 6));
     }
+
+    QTableWidgetItem* idItem = _toolTable->item(matchRow, 0);
+    if (!idItem)
+    {
+        idItem = makeTextCell(QString::number(toolId));
+        _toolTable->setItem(matchRow, 0, idItem);
+    }
+    idItem->setText(QString::number(toolId));
+    idItem->setData(Qt::UserRole, toolType);
+    idItem->setData(Qt::UserRole + 6, toolId);
+    if (type == ToolType::GrindingWheel)
+    {
+        if (tipWidth > 0.0) idItem->setData(Qt::UserRole + 1, tipWidth);
+        if (shoulderWidth > 0.0) idItem->setData(Qt::UserRole + 2, shoulderWidth);
+        if (taperHeight > 0.0) idItem->setData(Qt::UserRole + 3, taperHeight);
+        if (shoulderHeight >= 0.0) idItem->setData(Qt::UserRole + 4, shoulderHeight);
+    }
+
+    auto setText = [this, matchRow](int col, const QString& text) {
+        QTableWidgetItem* cell = _toolTable->item(matchRow, col);
+        if (!cell)
+        {
+            cell = makeTextCell(text, Qt::AlignLeft);
+            _toolTable->setItem(matchRow, col, cell);
+        }
+        else
+        {
+            cell->setText(text);
+        }
+    };
+    auto setNumber = [this, matchRow](int col, double value) {
+        QTableWidgetItem* cell = _toolTable->item(matchRow, col);
+        if (!cell)
+        {
+            cell = makeEditableCell(value, 6);
+            _toolTable->setItem(matchRow, col, cell);
+        }
+        else
+        {
+            cell->setText(QString::number(value, 'f', 6));
+        }
+    };
+    setText(1, QString::fromLatin1(toolTypeLabel(type)));
+    setNumber(2, radius);
+    setNumber(3, cuttingLength);
+    setNumber(4, shankLength);
+    setNumber(5, shankRadius);
     _toolTable->blockSignals(blocked);
 
-    if (matchRow >= 0 && matchRow == _toolTable->currentRow() &&
-        !_toolTable->selectedItems().isEmpty())
+    if (matchRow == _toolTable->currentRow() && !_toolTable->selectedItems().isEmpty())
         applySelectedLibraryTool();
+}
+
+void SimulationPanel::updateLibraryColor(int toolId, int toolType, const QColor& color)
+{
+    if (!color.isValid() || toolType == static_cast<int>(ToolType::None)) return;
+
+    if (_toolTable)
+    {
+        int row = libraryRowForId(toolId);
+        if (row < 0)
+        {
+            for (int i = 0; i < _toolTable->rowCount(); ++i)
+            {
+                QTableWidgetItem* idItem = _toolTable->item(i, 0);
+                if (!idItem || idItem->data(Qt::UserRole).toInt() != toolType) continue;
+                row = i;
+                break;
+            }
+        }
+        if (row >= 0)
+        {
+            if (QTableWidgetItem* idItem = _toolTable->item(row, 0))
+                idItem->setData(Qt::UserRole + 5, color);
+        }
+    }
+
+    if (_renderManager)
+    {
+        _renderManager->setToolColor(vsg::vec4(static_cast<float>(color.redF()),
+                                               static_cast<float>(color.greenF()),
+                                               static_cast<float>(color.blueF()), 1.0f));
+    }
+}
+
+void SimulationPanel::removeLibraryTool(int toolId)
+{
+    if (!_toolTable || toolId <= 0) return;
+    const int row = libraryRowForId(toolId);
+    if (row < 0) return;
+
+    const bool wasSelected = row == _toolTable->currentRow() &&
+                             !_toolTable->selectedItems().isEmpty();
+    const bool blocked = _toolTable->blockSignals(true);
+    _toolTable->removeRow(row);
+    _toolTable->blockSignals(blocked);
+
+    if (!wasSelected) return;
+    const int remaining = _toolTable->rowCount();
+    if (remaining == 0)
+    {
+        clearLibrarySelection();
+        return;
+    }
+    _toolTable->selectRow(std::min(row, remaining - 1));
+    applySelectedLibraryTool();
 }
 
 void SimulationPanel::onToolLibrarySelectionChanged()
@@ -996,6 +1110,13 @@ bool SimulationPanel::applySelectedLibraryTool()
     }
     if (_renderManager)
     {
+        const QColor color = idItem->data(Qt::UserRole + 5).value<QColor>();
+        if (color.isValid())
+        {
+            _renderManager->setToolColor(vsg::vec4(static_cast<float>(color.redF()),
+                                                   static_cast<float>(color.greenF()),
+                                                   static_cast<float>(color.blueF()), 1.0f));
+        }
         _renderManager->setToolType(type);
         _renderManager->updateToolGeometry();
     }
@@ -1020,7 +1141,9 @@ void SimulationPanel::onToolLibraryDoubleClicked(int row, int)
     const QTableWidgetItem* shankRadiusItem = _toolTable->item(row, 5);
     if (!idItem || !radiusItem || !cuttingItem || !shankItem || !shankRadiusItem) return;
 
-    emit toolLibraryPreviewRequested(idItem->data(Qt::UserRole).toInt(),
+    int toolId = idItem->data(Qt::UserRole + 6).toInt();
+    if (toolId <= 0) toolId = idItem->text().toInt();
+    emit toolLibraryPreviewRequested(toolId, idItem->data(Qt::UserRole).toInt(),
                                      radiusItem->text().toDouble(),
                                      cuttingItem->text().toDouble(),
                                      shankItem->text().toDouble(),
@@ -1068,6 +1191,7 @@ void SimulationPanel::fillToolLibrary()
         _toolTable->insertRow(row);
         auto* idItem = makeTextCell(QString::number(seed.id));
         idItem->setData(Qt::UserRole, static_cast<int>(seed.type));
+        idItem->setData(Qt::UserRole + 6, seed.id);
         if (seed.type == ToolType::GrindingWheel)
         {
             idItem->setData(Qt::UserRole + 1, tipWidth);

@@ -120,8 +120,14 @@ public:
                _inspectionSection.needsCompile();
     }
     void noteCompiled();
+    // Install a grown VertexIndexDraw immediately before compileManager->compile.
+    void prepareGpuCompile();
+    void revertFailedGpuCompile();
+    int stride() const { return _stride; }
 
 private:
+    bool growCapacity(std::uint32_t minExtra);
+    bool takeFreeBlock(std::uint32_t length, std::uint32_t* outFirst);
     struct AxisLayout
     {
         bool present = false;

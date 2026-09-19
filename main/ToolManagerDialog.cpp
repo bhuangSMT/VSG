@@ -4,12 +4,21 @@
 #include <algorithm>
 
 #include <QtGui/QCloseEvent>
+#include <QtGui/QColor>
 #include <QtGui/QFont>
+#include <QtGui/QKeySequence>
+#include <QtGui/QShortcut>
 #include <QtGui/QShowEvent>
 #include <QtWidgets/QAbstractItemView>
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QColorDialog>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QHeaderView>
+#include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
+#include <QtWidgets/QLineEdit>
 #include <QtWidgets/QMessageBox>
+#include <QtWidgets/QPushButton>
 #include <QtWidgets/QSplitter>
 #include <QtWidgets/QTreeWidget>
 #include <QtWidgets/QTreeWidgetItem>
@@ -30,9 +39,18 @@ namespace
 constexpr int kRoleType = Qt::UserRole;
 constexpr int kRoleLeafKind = Qt::UserRole + 1;
 constexpr int kRoleValue = Qt::UserRole + 2;
+constexpr int kRoleId = Qt::UserRole + 3;
+constexpr int kRoleColor = Qt::UserRole + 4;
 
-const vsg::vec4 kCutColor{0.95f, 0.35f, 0.10f, 1.0f};
+const QColor kDefaultCutQColor = QColor::fromRgbF(0.95, 0.35, 0.10);
 const vsg::vec4 kMetalColor{0.78f, 0.80f, 0.84f, 1.0f};
+
+vsg::vec4 cutColorVec(const QColor& color)
+{
+    const QColor c = color.isValid() ? color : kDefaultCutQColor;
+    return {static_cast<float>(c.redF()), static_cast<float>(c.greenF()),
+            static_cast<float>(c.blueF()), 1.0f};
+}
 
 bool parsePositive(const QString& text, double* out)
 {
@@ -229,16 +247,31 @@ ToolManagerDialog::ToolManagerDialog(vsg::ref_ptr<vsg::WindowTraits> sharedTrait
     libraryTitle->setFont(titleFont);
     leftLayout->addWidget(libraryTitle);
 
+    auto* buttons = new QWidget();
+    auto* buttonRow = new QHBoxLayout(buttons);
+    buttonRow->setContentsMargins(0, 0, 0, 0);
+    buttonRow->setSpacing(6);
+    _newToolButton = new QPushButton("New tool");
+    _deleteButton = new QPushButton("Delete");
+    _colorButton = new QPushButton("Color");
+    buttonRow->addWidget(_newToolButton);
+    buttonRow->addWidget(_deleteButton);
+    buttonRow->addWidget(_colorButton);
+    buttonRow->addStretch(1);
+    leftLayout->addWidget(buttons);
+
     _toolTree = new QTreeWidget();
-    _toolTree->setHeaderLabel("Tools");
+    _toolTree->setHeaderLabels({QStringLiteral("Id"), QStringLiteral("Type")});
     _toolTree->setRootIsDecorated(true);
-    _toolTree->setUniformRowHeights(true);
+    _toolTree->setUniformRowHeights(false);
     _toolTree->setSelectionMode(QAbstractItemView::SingleSelection);
     _toolTree->setEditTriggers(QAbstractItemView::DoubleClicked |
                                QAbstractItemView::EditKeyPressed |
                                QAbstractItemView::AnyKeyPressed);
-    _toolTree->setColumnCount(1);
+    _toolTree->setColumnCount(2);
+    _toolTree->setColumnWidth(0, 56);
     _toolTree->header()->setStretchLastSection(true);
+    _toolTree->setFocusPolicy(Qt::StrongFocus);
     leftLayout->addWidget(_toolTree, 1);
 
     fillToolLibrary();
@@ -259,6 +292,21 @@ ToolManagerDialog::ToolManagerDialog(vsg::ref_ptr<vsg::WindowTraits> sharedTrait
             &ToolManagerDialog::onLibrarySelectionChanged);
     connect(_toolTree, &QTreeWidget::itemDoubleClicked, this,
             &ToolManagerDialog::onLibraryItemDoubleClicked);
+    connect(_newToolButton, &QPushButton::clicked, this, &ToolManagerDialog::onNewTool);
+    connect(_deleteButton, &QPushButton::clicked, this, &ToolManagerDialog::deleteSelectedTool);
+    connect(_colorButton, &QPushButton::clicked, this, &ToolManagerDialog::onPickColor);
+
+    auto* deleteShortcut = new QShortcut(QKeySequence::Delete, _toolTree);
+    deleteShortcut->setContext(Qt::WidgetShortcut);
+    connect(deleteShortcut, &QShortcut::activated, this, &ToolManagerDialog::deleteSelectedTool);
+    auto* deleteKeyShortcut = new QShortcut(QKeySequence(Qt::Key_Delete), _toolTree);
+    deleteKeyShortcut->setContext(Qt::WidgetShortcut);
+    connect(deleteKeyShortcut, &QShortcut::activated, this, &ToolManagerDialog::deleteSelectedTool);
+    auto* backspaceShortcut = new QShortcut(QKeySequence(Qt::Key_Backspace), _toolTree);
+    backspaceShortcut->setContext(Qt::WidgetShortcut);
+    connect(backspaceShortcut, &QShortcut::activated, this, &ToolManagerDialog::deleteSelectedTool);
+
+    updateLibraryActions();
 }
 
 void ToolManagerDialog::showEvent(QShowEvent* event)
@@ -273,19 +321,26 @@ void ToolManagerDialog::closeEvent(QCloseEvent* event)
     event->ignore();
 }
 
-void ToolManagerDialog::previewTool(ToolType type, double radius, double cuttingLength,
+void ToolManagerDialog::previewTool(int toolId, ToolType type, double radius, double cuttingLength,
                                     double shankLength, double shankRadius, double tipWidth,
                                     double shoulderWidth, double taperHeight,
                                     double shoulderHeight)
 {
-    selectToolForType(type);
+    if (toolId > 0) selectToolForId(toolId);
+    else selectToolForType(type);
     QTreeWidgetItem* toolItem = nullptr;
     if (_toolTree)
     {
         for (int i = 0; i < _toolTree->topLevelItemCount(); ++i)
         {
             QTreeWidgetItem* item = _toolTree->topLevelItem(i);
-            if (item && item->data(0, kRoleType).toInt() == static_cast<int>(type))
+            if (!item) continue;
+            if (toolId > 0 && item->data(0, kRoleId).toInt() == toolId)
+            {
+                toolItem = item;
+                break;
+            }
+            if (toolId <= 0 && item->data(0, kRoleType).toInt() == static_cast<int>(type))
             {
                 toolItem = item;
                 break;
@@ -314,30 +369,70 @@ void ToolManagerDialog::previewTool(ToolType type, double radius, double cutting
         }
         writeToolParams(toolItem, params);
     }
+    const QColor color = toolColor(toolItem);
     if (!_ready)
     {
         _pending = {true, type, radius, cuttingLength, shankLength, shankRadius,
-                    tipWidth, shoulderWidth, taperHeight, shoulderHeight};
+                    tipWidth, shoulderWidth, taperHeight, shoulderHeight, color};
         return;
     }
     applyPreview(type, radius, cuttingLength, shankLength, shankRadius, tipWidth, shoulderWidth,
-                 taperHeight, shoulderHeight);
+                 taperHeight, shoulderHeight, color);
+}
+
+ToolManagerDialog::ToolParams ToolManagerDialog::defaultLibraryParams(ToolType type) const
+{
+    const Parameter& store = Parameter::instance();
+    ToolParams params;
+    params.radius = store.toolRadius() > 0.0 ? store.toolRadius() : 0.05;
+    params.cuttingLength = store.toolLength() > 0.0 ? store.toolLength() : params.radius * 2.8;
+    params.shankLength = params.cuttingLength;
+    params.shankRadius =
+        (type == ToolType::Sphere) ? params.radius * 0.6 : params.radius * 1.2;
+    params.tipWidth = store.toolWheelTipWidth() > 0.0 ? store.toolWheelTipWidth() : 0.01;
+    params.shoulderWidth =
+        store.toolWheelShoulderWidth() > 0.0 ? store.toolWheelShoulderWidth() : 0.06;
+    params.taperHeight =
+        store.toolWheelTaperHeight() > 0.0 ? store.toolWheelTaperHeight() : 0.035;
+    params.shoulderHeight =
+        store.toolWheelShoulderHeight() >= 0.0 ? store.toolWheelShoulderHeight() : 0.015;
+    if (type == ToolType::GrindingWheel)
+    {
+        params.cuttingLength = params.taperHeight + params.shoulderHeight;
+        params.radius = params.cuttingLength;
+    }
+    return params;
+}
+
+int ToolManagerDialog::nextToolId() const
+{
+    int next = 1;
+    if (!_toolTree) return next;
+    for (int i = 0; i < _toolTree->topLevelItemCount(); ++i)
+    {
+        QTreeWidgetItem* item = _toolTree->topLevelItem(i);
+        if (!item) continue;
+        next = std::max(next, item->data(0, kRoleId).toInt() + 1);
+    }
+    return next;
+}
+
+QColor ToolManagerDialog::toolColor(QTreeWidgetItem* toolItem) const
+{
+    if (!toolItem) return kDefaultCutQColor;
+    const QColor color = toolItem->data(0, kRoleColor).value<QColor>();
+    return color.isValid() ? color : kDefaultCutQColor;
+}
+
+QTreeWidgetItem* ToolManagerDialog::currentToolItem() const
+{
+    if (!_toolTree) return nullptr;
+    return toolItemFromAny(_toolTree->currentItem());
 }
 
 void ToolManagerDialog::fillToolLibrary()
 {
     if (!_toolTree) return;
-
-    const Parameter& store = Parameter::instance();
-    const double radius = store.toolRadius() > 0.0 ? store.toolRadius() : 0.05;
-    const double length = store.toolLength() > 0.0 ? store.toolLength() : radius * 2.8;
-    const double tipWidth = store.toolWheelTipWidth() > 0.0 ? store.toolWheelTipWidth() : 0.01;
-    const double shoulderWidth =
-        store.toolWheelShoulderWidth() > 0.0 ? store.toolWheelShoulderWidth() : 0.06;
-    const double taperHeight =
-        store.toolWheelTaperHeight() > 0.0 ? store.toolWheelTaperHeight() : 0.035;
-    const double shoulderHeight =
-        store.toolWheelShoulderHeight() >= 0.0 ? store.toolWheelShoulderHeight() : 0.015;
 
     struct Seed
     {
@@ -353,41 +448,89 @@ void ToolManagerDialog::fillToolLibrary()
     const bool blocked = _toolTree->blockSignals(true);
     _toolTree->clear();
     for (const Seed& seed : seeds)
-    {
-        auto* tool = new QTreeWidgetItem();
-        tool->setFlags((tool->flags() | Qt::ItemIsEnabled | Qt::ItemIsSelectable) &
-                       ~Qt::ItemIsEditable);
-        tool->setData(0, kRoleType, static_cast<int>(seed.type));
-        tool->setText(0, QString("%1 %2").arg(seed.id).arg(
-                             QString::fromLatin1(toolTypeLabel(seed.type))));
+        addToolRow(seed.id, seed.type, defaultLibraryParams(seed.type), kDefaultCutQColor);
+    _toolTree->blockSignals(blocked);
+}
 
-        const double shankRadius =
-            (seed.type == ToolType::Sphere) ? radius * 0.6 : radius * 1.2;
-        ToolParams params{radius, length, length, shankRadius, tipWidth, shoulderWidth,
-                          taperHeight, shoulderHeight};
-        if (seed.type == ToolType::GrindingWheel)
-        {
-            params.cuttingLength = params.taperHeight + params.shoulderHeight;
-            params.radius = params.cuttingLength;
-            tool->addChild(makeLeaf(LeafKind::TipWidth, params.tipWidth));
-            tool->addChild(makeLeaf(LeafKind::ShoulderWidth, params.shoulderWidth));
-            tool->addChild(makeLeaf(LeafKind::TaperHeight, params.taperHeight));
-            tool->addChild(makeLeaf(LeafKind::ShoulderHeight, params.shoulderHeight));
-        }
-        else if (seed.type == ToolType::Sphere)
-        {
-            tool->addChild(makeLeaf(LeafKind::Radius, params.radius));
-        }
-        else
-        {
-            tool->addChild(makeLeaf(LeafKind::Radius, params.radius));
-            tool->addChild(makeLeaf(LeafKind::CuttingLength, params.cuttingLength));
-        }
-        tool->addChild(makeLeaf(LeafKind::ShankLength, params.shankLength));
-        tool->addChild(makeLeaf(LeafKind::ShankRadius, params.shankRadius));
-        tool->setExpanded(false);
-        _toolTree->addTopLevelItem(tool);
+QTreeWidgetItem* ToolManagerDialog::addToolRow(int id, ToolType type, const ToolParams& params,
+                                               const QColor& color)
+{
+    if (!_toolTree) return nullptr;
+
+    auto* tool = new QTreeWidgetItem();
+    tool->setFlags((tool->flags() | Qt::ItemIsEnabled | Qt::ItemIsSelectable) &
+                   ~Qt::ItemIsEditable);
+    tool->setData(0, kRoleId, id);
+    tool->setData(0, kRoleType, static_cast<int>(type));
+    tool->setData(0, kRoleColor, color.isValid() ? color : kDefaultCutQColor);
+    tool->setText(0, QString::number(id));
+    _toolTree->addTopLevelItem(tool);
+    attachTypeCombo(tool);
+    rebuildLeaves(tool, &params);
+    tool->setExpanded(false);
+    return tool;
+}
+
+void ToolManagerDialog::attachTypeCombo(QTreeWidgetItem* toolItem)
+{
+    if (!toolItem || !_toolTree) return;
+
+    auto* combo = new QComboBox(_toolTree);
+    const ToolType types[] = {
+        ToolType::BullNose, ToolType::FlatNose, ToolType::BallNose,
+        ToolType::Sphere, ToolType::GrindingWheel,
+    };
+    for (ToolType type : types)
+        combo->addItem(QString::fromLatin1(toolTypeLabel(type)), static_cast<int>(type));
+    const int index = combo->findData(toolItem->data(0, kRoleType));
+    if (index >= 0) combo->setCurrentIndex(index);
+    combo->setFocusPolicy(Qt::StrongFocus);
+    connect(combo, &QComboBox::currentIndexChanged, this, [this, toolItem](int) {
+        onToolTypeChanged(toolItem);
+    });
+    _toolTree->setItemWidget(toolItem, 1, combo);
+}
+
+void ToolManagerDialog::rebuildLeaves(QTreeWidgetItem* toolItem, const ToolParams* overrideParams)
+{
+    if (!toolItem || !_toolTree) return;
+
+    ToolParams params = overrideParams ? *overrideParams : readToolParams(toolItem);
+    const auto type = static_cast<ToolType>(toolItem->data(0, kRoleType).toInt());
+    if (type == ToolType::GrindingWheel)
+    {
+        params.cuttingLength = params.taperHeight + params.shoulderHeight;
+        params.radius = params.cuttingLength;
     }
+
+    const bool blocked = _toolTree->blockSignals(true);
+    while (toolItem->childCount() > 0)
+        delete toolItem->takeChild(0);
+
+    auto addLeaf = [&](LeafKind kind, double value) {
+        toolItem->addChild(makeLeaf(kind, value));
+        if (QTreeWidgetItem* leaf = toolItem->child(toolItem->childCount() - 1))
+            leaf->setFirstColumnSpanned(true);
+    };
+
+    if (type == ToolType::GrindingWheel)
+    {
+        addLeaf(LeafKind::TipWidth, params.tipWidth);
+        addLeaf(LeafKind::ShoulderWidth, params.shoulderWidth);
+        addLeaf(LeafKind::TaperHeight, params.taperHeight);
+        addLeaf(LeafKind::ShoulderHeight, params.shoulderHeight);
+    }
+    else if (type == ToolType::Sphere)
+    {
+        addLeaf(LeafKind::Radius, params.radius);
+    }
+    else
+    {
+        addLeaf(LeafKind::Radius, params.radius);
+        addLeaf(LeafKind::CuttingLength, params.cuttingLength);
+    }
+    addLeaf(LeafKind::ShankLength, params.shankLength);
+    addLeaf(LeafKind::ShankRadius, params.shankRadius);
     _toolTree->blockSignals(blocked);
 }
 
@@ -457,20 +600,108 @@ void ToolManagerDialog::previewToolItem(QTreeWidgetItem* toolItem)
     {
         _pending = {true, type, params.radius, params.cuttingLength, params.shankLength,
                     params.shankRadius, params.tipWidth, params.shoulderWidth, params.taperHeight,
-                    params.shoulderHeight};
+                    params.shoulderHeight, toolColor(toolItem)};
         return;
     }
     applyPreview(type, params.radius, params.cuttingLength, params.shankLength,
                  params.shankRadius, params.tipWidth, params.shoulderWidth, params.taperHeight,
-                 params.shoulderHeight);
+                 params.shoulderHeight, toolColor(toolItem));
 }
 
 void ToolManagerDialog::onLibrarySelectionChanged()
 {
+    updateLibraryActions();
     if (!_toolTree) return;
     const auto selected = _toolTree->selectedItems();
     if (selected.isEmpty()) return;
     previewToolItem(toolItemFromAny(selected.front()));
+}
+
+void ToolManagerDialog::updateLibraryActions()
+{
+    const bool have = currentToolItem() && _toolTree && !_toolTree->selectedItems().isEmpty();
+    if (_deleteButton) _deleteButton->setEnabled(have);
+    if (_colorButton)
+    {
+        _colorButton->setEnabled(have);
+        const QColor color = have ? toolColor(currentToolItem()) : kDefaultCutQColor;
+        const int luma = (color.red() * 299 + color.green() * 587 + color.blue() * 114) / 1000;
+        const QString fg = luma > 140 ? QStringLiteral("#111111") : QStringLiteral("#f4f4f4");
+        _colorButton->setStyleSheet(
+            QStringLiteral("QPushButton { background-color: %1; color: %2; }")
+                .arg(color.name(), fg));
+    }
+}
+
+void ToolManagerDialog::onNewTool()
+{
+    if (!_toolTree) return;
+    auto* tool = addToolRow(nextToolId(), ToolType::FlatNose,
+                            defaultLibraryParams(ToolType::FlatNose), kDefaultCutQColor);
+    if (!tool) return;
+    _toolTree->setCurrentItem(tool);
+    previewToolItem(tool);
+    updateLibraryActions();
+    emitLibrarySnapshot(tool);
+}
+
+void ToolManagerDialog::onPickColor()
+{
+    QTreeWidgetItem* tool = currentToolItem();
+    if (!tool) return;
+    const QColor chosen = QColorDialog::getColor(toolColor(tool), this, "Tool color");
+    if (!chosen.isValid()) return;
+    tool->setData(0, kRoleColor, chosen);
+    updateLibraryActions();
+    previewToolItem(tool);
+    emit toolColorChanged(tool->data(0, kRoleId).toInt(), tool->data(0, kRoleType).toInt(),
+                         chosen);
+}
+
+void ToolManagerDialog::onToolTypeChanged(QTreeWidgetItem* toolItem)
+{
+    if (!toolItem || !_toolTree) return;
+    auto* combo = qobject_cast<QComboBox*>(_toolTree->itemWidget(toolItem, 1));
+    if (!combo) return;
+    const auto type = static_cast<ToolType>(combo->currentData().toInt());
+    if (type == ToolType::None) return;
+    if (toolItem->data(0, kRoleType).toInt() == static_cast<int>(type)) return;
+    toolItem->setData(0, kRoleType, static_cast<int>(type));
+    rebuildLeaves(toolItem);
+    previewToolItem(toolItem);
+    emitLibrarySnapshot(toolItem);
+}
+
+void ToolManagerDialog::deleteSelectedTool()
+{
+    if (!_toolTree) return;
+    if (QWidget* focus = QApplication::focusWidget())
+    {
+        if (qobject_cast<QLineEdit*>(focus) && _toolTree->isAncestorOf(focus))
+            return;
+    }
+
+    QTreeWidgetItem* tool = toolItemFromAny(_toolTree->currentItem());
+    if (!tool) return;
+    const int index = _toolTree->indexOfTopLevelItem(tool);
+    if (index < 0) return;
+    const int toolId = tool->data(0, kRoleId).toInt();
+
+    delete _toolTree->takeTopLevelItem(index);
+    if (toolId > 0) emit toolLibraryRemoved(toolId);
+
+    const int remaining = _toolTree->topLevelItemCount();
+    if (remaining == 0)
+    {
+        updateLibraryActions();
+        if (_ready)
+            presentPreview(makePlaceholder(_options));
+        else
+            _pending = {};
+        return;
+    }
+
+    _toolTree->setCurrentItem(_toolTree->topLevelItem(std::min(index, remaining - 1)));
 }
 
 void ToolManagerDialog::onLibraryItemDoubleClicked(QTreeWidgetItem* item, int)
@@ -531,17 +762,36 @@ void ToolManagerDialog::onLibraryItemChanged(QTreeWidgetItem* item, int)
 
     QTreeWidgetItem* toolItem = item->parent();
     previewToolItem(toolItem);
+    emitLibrarySnapshot(toolItem);
+}
 
+void ToolManagerDialog::emitLibrarySnapshot(QTreeWidgetItem* toolItem)
+{
+    if (!toolItem) return;
+    const int toolId = toolItem->data(0, kRoleId).toInt();
     const auto type = static_cast<ToolType>(toolItem->data(0, kRoleType).toInt());
+    if (toolId <= 0 || type == ToolType::None) return;
     const ToolParams params = readToolParams(toolItem);
     const double totalH = params.taperHeight + params.shoulderHeight;
     const double radius =
         (type == ToolType::GrindingWheel && totalH > 0.0) ? totalH : params.radius;
     const double cutting =
         (type == ToolType::GrindingWheel && totalH > 0.0) ? totalH : params.cuttingLength;
-    emit toolLibraryEntryChanged(static_cast<int>(type), radius, cutting, params.shankLength,
-                                 params.shankRadius, params.tipWidth, params.shoulderWidth,
-                                 params.taperHeight, params.shoulderHeight);
+    emit toolLibraryEntryChanged(toolId, static_cast<int>(type), radius, cutting,
+                                 params.shankLength, params.shankRadius, params.tipWidth,
+                                 params.shoulderWidth, params.taperHeight, params.shoulderHeight);
+}
+
+void ToolManagerDialog::selectToolForId(int toolId)
+{
+    if (!_toolTree || toolId <= 0) return;
+    for (int i = 0; i < _toolTree->topLevelItemCount(); ++i)
+    {
+        QTreeWidgetItem* item = _toolTree->topLevelItem(i);
+        if (!item || item->data(0, kRoleId).toInt() != toolId) continue;
+        _toolTree->setCurrentItem(item);
+        return;
+    }
 }
 
 void ToolManagerDialog::selectToolForType(ToolType type)
@@ -560,7 +810,7 @@ void ToolManagerDialog::selectToolForType(ToolType type)
 void ToolManagerDialog::applyPreview(ToolType type, double radius, double cuttingLength,
                                      double shankLength, double shankRadius, double tipWidth,
                                      double shoulderWidth, double taperHeight,
-                                     double shoulderHeight)
+                                     double shoulderHeight, const QColor& cutColor)
 {
     if (type == ToolType::None)
     {
@@ -591,7 +841,7 @@ void ToolManagerDialog::applyPreview(ToolType type, double radius, double cuttin
     const TriangleMesh cutMesh =
         createToolMesh(type, cutterRadius, cutterLength, 48, 24, 12, 60.0f,
                        static_cast<float>(shankRadius), static_cast<float>(shankLength), wheel);
-    auto cutNode = makeToolNode(cutMesh, _options, kCutColor, false);
+    auto cutNode = makeToolNode(cutMesh, _options, cutColorVec(cutColor), false);
 
     const auto group = vsg::Group::create();
     if (cutNode) group->addChild(cutNode);
@@ -674,7 +924,8 @@ void ToolManagerDialog::initializeScene()
         if (_pending.valid)
             applyPreview(_pending.type, _pending.radius, _pending.cuttingLength,
                          _pending.shankLength, _pending.shankRadius, _pending.tipWidth,
-                         _pending.shoulderWidth, _pending.taperHeight, _pending.shoulderHeight);
+                         _pending.shoulderWidth, _pending.taperHeight, _pending.shoulderHeight,
+                         _pending.cutColor);
         else
             _scene->addChild(makePlaceholder(_options));
         _pending = {};

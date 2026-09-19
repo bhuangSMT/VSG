@@ -848,6 +848,10 @@ try
             toolManager = new app::ToolManagerDialog(windowTraits, options, interval, mainWindow);
             QObject::connect(toolManager, &app::ToolManagerDialog::toolLibraryEntryChanged,
                              simPanel, &app::SimulationPanel::updateLibraryEntry);
+            QObject::connect(toolManager, &app::ToolManagerDialog::toolLibraryRemoved,
+                             simPanel, &app::SimulationPanel::removeLibraryTool);
+            QObject::connect(toolManager, &app::ToolManagerDialog::toolColorChanged,
+                             simPanel, &app::SimulationPanel::updateLibraryColor);
         }
         return toolManager;
     };
@@ -893,12 +897,12 @@ try
                          lengthSpin->blockSignals(false);
                      });
     QObject::connect(simPanel, &app::SimulationPanel::toolLibraryPreviewRequested,
-                     [ensureToolManager](int toolType, double radius, double cuttingLength,
-                                         double shankLength, double shankRadius, double tipWidth,
-                                         double shoulderWidth, double taperHeight,
-                                         double shoulderHeight) {
+                     [ensureToolManager](int toolId, int toolType, double radius,
+                                         double cuttingLength, double shankLength,
+                                         double shankRadius, double tipWidth, double shoulderWidth,
+                                         double taperHeight, double shoulderHeight) {
                          auto* manager = ensureToolManager();
-                         manager->previewTool(static_cast<app::ToolType>(toolType), radius,
+                         manager->previewTool(toolId, static_cast<app::ToolType>(toolType), radius,
                                               cuttingLength, shankLength, shankRadius, tipWidth,
                                               shoulderWidth, taperHeight, shoulderHeight);
                          manager->show();

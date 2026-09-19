@@ -7,6 +7,7 @@
 
 #include <QtCore/QPoint>
 #include <QtCore/QString>
+#include <QtGui/QColor>
 #include <QtWidgets/QWidget>
 
 #include "BooleanOp.h"
@@ -50,12 +51,14 @@ public:
     void popupExitCollectionMenu(const QPoint& globalPos);
     void notifyBooleanOp(BooleanOp op);
     void clearLibrarySelection();
-    // Match a Tool manager edit into the Simulation library table. Re-applies
-    // the cutter when that row is the current selection.
-    void updateLibraryEntry(int toolType, double radius, double cuttingLength,
+    // Upsert a Tool manager edit into the Simulation library table by tool id.
+    // Re-applies the cutter when that row is the current selection.
+    void updateLibraryEntry(int toolId, int toolType, double radius, double cuttingLength,
                             double shankLength, double shankRadius, double tipWidth = 0.0,
                             double shoulderWidth = 0.0, double taperHeight = 0.0,
                             double shoulderHeight = 0.0);
+    void updateLibraryColor(int toolId, int toolType, const QColor& color);
+    void removeLibraryTool(int toolId);
 
     // Helix axis pick: Axis button in the Helix dialog arms this; ToolTracker
     // completes/cancels it and the dialog reopens.
@@ -69,7 +72,7 @@ signals:
     void subtractionOperationRequested();
     void unionOperationRequested();
     void inspectionOperationRequested();
-    void toolLibraryPreviewRequested(int toolType, double radius, double cuttingLength,
+    void toolLibraryPreviewRequested(int toolId, int toolType, double radius, double cuttingLength,
                                      double shankLength, double shankRadius, double tipWidth,
                                      double shoulderWidth, double taperHeight,
                                      double shoulderHeight);
@@ -114,6 +117,7 @@ private:
     bool isNullRow(int row) const;
     int rowsPerStepFromSlider() const;
     void fillToolLibrary();
+    int libraryRowForId(int toolId) const;
     bool applySelectedLibraryTool();
     bool prepareRerunTool();
 
