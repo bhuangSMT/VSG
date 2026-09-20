@@ -30,8 +30,8 @@ namespace
 // The quad is built around the splat centre in eye space, so it always faces
 // the camera. inCenterRadius.w carries the eye-space half-width.
 // inNormal.xyz is the surface normal; inNormal.w packs edgeMask bits
-// (bit0=+X … bit5=-Z) plus an 8-bit edge strength above them, which describe
-// how close the endpoint sits to a crease.
+// (bit0=+X … bit5=-Z), an 8-bit edge strength at bits 6–13, and cutFace at
+// bit 14 (Disk lighting only).
 const char* const splatVertexBody = R"(
 layout(push_constant) uniform PushConstants
 {
@@ -51,6 +51,7 @@ layout(location = 3) out float bell;
 #ifdef HARD_DISK_AA
 layout(location = 4) flat out float edgeStrength;
 layout(location = 5) flat out vec2 edgeDirDisc;
+layout(location = 6) flat out float isCutFace;
 #endif
 
 void main()
@@ -67,6 +68,7 @@ void main()
 #ifdef HARD_DISK_AA
         edgeStrength = 0.0;
         edgeDirDisc = vec2(0.0);
+        isCutFace = 0.0;
 #endif
         return;
     }
@@ -119,7 +121,8 @@ void main()
 #ifdef HARD_DISK_AA
     uint packed = uint(inNormal.w + 0.5);
     uint mask = packed & 63u;
-    edgeStrength = float(packed >> 6) / 255.0;
+    edgeStrength = float((packed >> 6) & 255u) / 255.0;
+    isCutFace = float((packed >> 14) & 1u);
 
     // Disc corner space matches eye XY. Sum the set axes into one direction so
     // a rim with two creases narrows along their diagonal instead of twice.
@@ -155,6 +158,7 @@ layout(location = 3) in float bell;
 #ifdef HARD_DISK_AA
 layout(location = 4) flat in float edgeStrength;
 layout(location = 5) flat in vec2 edgeDirDisc;
+layout(location = 6) flat in float isCutFace;
 #endif
 
 layout(location = 0) out vec4 outColor;
@@ -244,7 +248,16 @@ void main()
     else normal /= nLen;
     if (dot(normal, viewDir) < 0.0) normal = -normal;
 
-    float diffuse = max(dot(normal, lightDir), 0.0);
+    float nDotL = dot(normal, lightDir);
+#ifdef HARD_DISK_AA
+    // Soft wrap only on cut-tagged discs. Stock keeps hard Lambert so the
+    // original cylinder still reads as tight metal.
+    float diffuse = (isCutFace > 0.5)
+        ? clamp(nDotL * 0.35 + 0.65, 0.0, 1.0)
+        : max(nDotL, 0.0);
+#else
+    float diffuse = max(nDotL, 0.0);
+#endif
     vec3 halfway = normalize(lightDir + viewDir);
 
     // Polished steel: a dark body with a tight highlight hot enough to clip,
@@ -256,14 +269,21 @@ void main()
     // No rim term either — a splat's edge is not a silhouette, so lighting it
     // just outlines every splat and frosts the whole surface.
 #ifdef HARD_DISK_AA
-    // A blended Gaussian averages many splats per pixel, which hides a narrow
-    // highlight lobe; one hard disk owns the pixel outright, so exponent 70
-    // turned a few degrees of normal difference into full-contrast speckle
-    // (specular spanned 0–1.40 against diffuse's 0.12–0.67). Wider lobe, and
-    // diffuse carries the form. Still clips on axis, so it reads as metal.
-    float specular = pow(max(dot(normal, halfway), 0.0), 24.0);
-    vec3 lit = color.rgb * (0.12 + 0.70 * diffuse)
-             + color.rgb * (0.45 * specular);
+    float specular;
+    vec3 lit;
+    if (isCutFace > 0.5)
+    {
+        // Cut faces: flatter wrap, higher ambient, almost-diffuse spec.
+        specular = pow(max(dot(normal, halfway), 0.0), 4.0);
+        lit = color.rgb * (0.32 + 0.50 * diffuse)
+            + color.rgb * (0.08 * specular);
+    }
+    else
+    {
+        specular = pow(max(dot(normal, halfway), 0.0), 24.0);
+        lit = color.rgb * (0.12 + 0.70 * diffuse)
+            + color.rgb * (0.45 * specular);
+    }
 #else
     float specular = pow(max(dot(normal, halfway), 0.0), 70.0);
     vec3 lit = color.rgb * (0.12 + 0.55 * diffuse)
@@ -700,12 +720,14 @@ void GaussianSplatSet::set(std::size_t index, const Splat& splat)
     if (!_centerRadius || index >= _capacity) return;
 
     const auto base = index * 4;
-    // normal.w carries the 6 direction bits plus an 8-bit strength above them.
-    // Peak 63 + 255*64 = 16383, exact in float32.
+    // normal.w: 6 direction bits, 8-bit strength at <<6, cutFace at bit 14.
+    // Peak 63 + 255*64 + 16384 = 32767, exact in float32.
     const auto strengthQ = static_cast<std::uint32_t>(
         std::lround(std::clamp(splat.edgeStrength, 0.0f, 1.0f) * 255.0f));
+    const std::uint32_t packed =
+        splat.edgeMask | (strengthQ << 6) | (splat.cutFace ? (1u << 14) : 0u);
     const vsg::vec4 packedNormal(splat.normal.x, splat.normal.y, splat.normal.z,
-                                 static_cast<float>(splat.edgeMask | (strengthQ << 6)));
+                                 static_cast<float>(packed));
     for (std::size_t k = 0; k < 4; ++k)
     {
         (*_centerRadius)[base + k] =

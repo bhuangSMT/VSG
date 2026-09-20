@@ -1138,12 +1138,14 @@ vsg::ref_ptr<vsg::Node> RenderManager::createSplatNode(const RayModel& rayModel)
                                                 static_cast<float>(start[1]),
                                                 static_cast<float>(start[2])),
                                       normalOrAxis(span.beginNormal, true),
-                                      span.cutBegin() ? toolColor : color, spanRadius});
+                                      span.cutBegin() ? toolColor : color, spanRadius, 0, 0.0f,
+                                      span.cutBegin()});
                     splats.push_back({vsg::vec3(static_cast<float>(end[0]),
                                                 static_cast<float>(end[1]),
                                                 static_cast<float>(end[2])),
                                       normalOrAxis(span.endNormal, false),
-                                      span.cutEnd() ? toolColor : color, spanRadius});
+                                      span.cutEnd() ? toolColor : color, spanRadius, 0, 0.0f,
+                                      span.cutEnd()});
                 }
             }
         }

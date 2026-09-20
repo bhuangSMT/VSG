@@ -1338,7 +1338,7 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                                     static_cast<float>(start[1]),
                                     static_cast<float>(start[2])),
                           edgeStart.normal, span.cutBegin() ? tool : stock, spanRadius,
-                          edgeStart.mask, edgeStart.strength});
+                          edgeStart.mask, edgeStart.strength, span.cutBegin()});
                 ++written;
             }
             if (!skipEnd)
@@ -1357,7 +1357,7 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                                     static_cast<float>(end[1]),
                                     static_cast<float>(end[2])),
                           edgeEnd.normal, span.cutEnd() ? tool : stock, spanRadius,
-                          edgeEnd.mask, edgeEnd.strength});
+                          edgeEnd.mask, edgeEnd.strength, span.cutEnd()});
                 ++written;
             }
         }
