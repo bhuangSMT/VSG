@@ -30,8 +30,8 @@ namespace
 // The quad is built around the splat centre in eye space, so it always faces
 // the camera. inCenterRadius.w carries the eye-space half-width.
 // inNormal.xyz is the surface normal; inNormal.w packs edgeMask bits
-// (bit0=+X … bit5=-Z), an 8-bit edge strength at bits 6–13, and cutFace at
-// bit 14 (Disk lighting only).
+// (bit0=+X … bit5=-Z), an 8-bit edge strength at bits 6–13, cutFace at
+// bit 14, and rimClip at bit 15 (Disk lighting / crease clip).
 const char* const splatVertexBody = R"(
 layout(push_constant) uniform PushConstants
 {
@@ -52,6 +52,7 @@ layout(location = 3) out float bell;
 layout(location = 4) flat out float edgeStrength;
 layout(location = 5) flat out vec2 edgeDirDisc;
 layout(location = 6) flat out float isCutFace;
+layout(location = 7) flat out float rimClip;
 #endif
 
 void main()
@@ -69,6 +70,7 @@ void main()
         edgeStrength = 0.0;
         edgeDirDisc = vec2(0.0);
         isCutFace = 0.0;
+        rimClip = 0.0;
 #endif
         return;
     }
@@ -123,6 +125,7 @@ void main()
     uint mask = packed & 63u;
     edgeStrength = float((packed >> 6) & 255u) / 255.0;
     isCutFace = float((packed >> 14) & 1u);
+    rimClip = float((packed >> 15) & 1u);
 
     // Disc corner space matches eye XY. Sum the set axes into one direction so
     // a rim with two creases narrows along their diagonal instead of twice.
@@ -159,6 +162,7 @@ layout(location = 3) in float bell;
 layout(location = 4) flat in float edgeStrength;
 layout(location = 5) flat in vec2 edgeDirDisc;
 layout(location = 6) flat in float isCutFace;
+layout(location = 7) flat in float rimClip;
 #endif
 
 layout(location = 0) out vec4 outColor;
@@ -171,6 +175,13 @@ void main()
     // half-cellDiag precisely because endpoints thin out at rims and grazing
     // views, so every disc rasterizes and the depth test picks the winner.
     if (max(abs(corner.x), abs(corner.y)) > 1.0) discard;
+
+    // Rim discs: drop the half that hangs into the other face. This is not the
+    // old shrink-toward-crease (that opened slivers); coverage on this face stays.
+    if (rimClip > 0.5 && dot(edgeDirDisc, edgeDirDisc) > 1e-12)
+    {
+        if (dot(corner, edgeDirDisc) > 0.0) discard;
+    }
 
     float r = length(corner);
 #ifdef SPLAT_DEBUG_SHRINK
@@ -720,12 +731,13 @@ void GaussianSplatSet::set(std::size_t index, const Splat& splat)
     if (!_centerRadius || index >= _capacity) return;
 
     const auto base = index * 4;
-    // normal.w: 6 direction bits, 8-bit strength at <<6, cutFace at bit 14.
-    // Peak 63 + 255*64 + 16384 = 32767, exact in float32.
+    // normal.w: 6 direction bits, 8-bit strength at <<6, cutFace at bit 14,
+    // rimClip at bit 15. Peak 65535, exact in float32.
     const auto strengthQ = static_cast<std::uint32_t>(
         std::lround(std::clamp(splat.edgeStrength, 0.0f, 1.0f) * 255.0f));
     const std::uint32_t packed =
-        splat.edgeMask | (strengthQ << 6) | (splat.cutFace ? (1u << 14) : 0u);
+        splat.edgeMask | (strengthQ << 6) | (splat.cutFace ? (1u << 14) : 0u) |
+        (splat.rimClip ? (1u << 15) : 0u);
     const vsg::vec4 packedNormal(splat.normal.x, splat.normal.y, splat.normal.z,
                                  static_cast<float>(packed));
     for (std::size_t k = 0; k < 4; ++k)

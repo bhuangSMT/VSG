@@ -607,6 +607,7 @@ bool cellHasCutTag(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv)
 }
 
 // Cut-region UV rim at packing stride: any missing/empty/non-cut neighbour.
+// Used by skipSplatEnds when the cut overlay is on (interior cut discs drop).
 bool cutCellOnRim(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv, int stride)
 {
     if (stride < 1) stride = 1;
@@ -619,6 +620,114 @@ bool cutCellOnRim(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv, int s
     if (iv < s || !neighborCut(iu, iv - s)) return true;
     if (iv + s >= grid.height || !neighborCut(iu, iv + s)) return true;
     return false;
+}
+
+// Cut-region UV rim: this cell is cut-tagged and a UV neighbour is missing or
+// untagged. Unlike cutCellOnRim, uncut stock is not a rim.
+bool cutRegionRim(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv, int stride)
+{
+    if (!cellHasCutTag(grid, iu, iv)) return false;
+    if (stride < 1) stride = 1;
+    const auto s = static_cast<std::uint32_t>(stride);
+    auto neighborCut = [&](std::uint32_t nu, std::uint32_t nv) {
+        return nu < grid.width && nv < grid.height && cellHasCutTag(grid, nu, nv);
+    };
+    if (iu < s || !neighborCut(iu - s, iv)) return true;
+    if (iu + s >= grid.width || !neighborCut(iu + s, iv)) return true;
+    if (iv < s || !neighborCut(iu, iv - s)) return true;
+    if (iv + s >= grid.height || !neighborCut(iu, iv + s)) return true;
+    return false;
+}
+
+// Untagged cell sitting next to a cut-tagged UV neighbour (gray coins on the crease).
+bool stockBesideCut(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv, int stride)
+{
+    if (cellHasCutTag(grid, iu, iv)) return false;
+    if (stride < 1) stride = 1;
+    const auto s = static_cast<std::uint32_t>(stride);
+    auto neighborCut = [&](std::uint32_t nu, std::uint32_t nv) {
+        return nu < grid.width && nv < grid.height && cellHasCutTag(grid, nu, nv);
+    };
+    if (iu >= s && neighborCut(iu - s, iv)) return true;
+    if (iu + s < grid.width && neighborCut(iu + s, iv)) return true;
+    if (iv >= s && neighborCut(iu, iv - s)) return true;
+    if (iv + s < grid.height && neighborCut(iu, iv + s)) return true;
+    return false;
+}
+
+constexpr int kRimExtra = 2;
+
+// Along-rim cut neighbours with a strictly greater (iu, iv) so each pair is
+// densified once.
+int alongRimHigherCutNeighbors(const RayGrid& grid, std::uint32_t iu, std::uint32_t iv,
+                               int stride)
+{
+    if (stride < 1) stride = 1;
+    const auto s = static_cast<std::uint32_t>(stride);
+    int n = 0;
+    auto consider = [&](std::uint32_t nu, std::uint32_t nv) {
+        if (nu >= grid.width || nv >= grid.height) return;
+        if (nu < iu || (nu == iu && nv <= iv)) return;
+        if (cellHasCutTag(grid, nu, nv)) ++n;
+    };
+    if (iu >= s) consider(iu - s, iv);
+    if (iu + s < grid.width) consider(iu + s, iv);
+    if (iv >= s) consider(iu, iv - s);
+    if (iv + s < grid.height) consider(iu, iv + s);
+    return n;
+}
+
+bool matchingCutEndpoint(const RayGrid& grid, std::uint32_t nu, std::uint32_t nv, bool enter,
+                         double along, Point3d& outPos, vsg::vec3& outNormal)
+{
+    if (nu >= grid.width || nv >= grid.height) return false;
+    const RaySlot& slot = grid.at(nu, nv);
+    if (slot.empty()) return false;
+
+    const std::size_t axis = grid.axis;
+    const std::size_t u = (axis + 1) % 3;
+    const std::size_t v = (axis + 2) % 3;
+    const double u0 = grid.sampleU(nu);
+    const double v0 = grid.sampleV(nv);
+
+    bool found = false;
+    double bestDelta = 0.0;
+    for (const Interval& span : grid.pool.span(slot))
+    {
+        if (!span.hasSolidLength()) continue;
+        if (enter && !span.cutBegin()) continue;
+        if (!enter && !span.cutEnd()) continue;
+        const double a = enter ? grid.fromTick(span.begin) : grid.fromTick(span.end);
+        const double delta = std::abs(a - along);
+        if (found && delta >= bestDelta) continue;
+        found = true;
+        bestDelta = delta;
+        outPos = Point3d{0.0, 0.0, 0.0};
+        outPos[axis] = a;
+        outPos[u] = u0;
+        outPos[v] = v0;
+        const Normal3f& rec = enter ? span.beginNormal : span.endNormal;
+        outNormal = vsg::vec3(rec[0], rec[1], rec[2]);
+    }
+    return found;
+}
+
+Point3d lerpPoint(const Point3d& a, const Point3d& b, float t)
+{
+    Point3d p{0.0, 0.0, 0.0};
+    const double tt = static_cast<double>(t);
+    for (int i = 0; i < 3; ++i)
+        p[static_cast<std::size_t>(i)] = a[static_cast<std::size_t>(i)] * (1.0 - tt) +
+                                         b[static_cast<std::size_t>(i)] * tt;
+    return p;
+}
+
+vsg::vec3 lerpNormal(const vsg::vec3& a, const vsg::vec3& b, float t)
+{
+    vsg::vec3 n = a * (1.0f - t) + b * t;
+    const float len = vsg::length(n);
+    if (len > 1.0e-8f) n /= len;
+    return n;
 }
 
 bool onCoarseLattice(std::uint32_t iu, std::uint32_t iv, int coarseStride)
@@ -711,6 +820,8 @@ std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t 
     const double v0 = grid.sampleV(iv);
     const double hide = leftoverHideLength(grid, stride);
     const bool onRim = !skipCutSplats || cutCellOnRim(grid, iu, iv, stride);
+    const bool regionRim = cutRegionRim(grid, iu, iv, stride);
+    const int rimNeighbors = regionRim ? alongRimHigherCutNeighbors(grid, iu, iv, stride) : 0;
     std::uint32_t n = 0;
     for (const Interval& span : grid.pool.span(slot))
     {
@@ -740,10 +851,18 @@ std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t 
         }
         if (!skipStart &&
             (protectStart || endpointInViewCull(grid, iu, iv, start[axis], viewCull)))
+        {
             ++n;
+            if (regionRim && span.cutBegin())
+                n += static_cast<std::uint32_t>(kRimExtra * rimNeighbors);
+        }
         if (!skipEnd &&
             (protectEnd || endpointInViewCull(grid, iu, iv, end[axis], viewCull)))
+        {
             ++n;
+            if (regionRim && span.cutEnd())
+                n += static_cast<std::uint32_t>(kRimExtra * rimNeighbors);
+        }
     }
     return n;
 }
@@ -1279,7 +1398,47 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
     vsg::vec4 tool = style.toolColor;
     tool.a = style.opacity;
 
+    const bool regionRim = cutRegionRim(*grid, iu, iv, stride);
+    const bool besideCut = stockBesideCut(*grid, iu, iv, stride);
+    const float rimRadius = radius / static_cast<float>(kRimExtra + 1);
     std::uint32_t written = 0;
+
+    auto emitSplat = [&](const Point3d& p, const vsg::vec3& n, const vsg::vec4& col, float rad,
+                         std::uint8_t mask, float strength, bool cut, bool clip) -> bool {
+        if (written + 1 > ref.block) return false;
+        _set.set(static_cast<std::size_t>(ref.first + written),
+                 {vsg::vec3(static_cast<float>(p[0]), static_cast<float>(p[1]),
+                            static_cast<float>(p[2])),
+                  n, col, rad, mask, strength, cut, clip});
+        ++written;
+        return true;
+    };
+
+    auto emitRimExtras = [&](bool enter, const Point3d& from, const vsg::vec3& fromN,
+                             const EdgeInfo& edge, float rad) {
+        const auto s = static_cast<std::uint32_t>(stride);
+        auto toward = [&](std::uint32_t nu, std::uint32_t nv) {
+            if (nu >= grid->width || nv >= grid->height) return;
+            if (nu < iu || (nu == iu && nv <= iv)) return;
+            if (!cellHasCutTag(*grid, nu, nv)) return;
+            Point3d to{};
+            vsg::vec3 toN{};
+            if (!matchingCutEndpoint(*grid, nu, nv, enter, from[axis], to, toN)) return;
+            for (int e = 1; e <= kRimExtra; ++e)
+            {
+                const float t =
+                    static_cast<float>(e) / static_cast<float>(kRimExtra + 1);
+                if (!emitSplat(lerpPoint(from, to, t), lerpNormal(fromN, toN, t), tool, rad,
+                               edge.mask, edge.strength, true, true))
+                    return;
+            }
+        };
+        if (iu >= s) toward(iu - s, iv);
+        if (iu + s < grid->width) toward(iu + s, iv);
+        if (iv >= s) toward(iu, iv - s);
+        if (iv + s < grid->height) toward(iu, iv + s);
+    };
+
     if (!slot.empty())
     {
         auto spans = grid->pool.span(slot);
@@ -1324,8 +1483,6 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
 
             if (!skipStart)
             {
-                if (written + 1 > ref.block) break;
-                const auto base = static_cast<std::size_t>(ref.first + written);
                 const vsg::vec3 nStart = endpointNormal(*grid, axis, iu, iv, stride,
                                                         span.beginNormal, true, start[axis]);
                 const EdgeInfo edgeStart =
@@ -1333,18 +1490,18 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                 if (ucamNormalStatsEnabled())
                     recordNormalStat(nStart, edgeStart, axis, normalValid(span.beginNormal),
                                      span.cutBegin(), span.capBegin());
-                _set.set(base,
-                         {vsg::vec3(static_cast<float>(start[0]),
-                                    static_cast<float>(start[1]),
-                                    static_cast<float>(start[2])),
-                          edgeStart.normal, span.cutBegin() ? tool : stock, spanRadius,
-                          edgeStart.mask, edgeStart.strength, span.cutBegin()});
-                ++written;
+                const bool cut = span.cutBegin();
+                const bool clip = (regionRim && cut) || (besideCut && !cut);
+                const float rad =
+                    clip ? std::min(spanRadius, rimRadius) : spanRadius;
+                if (!emitSplat(start, edgeStart.normal, cut ? tool : stock, rad, edgeStart.mask,
+                               edgeStart.strength, cut, clip))
+                    break;
+                if (regionRim && cut)
+                    emitRimExtras(true, start, edgeStart.normal, edgeStart, rad);
             }
             if (!skipEnd)
             {
-                if (written + 1 > ref.block) break;
-                const auto base = static_cast<std::size_t>(ref.first + written);
                 const vsg::vec3 nEnd = endpointNormal(*grid, axis, iu, iv, stride, span.endNormal,
                                                       false, end[axis]);
                 const EdgeInfo edgeEnd =
@@ -1352,13 +1509,15 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                 if (ucamNormalStatsEnabled())
                     recordNormalStat(nEnd, edgeEnd, axis, normalValid(span.endNormal),
                                      span.cutEnd(), span.capEnd());
-                _set.set(base,
-                         {vsg::vec3(static_cast<float>(end[0]),
-                                    static_cast<float>(end[1]),
-                                    static_cast<float>(end[2])),
-                          edgeEnd.normal, span.cutEnd() ? tool : stock, spanRadius,
-                          edgeEnd.mask, edgeEnd.strength, span.cutEnd()});
-                ++written;
+                const bool cut = span.cutEnd();
+                const bool clip = (regionRim && cut) || (besideCut && !cut);
+                const float rad =
+                    clip ? std::min(spanRadius, rimRadius) : spanRadius;
+                if (!emitSplat(end, edgeEnd.normal, cut ? tool : stock, rad, edgeEnd.mask,
+                               edgeEnd.strength, cut, clip))
+                    break;
+                if (regionRim && cut)
+                    emitRimExtras(false, end, edgeEnd.normal, edgeEnd, rad);
             }
         }
     }

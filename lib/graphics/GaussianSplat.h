@@ -60,6 +60,9 @@ struct Splat
     // Packed into normal.w bit 14. Disk lighting uses this, not RGB, to pick
     // the soft cut-face lobe vs the stock metal lobe.
     bool cutFace = false;
+    // Packed into normal.w bit 15. HARD_DISK discards the half toward the
+    // other face so rim coins do not hang across the crease.
+    bool rimClip = false;
 };
 
 // cellRadius is already in the space applyFit() maps into (and includes
@@ -135,7 +138,7 @@ private:
     vsg::ref_ptr<vsg::vec4Array> _centerRadius;
     vsg::ref_ptr<vsg::vec2Array> _corners;
     vsg::ref_ptr<vsg::vec4Array> _colors;
-    // xyz = surface normal, w = edgeMask | (edgeStrength << 6) | (cutFace << 14).
+    // xyz = surface normal, w = edgeMask | (edgeStrength << 6) | (cutFace << 14) | (rimClip << 15).
     vsg::ref_ptr<vsg::vec4Array> _normals;
     vsg::ref_ptr<vsg::uintArray> _indices;
     vsg::ref_ptr<vsg::VertexIndexDraw> _draw;
