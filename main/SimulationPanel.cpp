@@ -757,9 +757,12 @@ void SimulationPanel::updateRerunButton()
 
 void SimulationPanel::setCutMeshDisplayForPlayback(bool showMesh)
 {
-    if (Parameter::instance().cutMeshDisplay() == showMesh) return;
-    Parameter::instance().setCutMeshDisplay(showMesh);
-    if (_renderManager) _renderManager->refreshCutMeshDisplay();
+    if (Parameter::instance().cutMeshDisplay() != showMesh)
+    {
+        Parameter::instance().setCutMeshDisplay(showMesh);
+        if (_renderManager) _renderManager->refreshCutMeshDisplay();
+    }
+    emit cutMeshDisplayChanged(showMesh);
 }
 
 void SimulationPanel::stopPlayback()
@@ -779,11 +782,13 @@ void SimulationPanel::pausePlayback()
     _paused = true;
     if (_playTimer) _playTimer->stop();
     updateRerunButton();
+    setCutMeshDisplayForPlayback(true);
 }
 
 void SimulationPanel::finishPlayback()
 {
     stopPlayback();
+    setCutMeshDisplayForPlayback(true);
     emit noneOperationRequested();
 }
 
@@ -809,7 +814,7 @@ void SimulationPanel::onRerun()
     {
         _paused = false;
         _playing = true;
-        // Keep cut-mesh remesh on (same patchCutFace path as Interactive).
+        setCutMeshDisplayForPlayback(false);
         updateRerunButton();
         if (_playRow + 1 >= _table->rowCount())
         {
@@ -829,7 +834,7 @@ void SimulationPanel::onRerun()
     _renderManager->resetSweepAnchor();
     _paused = false;
     _playing = true;
-    // Keep cut-mesh remesh on (same patchCutFace path as Interactive).
+    setCutMeshDisplayForPlayback(false);
     _playRow = 0;
     updateRerunButton();
     applyRow(0);

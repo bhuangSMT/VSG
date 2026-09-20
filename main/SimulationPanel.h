@@ -78,6 +78,7 @@ signals:
                                      double shoulderHeight);
     void toolLibraryApplied(int toolType, double radius, double cuttingLength, double shankLength,
                             double shankRadius);
+    void cutMeshDisplayChanged(bool on);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -103,7 +104,7 @@ private:
     void stopPlayback();
     void pausePlayback();
     void finishPlayback();
-    // Ensure mesh display matches showMesh (used on pause/stop to keep remesh on).
+    // Playback: mesh off while Re-run runs, on when Pause or Re-run finishes.
     void setCutMeshDisplayForPlayback(bool showMesh);
     void updateRerunButton();
     void beginHelixAxisPick();

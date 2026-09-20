@@ -943,6 +943,11 @@ try
         app::Parameter::instance().setCutMeshDisplay(on);
         renderManager->refreshCutMeshDisplay();
     });
+    QObject::connect(simPanel, &app::SimulationPanel::cutMeshDisplayChanged,
+                     [cutMeshDisplayCheck](bool on) {
+                         const QSignalBlocker block(cutMeshDisplayCheck);
+                         cutMeshDisplayCheck->setChecked(on);
+                     });
 
     auto selectBooleanOp = [booleanCombo](app::BooleanOp op) {
         const int want = static_cast<int>(op);
