@@ -14,6 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(UCAM_BUILD_SHARED "Build geom/boolean/graphics/aptparser as shared libraries" ON)
+option(UCAM_BUILD_SDK "Build and install the C ABI SDK (libucam + ucam.h)" ON)
+option(UCAM_NATIVE_ARCH "Use -march=native in Release (off for portable SDK dylibs)" ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
@@ -29,7 +31,10 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
         message(STATUS "LTO not available: ${_ipo_msg}")
     endif()
     if(NOT MSVC)
-        add_compile_options(-O3 -march=native)
+        add_compile_options(-O3)
+        if(UCAM_NATIVE_ARCH)
+            add_compile_options(-march=native)
+        endif()
     endif()
 endif()
 
@@ -97,6 +102,9 @@ add_subdirectory(lib/geom)
 add_subdirectory(lib/boolean)
 add_subdirectory(lib/graphics)
 add_subdirectory(lib/APTParser)
+if(UCAM_BUILD_SDK)
+    add_subdirectory(lib/ucam_c)
+endif()
 
 # ---------------------------------------------------------------------------
 # Application
@@ -174,6 +182,56 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/ucamConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
 )
+
+if(UCAM_BUILD_SDK)
+    add_executable(ucam_sdk_example examples/vs_cpp/main.cpp)
+    target_link_libraries(ucam_sdk_example PRIVATE ucam)
+    add_executable(ucam_sdk_view_preview examples/vs_cpp/view_preview.cpp)
+    target_link_libraries(ucam_sdk_view_preview PRIVATE ucam)
+    if(WIN32)
+        target_compile_definitions(ucam_sdk_example PRIVATE NOMINMAX)
+        target_compile_definitions(ucam_sdk_view_preview PRIVATE NOMINMAX)
+    endif()
+
+    configure_package_config_file(
+        ${PROJECT_SOURCE_DIR}/cmake/ucamSdkConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/ucamSdkConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+    )
+    install(EXPORT ucamSdkTargets
+        FILE ucamSdkTargets.cmake
+        NAMESPACE ucam::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+        COMPONENT ucam_sdk
+        EXCLUDE_FROM_ALL
+    )
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/ucamSdkConfig.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+        COMPONENT ucam_sdk
+        EXCLUDE_FROM_ALL
+        RENAME ucamConfig.cmake
+    )
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/ucamConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ucam
+        COMPONENT ucam_sdk
+        EXCLUDE_FROM_ALL
+    )
+    install(FILES
+        ${PROJECT_SOURCE_DIR}/sdk/README.md
+        DESTINATION .
+        COMPONENT ucam_sdk
+        EXCLUDE_FROM_ALL
+    )
+    install(FILES
+        ${PROJECT_SOURCE_DIR}/examples/vs_cpp/main.cpp
+        ${PROJECT_SOURCE_DIR}/examples/vs_cpp/view_preview.cpp
+        DESTINATION examples/vs_cpp
+        COMPONENT ucam_sdk
+        EXCLUDE_FROM_ALL
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # Windows: copy VSG/vsgQt (and ucam) DLLs next to the exe and run windeployqt
