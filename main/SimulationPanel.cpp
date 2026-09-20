@@ -112,6 +112,11 @@ bool movedEnough(const ToolSample& a, const ToolSample& b)
     return (da * da + db * db + dc * dc) > (0.1 * 0.1);
 }
 
+bool usesClStyleMode(SimulationMode mode)
+{
+    return mode == SimulationMode::ClData || mode == SimulationMode::MachineSimulation;
+}
+
 } // namespace
 
 SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
@@ -132,10 +137,17 @@ SimulationPanel::SimulationPanel(QWidget* parent) : QWidget(parent)
     _modeCombo = new QComboBox();
     _modeCombo->addItem("Interactive", static_cast<int>(SimulationMode::Interactive));
     _modeCombo->addItem("CL data", static_cast<int>(SimulationMode::ClData));
+    _modeCombo->addItem("Machine simulation", static_cast<int>(SimulationMode::MachineSimulation));
     _modeCombo->addItem("NC machining", static_cast<int>(SimulationMode::NcMachining));
     if (auto* model = qobject_cast<QStandardItemModel*>(_modeCombo->model()))
     {
-        if (QStandardItem* nc = model->item(2)) nc->setEnabled(false);
+        for (int i = 0; i < _modeCombo->count(); ++i)
+        {
+            if (_modeCombo->itemData(i).toInt() != static_cast<int>(SimulationMode::NcMachining))
+                continue;
+            if (QStandardItem* nc = model->item(i)) nc->setEnabled(false);
+            break;
+        }
     }
     layout->addWidget(_modeCombo);
 
@@ -373,6 +385,7 @@ void SimulationPanel::onModeChanged(int index)
     Parameter::instance().setSimulationMode(mode);
     if (mode != SimulationMode::Interactive) stopPlayback();
     setTableVisibleForMode();
+    if (_renderManager) _renderManager->refreshMachineDisplay();
 }
 
 void SimulationPanel::endHelixAxisPick()
@@ -595,16 +608,19 @@ void SimulationPanel::onHelixClicked()
     applyFifoCap();
     if (_table->rowCount() > 0) _table->scrollToBottom();
 
-    if (_renderManager) _renderManager->setTrajectoryPath(path);
+    if (_renderManager)
+    {
+        _renderManager->setMachineAxis(toWorld(vsg::dvec3(0.0, 0.0, 0.0)), toWorldDir(axialDir));
+        _renderManager->setTrajectoryPath(path);
+    }
 }
 
 void SimulationPanel::setTableVisibleForMode()
 {
     const auto mode = Parameter::instance().simulationMode();
-    // Pose table + tool library stay available for Interactive and CL data.
-    _tableHost->setVisible(mode == SimulationMode::Interactive ||
-                           mode == SimulationMode::ClData);
-    _clDataHost->setVisible(mode == SimulationMode::ClData);
+    // Pose table + tool library stay available for Interactive and CL-style modes.
+    _tableHost->setVisible(mode == SimulationMode::Interactive || usesClStyleMode(mode));
+    _clDataHost->setVisible(usesClStyleMode(mode));
 }
 
 void SimulationPanel::appendSamples(const std::vector<ToolSample>& samples)
@@ -649,8 +665,8 @@ bool SimulationPanel::isNullRow(int row) const
 
 void SimulationPanel::applyFifoCap()
 {
-    // CL data keeps the full path (helix / APT); Interactive still FIFO-caps.
-    if (Parameter::instance().simulationMode() == SimulationMode::ClData) return;
+    // CL-style modes keep the full path (helix / APT); Interactive still FIFO-caps.
+    if (usesClStyleMode(Parameter::instance().simulationMode())) return;
     const int extra = _table->rowCount() - maxRows;
     if (extra > 0)
     {
@@ -799,6 +815,7 @@ void SimulationPanel::onReset()
     _pathFeeds.clear();
     _log.take();
     _lastRecorded.reset();
+    if (_renderManager) _renderManager->resetMachineHome();
 }
 
 void SimulationPanel::onRerun()
@@ -832,6 +849,7 @@ void SimulationPanel::onRerun()
     if (appliesBoolean(Parameter::instance().booleanOp()))
         _renderManager->resetBooleanStock();
     _renderManager->resetSweepAnchor();
+    _renderManager->resetMachineHome();
     _paused = false;
     _playing = true;
     setCutMeshDisplayForPlayback(false);

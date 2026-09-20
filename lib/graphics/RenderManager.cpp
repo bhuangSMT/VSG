@@ -23,6 +23,7 @@
 #include "ModelPick.h"
 #include "Parameter.h"
 #include "RayBoolean.h"
+#include "SimulationMode.h"
 #include "SweptVolume.h"
 #include "ToolGeometry.h"
 #include "TriangleMesh.h"
@@ -42,6 +43,52 @@ bool accumulatesCutMesh(BooleanOp op)
 bool cutMeshEnabled()
 {
     return Parameter::instance().cutMeshDisplay();
+}
+
+vsg::dmat4 toolFrameMatrix(const vsg::dvec3& tip, const vsg::dvec3& x, const vsg::dvec3& y,
+                           const vsg::dvec3& z)
+{
+    return vsg::dmat4(x.x, x.y, x.z, 0.0,
+                      y.x, y.y, y.z, 0.0,
+                      z.x, z.y, z.z, 0.0,
+                      tip.x, tip.y, tip.z, 1.0);
+}
+
+Eigen::Vector3d toEigen(const vsg::dvec3& v)
+{
+    return {v.x, v.y, v.z};
+}
+
+vsg::dmat4 toVsg(const Eigen::Isometry3d& T)
+{
+    const Eigen::Matrix3d R = T.linear();
+    const Eigen::Vector3d t = T.translation();
+    return vsg::dmat4(R(0, 0), R(1, 0), R(2, 0), 0.0,
+                      R(0, 1), R(1, 1), R(2, 1), 0.0,
+                      R(0, 2), R(1, 2), R(2, 2), 0.0,
+                      t.x(), t.y(), t.z(), 1.0);
+}
+
+Eigen::Vector3d vsgTranslation(const vsg::dmat4& m)
+{
+    return {m[3][0], m[3][1], m[3][2]};
+}
+
+Eigen::Matrix3d vsgRotation(const vsg::dmat4& m)
+{
+    Eigen::Matrix3d R;
+    R.col(0) = Eigen::Vector3d(m[0][0], m[0][1], m[0][2]);
+    R.col(1) = Eigen::Vector3d(m[1][0], m[1][1], m[1][2]);
+    R.col(2) = Eigen::Vector3d(m[2][0], m[2][1], m[2][2]);
+    return R;
+}
+
+Eigen::Isometry3d toEigen(const vsg::dmat4& m)
+{
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    T.linear() = vsgRotation(m);
+    T.translation() = vsgTranslation(m);
+    return T;
 }
 
 bool skipCutSplatEnds(bool /*cutFaceLive*/)
@@ -489,13 +536,183 @@ vsg::ref_ptr<vsg::Node> RenderManager::buildDrawable(vsg::ref_ptr<vsg::vec3Array
 vsg::ref_ptr<vsg::Node> RenderManager::applyFit(vsg::ref_ptr<vsg::Node> node,
                                                 const BoundingBox& bounds) const
 {
-    if (!_fitToUnitBox || !bounds.valid()) return node;
+    const bool wrapFit = _fitToUnitBox && bounds.valid();
+    const bool wrapMachine =
+        Parameter::instance().simulationMode() == SimulationMode::MachineSimulation;
+    if (!wrapFit && !wrapMachine) return node;
 
     auto transform = vsg::MatrixTransform::create();
-    transform->matrix = fitMatrix(bounds);
+    transform->matrix = stockDisplayMatrix(bounds);
     transform->addChild(node);
 
     return transform;
+}
+
+vsg::dmat4 RenderManager::stockDisplayMatrix(const BoundingBox& bounds) const
+{
+    const vsg::dmat4 fit = fitMatrix(bounds);
+    if (Parameter::instance().simulationMode() != SimulationMode::MachineSimulation)
+        return fit;
+    return toVsg(_machineAcc) * fit;
+}
+
+void RenderManager::noteClToolMatrix(const vsg::dmat4& matrix)
+{
+    _clToolMatrix = matrix;
+    _haveClToolMatrix = true;
+}
+
+void RenderManager::noteMachineTilt(const vsg::dvec3& x, const vsg::dvec3& y, const vsg::dvec3& z,
+                                   const vsg::dvec3& tip)
+{
+    _machineTilt.col(0) = toEigen(x);
+    _machineTilt.col(1) = toEigen(y);
+    _machineTilt.col(2) = toEigen(z);
+    if (!_haveMachineHomeTip)
+    {
+        _machineHomeTip = toEigen(tip);
+        _haveMachineHomeTip = true;
+    }
+}
+
+void RenderManager::ensureMachineHomeTip()
+{
+    if (Parameter::instance().simulationMode() != SimulationMode::MachineSimulation)
+        return;
+    if (_haveMachineHomeTip) return;
+    if (_haveClToolMatrix)
+    {
+        _machineHomeTip = vsgTranslation(_clToolMatrix);
+        _machineTilt = vsgRotation(_clToolMatrix);
+        _haveMachineHomeTip = true;
+    }
+}
+
+void RenderManager::applyWheelGpuXform()
+{
+    if (!_toolTransform) return;
+    if (!_haveClToolMatrix) return;
+    if (Parameter::instance().simulationMode() == SimulationMode::MachineSimulation)
+        _toolTransform->matrix = toVsg(_machineAcc * toEigen(_clToolMatrix));
+    else
+        _toolTransform->matrix = _clToolMatrix;
+}
+
+void RenderManager::applyMachineIncrement(const Eigen::Vector3d& tipA, const Eigen::Vector3d& tipB)
+{
+    Eigen::Vector3d axis = _machineAxis;
+    const double axisLen = axis.norm();
+    if (axisLen < 1.0e-12)
+        axis = Eigen::Vector3d::UnitX();
+    else
+        axis /= axisLen;
+
+    const Eigen::Vector3d origin = _machineAxisOrigin;
+    const double dFeed = axis.dot(tipB - tipA);
+    Eigen::Vector3d rA = (tipA - origin) - axis * axis.dot(tipA - origin);
+    Eigen::Vector3d rB = (tipB - origin) - axis * axis.dot(tipB - origin);
+    double dTheta = 0.0;
+    if (rA.norm() > 1.0e-12 && rB.norm() > 1.0e-12)
+    {
+        rA.normalize();
+        rB.normalize();
+        dTheta = std::atan2(axis.dot(rA.cross(rB)), rA.dot(rB));
+    }
+
+    const Eigen::Isometry3d Tinc = Eigen::Translation3d(origin) * Eigen::AngleAxisd(-dTheta, axis) *
+                                   Eigen::Translation3d(-origin) * Eigen::Translation3d(-dFeed * axis);
+    _machineAcc = Tinc * _machineAcc;
+}
+
+void RenderManager::finishMachineRedraw(bool booleanRan, const vsg::dvec3& tipB,
+                                        const vsg::dvec3* pathStartTip)
+{
+    if (Parameter::instance().simulationMode() == SimulationMode::MachineSimulation && booleanRan)
+    {
+        const Eigen::Vector3d pB = toEigen(tipB);
+        if (_haveMachinePrevTip)
+        {
+            applyMachineIncrement(_machinePrevTip, pB);
+        }
+        else if (pathStartTip)
+        {
+            const Eigen::Vector3d pA = toEigen(*pathStartTip);
+            if ((pB - pA).squaredNorm() > 1.0e-24)
+                applyMachineIncrement(pA, pB);
+        }
+        _machinePrevTip = pB;
+        _haveMachinePrevTip = true;
+    }
+    applyWheelGpuXform();
+    refreshStockGpuXform();
+}
+
+vsg::dmat4 RenderManager::trajectoryDisplayMatrix() const
+{
+    if (Parameter::instance().simulationMode() != SimulationMode::MachineSimulation)
+        return {};
+    return toVsg(_machineAcc);
+}
+
+void RenderManager::refreshTrajectoryGpuXform()
+{
+    auto* xform = dynamic_cast<vsg::MatrixTransform*>(_trajectoryNode.get());
+    if (!xform) return;
+    xform->matrix = trajectoryDisplayMatrix();
+}
+
+void RenderManager::refreshStockGpuXform()
+{
+    if (auto* xform = dynamic_cast<vsg::MatrixTransform*>(_modelNode.get()))
+    {
+        BoundingBox model;
+        if (_rayModel && _rayModel->bounds().valid())
+            model = _rayModel->bounds();
+        else if (_current)
+            model = BoundingBox::fromBRep(*_current);
+        xform->matrix = stockDisplayMatrix(model);
+    }
+    refreshTrajectoryGpuXform();
+    if (_viewer) _viewer->request();
+}
+
+void RenderManager::refreshMachineDisplay()
+{
+    if (Parameter::instance().simulationMode() != SimulationMode::MachineSimulation)
+    {
+        _machineAcc = Eigen::Isometry3d::Identity();
+        _haveMachinePrevTip = false;
+        _haveMachineHomeTip = false;
+    }
+    applyWheelGpuXform();
+    refreshStockGpuXform();
+}
+
+void RenderManager::resetMachineHome()
+{
+    _machineAcc = Eigen::Isometry3d::Identity();
+    _haveMachinePrevTip = false;
+    _haveMachineHomeTip = false;
+    if (Parameter::instance().simulationMode() == SimulationMode::MachineSimulation &&
+        _haveClToolMatrix)
+    {
+        _machineHomeTip = vsgTranslation(_clToolMatrix);
+        _machineTilt = vsgRotation(_clToolMatrix);
+        _haveMachineHomeTip = true;
+    }
+    applyWheelGpuXform();
+    refreshStockGpuXform();
+}
+
+void RenderManager::setMachineAxis(const vsg::dvec3& origin, const vsg::dvec3& direction)
+{
+    _machineAxisOrigin = toEigen(origin);
+    const Eigen::Vector3d axis = toEigen(direction);
+    const double len = axis.norm();
+    if (len > 1.0e-12)
+        _machineAxis = axis / len;
+    else
+        _machineAxis = Eigen::Vector3d::UnitX();
 }
 
 vsg::dmat4 RenderManager::fitMatrix(const BoundingBox& bounds) const
@@ -790,6 +1007,7 @@ void RenderManager::rebuildSplatCache()
     const SplatViewCull viewCull = splatViewCull();
     const int stride = displayStride();
     const int cutStride = cutFaceStride();
+    // Mesh on: strip cut-face disks first, then draw the overlay.
     const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
     _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
                         skipCutSplats, viewCull);
@@ -1674,10 +1892,10 @@ void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
         grindingWheelMotionFrame(z, along, x, y, z, prevY);
     }
 
-    _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
-                                        y.x, y.y, y.z, 0.0,
-                                        z.x, z.y, z.z, 0.0,
-                                        tip.x, tip.y, tip.z, 1.0);
+    const vsg::dmat4 cl = toolFrameMatrix(tip, x, y, z);
+    noteClToolMatrix(cl);
+    noteMachineTilt(x, y, z, tip);
+    _toolTransform->matrix = cl;
     _lastToolPose = tipPoses.back();
     if (_toolType == ToolType::GrindingWheel)
         _lastWheelY = y;
@@ -1686,6 +1904,7 @@ void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
     for (const ToolPose& p : tipPoses)
         appendToolTrajectory(p.position);
 
+    const vsg::dvec3 pathStart = tipPoses.front().position;
     if (Parameter::instance().booleanOp() == BooleanOp::Inspection)
     {
         const bool movedEnough = placeInspectionCutter(tipPoses.back(), false);
@@ -1693,6 +1912,7 @@ void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
             applyBooleanToRayModel();
         else if (_viewer)
             _viewer->request();
+        finishMachineRedraw(movedEnough, tip, &pathStart);
         return;
     }
 
@@ -1701,6 +1921,8 @@ void RenderManager::setToolPosePath(const std::vector<ToolPose>& referencePoses)
         applyBooleanToRayModel();
     else if (_viewer)
         _viewer->request();
+
+    finishMachineRedraw(sweepChanged, tip, &pathStart);
 }
 
 void RenderManager::setToolTipPose(const ToolPose& pose)
@@ -1882,11 +2104,12 @@ void RenderManager::retractToolAndResetSweep()
         else x /= xLen;
         const vsg::dvec3 y = vsg::cross(z, x);
 
-        _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
-                                            y.x, y.y, y.z, 0.0,
-                                            z.x, z.y, z.z, 0.0,
-                                            newTip.x, newTip.y, newTip.z, 1.0);
+        const vsg::dmat4 cl = toolFrameMatrix(newTip, x, y, z);
+        noteClToolMatrix(cl);
+        noteMachineTilt(x, y, z, newTip);
+        _toolTransform->matrix = cl;
         _lastToolPose = ToolPose{newTip, z};
+        finishMachineRedraw(false, newTip);
     }
 
     resetSweepAnchor();
@@ -1899,10 +2122,10 @@ void RenderManager::commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, co
 {
     if (!_toolTransform || _toolType == ToolType::None) return;
 
-    _toolTransform->matrix = vsg::dmat4(x.x, x.y, x.z, 0.0,
-                                        y.x, y.y, y.z, 0.0,
-                                        z.x, z.y, z.z, 0.0,
-                                        tip.x, tip.y, tip.z, 1.0);
+    const vsg::dmat4 cl = toolFrameMatrix(tip, x, y, z);
+    noteClToolMatrix(cl);
+    noteMachineTilt(x, y, z, tip);
+    _toolTransform->matrix = cl;
 
     const ToolPose pose{tip, z};
     _lastToolPose = pose;
@@ -1919,6 +2142,7 @@ void RenderManager::commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, co
             applyBooleanToRayModel();
         else if (_viewer)
             _viewer->request();
+        finishMachineRedraw(movedEnough, tip);
         return;
     }
 
@@ -1930,6 +2154,8 @@ void RenderManager::commitToolTip(const vsg::dvec3& tip, const vsg::dvec3& x, co
         applyBooleanToRayModel();
     else if (_viewer)
         _viewer->request();
+
+    finishMachineRedraw(sweepChanged, tip);
 }
 
 void RenderManager::setSweptVolumeVisible(bool visible)
@@ -2283,7 +2509,10 @@ void RenderManager::ensureTrajectoryCapacity()
                        children.end());
     }
 
-    _trajectoryNode = node;
+    auto xform = vsg::MatrixTransform::create();
+    xform->matrix = trajectoryDisplayMatrix();
+    xform->addChild(node);
+    _trajectoryNode = xform;
     _trajectoryPositions = positions;
     _trajectoryIndices = indices;
 

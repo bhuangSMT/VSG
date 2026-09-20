@@ -8,6 +8,7 @@ enum class SimulationMode
 {
     Interactive,
     ClData,
+    MachineSimulation,
     NcMachining
 };
 

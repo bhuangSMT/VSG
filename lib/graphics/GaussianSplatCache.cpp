@@ -575,10 +575,11 @@ void skipSplatEnds(const Interval& span, double modelLength, double hideShorterT
 {
     const bool cutStart = span.cutBegin();
     const bool cutEnd = span.cutEnd();
-    // Interior cut ends are covered by the overlay mesh; rim cells keep dots
-    // so the edge seals against stock Gaussians.
-    skipStart = skipCutSplats && cutStart && !onCutRim;
-    skipEnd = skipCutSplats && cutEnd && !onCutRim;
+    // Mesh on: drop every cut-face disk first (interior and rim). Mesh off
+    // keeps those disks as the cut surface.
+    skipStart = skipCutSplats && cutStart;
+    skipEnd = skipCutSplats && cutEnd;
+    (void)onCutRim;
     // Short leftovers and bleed partners: still useful when cut dots are kept.
     if ((cutStart || cutEnd) && hideShorterThan > 0.0 && modelLength <= hideShorterThan)
     {
@@ -853,14 +854,14 @@ std::uint32_t endpointNeed(const RayGrid& grid, std::uint32_t iu, std::uint32_t 
             (protectStart || endpointInViewCull(grid, iu, iv, start[axis], viewCull)))
         {
             ++n;
-            if (regionRim && span.cutBegin())
+            if (regionRim && span.cutBegin() && !skipCutSplats)
                 n += static_cast<std::uint32_t>(kRimExtra * rimNeighbors);
         }
         if (!skipEnd &&
             (protectEnd || endpointInViewCull(grid, iu, iv, end[axis], viewCull)))
         {
             ++n;
-            if (regionRim && span.cutEnd())
+            if (regionRim && span.cutEnd() && !skipCutSplats)
                 n += static_cast<std::uint32_t>(kRimExtra * rimNeighbors);
         }
     }
@@ -1497,7 +1498,7 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                 if (!emitSplat(start, edgeStart.normal, cut ? tool : stock, rad, edgeStart.mask,
                                edgeStart.strength, cut, clip))
                     break;
-                if (regionRim && cut)
+                if (regionRim && cut && !_skipCutSplats)
                     emitRimExtras(true, start, edgeStart.normal, edgeStart, rad);
             }
             if (!skipEnd)
@@ -1516,7 +1517,7 @@ bool GaussianSplatCache::fillCell(const RayModel& rayModel,
                 if (!emitSplat(end, edgeEnd.normal, cut ? tool : stock, rad, edgeEnd.mask,
                                edgeEnd.strength, cut, clip))
                     break;
-                if (regionRim && cut)
+                if (regionRim && cut && !_skipCutSplats)
                     emitRimExtras(false, end, edgeEnd.normal, edgeEnd, rad);
             }
         }

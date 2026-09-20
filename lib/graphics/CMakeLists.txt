@@ -8,7 +8,7 @@ ucam_add_library(ucam_graphics graphics
     WorldAxes.cpp
 )
 
-target_link_libraries(ucam_graphics PUBLIC ucam_boolean vsg::vsg vsgQt::vsgQt TBB::tbb)
+target_link_libraries(ucam_graphics PUBLIC ucam_boolean vsg::vsg vsgQt::vsgQt TBB::tbb Eigen3::Eigen)
 
 install(FILES
     ControlCube.h

@@ -83,6 +83,12 @@ find_package(TBB REQUIRED)
 # the only piece of that the importer does not do itself.
 find_package(ZLIB REQUIRED)
 
+# Machine Simulation feed/spin invert (Isometry3d). Homebrew Eigen on macOS.
+if(APPLE AND EXISTS "/opt/homebrew/opt/eigen")
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/eigen")
+endif()
+find_package(Eigen3 REQUIRED)
+
 # ---------------------------------------------------------------------------
 # Libraries: geom → boolean → graphics, plus APTParser
 # ---------------------------------------------------------------------------

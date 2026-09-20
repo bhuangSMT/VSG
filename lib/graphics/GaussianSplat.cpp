@@ -875,12 +875,13 @@ void main()
     else normal /= nLen;
     if (dot(normal, viewDir) < 0.0) normal = -normal;
 
-    float diffuse = max(dot(normal, lightDir), 0.0);
+    float nDotL = dot(normal, lightDir);
+    float diffuse = clamp(nDotL * 0.35 + 0.65, 0.0, 1.0);
     vec3 halfway = normalize(lightDir + viewDir);
-    float specular = pow(max(dot(normal, halfway), 0.0), 70.0);
+    float specular = pow(max(dot(normal, halfway), 0.0), 4.0);
 
-    vec3 lit = color.rgb * (0.12 + 0.55 * diffuse)
-             + color.rgb * (1.40 * specular);
+    vec3 lit = color.rgb * (0.32 + 0.50 * diffuse)
+             + color.rgb * (0.08 * specular);
     outColor = vec4(lit, color.a);
 }
 )";

@@ -12,6 +12,8 @@
 #include <optional>
 #include <vector>
 
+#include <Eigen/Geometry>
+
 #include <vsg/all.h>
 
 #include <vsgQt/Viewer.h>
@@ -161,6 +163,20 @@ public:
     // Fit matrix for the currently displayed stock (BRep / ray model), or identity.
     vsg::dmat4 currentFitMatrix() const;
 
+    // Write stockDisplayMatrix onto the existing stock MatrixTransform. No
+    // recompile and no CPU / wheel-pose change. Leaving Machine restores fit.
+    void refreshStockGpuXform();
+
+    // Park or restore the wheel VSG node, then refresh the stock node.
+    // Entering Machine snapshots the home tip; leaving restores the CL wheel.
+    void refreshMachineDisplay();
+
+    // Drop T_acc / home tip and recapture from the current CL pose (Reset / Re-run).
+    void resetMachineHome();
+
+    // Helix / stock axis in world (fitted) space. Default is +X through origin.
+    void setMachineAxis(const vsg::dvec3& origin, const vsg::dvec3& direction);
+
     // Apply Parameter::booleanOp() using the current SweptVolume. Subtraction
     // and Union are cumulative: the input is the previous boolean result (or
     // the original cast on the first cut). Inspection clones session stock
@@ -245,6 +261,20 @@ private:
     // Model-space to world-space transform matching applyFit(), or identity
     // when fitting is off / bounds are empty.
     vsg::dmat4 fitMatrix(const BoundingBox& bounds) const;
+
+    // GPU stock matrix: fit, or T_acc * fit in Machine only.
+    vsg::dmat4 stockDisplayMatrix(const BoundingBox& bounds) const;
+
+    void noteClToolMatrix(const vsg::dmat4& matrix);
+    void noteMachineTilt(const vsg::dvec3& x, const vsg::dvec3& y, const vsg::dvec3& z,
+                         const vsg::dvec3& tip);
+    void ensureMachineHomeTip();
+    void applyWheelGpuXform();
+    void applyMachineIncrement(const Eigen::Vector3d& tipA, const Eigen::Vector3d& tipB);
+    void finishMachineRedraw(bool booleanRan, const vsg::dvec3& tipB,
+                             const vsg::dvec3* pathStartTip = nullptr);
+    vsg::dmat4 trajectoryDisplayMatrix() const;
+    void refreshTrajectoryGpuXform();
 
     BoundingBox worldStockAabb() const;
     void updateWorldAxesSpecFromStock();
@@ -362,6 +392,20 @@ private:
     // Persistent tool placement. Children hold the cutter and optional shank;
     // the matrix moves the tip to the latest pick.
     vsg::ref_ptr<vsg::MatrixTransform> _toolTransform;
+
+    // Last CL tip-frame (boolean still uses this write before park).
+    vsg::dmat4 _clToolMatrix{};
+    bool _haveClToolMatrix = false;
+
+    // Machine GPU: wheel = T_acc * T_cl; stock = T_acc * fit.
+    Eigen::Isometry3d _machineAcc = Eigen::Isometry3d::Identity();
+    Eigen::Matrix3d _machineTilt = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d _machinePrevTip = Eigen::Vector3d::Zero();
+    bool _haveMachinePrevTip = false;
+    Eigen::Vector3d _machineHomeTip = Eigen::Vector3d::Zero();
+    bool _haveMachineHomeTip = false;
+    Eigen::Vector3d _machineAxis = Eigen::Vector3d::UnitX();
+    Eigen::Vector3d _machineAxisOrigin = Eigen::Vector3d::Zero();
 
     // The last (current) swept volume on the CPU: triangle soup + BVH. Always
     // recorded while a tool is active. The GPU node is only rebuilt when
