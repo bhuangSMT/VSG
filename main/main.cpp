@@ -167,19 +167,22 @@ vsg::ref_ptr<vsg::Trackball> initializeViewer(vsgQt::Window* window,
     vsg::dvec3 centre = (computeBounds.bounds.min + computeBounds.bounds.max) * 0.5;
     double radius = vsg::length(computeBounds.bounds.max - computeBounds.bounds.min) * 0.6;
     double nearFarRatio = 0.001;
+    // Far used to be radius*4.5 with the eye at radius*3.5 — a short zoom-out
+    // put the fitted stock behind the far plane and it vanished (looked culled).
+    const double viewRadius = (radius > 1.0e-6) ? radius : 1.0;
 
     uint32_t width = window->traits->width;
     uint32_t height = window->traits->height;
 
-    auto lookAt = vsg::LookAt::create(centre + vsg::dvec3(0.0, -radius * 3.5, 0.0),
+    auto lookAt = vsg::LookAt::create(centre + vsg::dvec3(0.0, -viewRadius * 3.5, 0.0),
                                       centre,
                                       vsg::dvec3(0.0, 0.0, 1.0));
 
     auto perspective = vsg::Perspective::create(
         30.0,
         static_cast<double>(width) / static_cast<double>(height),
-        nearFarRatio * radius,
-        radius * 4.5);
+        nearFarRatio * viewRadius,
+        viewRadius * 100.0);
 
     auto camera = vsg::Camera::create(perspective, lookAt,
                                       vsg::ViewportState::create(VkExtent2D{width, height}));

@@ -820,20 +820,7 @@ void RenderManager::refreshCutMeshDisplay()
 
 void RenderManager::refreshSplatViewForCamera()
 {
-    if (!usesSplatView(_viewMode) || !_rayModel || _rayModel->rayCount() == 0) return;
-    const int stride = displayStride();
-    // Same stride: discs already on the GPU stay. Packed rebuild only when
-    // densify actually changes the sample grid.
-    if (!_splatCache.empty() && _splatCache.stride() == stride) return;
-
-    // Stock densify only — never remesh an already-uploaded cut face.
-    const SplatViewCull viewCull = splatViewCull();
-    const bool skipCutSplats = skipCutSplatEnds(_splatCache.hasCutFace());
-    _splatCache.rebuild(*_rayModel, stride, splatRadii(*_rayModel, stride), splatStyle(),
-                        skipCutSplats, viewCull);
-    if (_splatCache.hasCutFace())
-        _splatCache.showCutFace();
-    presentSplatCache();
+    // View cull is off: do not rebuild or free discs when the camera moves.
 }
 
 vsg::dmat4 RenderManager::modelToClipMatrix() const
@@ -864,26 +851,8 @@ int RenderManager::cutFaceStride() const
 
 SplatViewCull RenderManager::splatViewCull() const
 {
-    SplatViewCull cull;
-    if (!_camera || !_rayModel) return cull;
-
-    const BoundingBox stock = _rayModel->bounds();
-    if (!stock.valid()) return cull;
-
-    const vsg::dmat4 modelToWorld = fitMatrix(stock);
-    const vsg::dmat4 worldToModel = vsg::inverse(modelToWorld);
-    vsg::dvec3 eyeWorld(0.0, 0.0, 0.0);
-    if (auto lookAt = _camera->viewMatrix.cast<vsg::LookAt>())
-        eyeWorld = lookAt->eye;
-    else
-        eyeWorld = vsg::inverse(_camera->viewMatrix->transform()) * vsg::dvec3(0.0, 0.0, 0.0);
-
-    cull.enabled = true;
-    cull.modelToClip = modelToClipMatrix();
-    cull.eyeModel = worldToModel * eyeWorld;
-    cull.coarseStride = coarseStride();
-    cull.ndcMargin = 0.08f;
-    return cull;
+    // Off: NDC frustum cull on zoom/rebuild was dropping untagged stock.
+    return {};
 }
 
 std::size_t RenderManager::rayCountVisibleAtStride(int stride) const
